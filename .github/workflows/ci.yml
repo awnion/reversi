@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
-      - run: bun run install:browsers
+      - run: bunx playwright install --with-deps chromium webkit
       - run: bun run build:packages
       - run: bun run test:browser
 
@@ -44,5 +44,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
-      - run: bun run install:browsers
+      - run: bunx playwright install --with-deps chromium webkit
       - run: bun run test:e2e
