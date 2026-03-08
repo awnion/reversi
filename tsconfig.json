@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/core"
+    },
+    {
+      "path": "./packages/board-ui"
+    },
+    {
+      "path": "./apps/web"
+    }
+  ]
+}

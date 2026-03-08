@@ -1,0 +1,137 @@
+:root {
+  color: #f5f1e8;
+  background:
+    radial-gradient(circle at top, rgba(255, 214, 153, 0.16), transparent 30%),
+    linear-gradient(180deg, #1b2f26 0%, #101b16 100%);
+  font-family: "Iowan Old Style", "Palatino Linotype", serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(320px, 72vmin) minmax(240px, 320px);
+  gap: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.board-panel,
+.sidebar {
+  background: rgba(14, 22, 18, 0.78);
+  border: 1px solid rgba(255, 244, 214, 0.12);
+  border-radius: 24px;
+  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.28);
+}
+
+.board-panel {
+  padding: 20px;
+}
+
+.sidebar {
+  padding: 24px;
+}
+
+.board-root,
+.rv-board {
+  width: min(72vmin, 720px);
+  aspect-ratio: 1;
+}
+
+.rv-board {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  gap: 0;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 2px solid rgba(255, 243, 214, 0.18);
+}
+
+.rv-square {
+  position: relative;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  background: #35654a;
+}
+
+.rv-square[data-tone='light'] {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent),
+    #3e7657;
+}
+
+.rv-square[data-tone='dark'] {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.08), transparent),
+    #2f5f45;
+}
+
+.rv-square[data-legal='true']::after {
+  content: '';
+  position: absolute;
+  inset: 8%;
+  border: 1px solid rgba(245, 241, 232, 0.12);
+  border-radius: 12px;
+}
+
+.rv-disc,
+.rv-hint {
+  position: absolute;
+  inset: 16%;
+  border-radius: 999px;
+}
+
+.rv-disc {
+  box-shadow: inset 0 2px 10px rgba(255, 255, 255, 0.12), inset 0 -8px 16px rgba(0, 0, 0, 0.28);
+}
+
+.rv-disc[data-disc='black'] {
+  background: radial-gradient(circle at 35% 30%, #5d6b66 0%, #1f2422 45%, #080909 100%);
+}
+
+.rv-disc[data-disc='white'] {
+  background: radial-gradient(circle at 35% 30%, #ffffff 0%, #d7d9d1 48%, #9fa69d 100%);
+}
+
+.rv-hint {
+  inset: 36%;
+  background: rgba(242, 229, 171, 0.7);
+}
+
+button {
+  font: inherit;
+}
+
+#pass-button {
+  padding: 10px 14px;
+  color: #f5f1e8;
+  background: #7d4c2c;
+  border: 0;
+  border-radius: 999px;
+}
+
+#pass-button:disabled {
+  opacity: 0.45;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .board-root,
+  .rv-board {
+    width: min(92vw, 720px);
+  }
+}
