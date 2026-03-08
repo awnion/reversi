@@ -1,7 +1,14 @@
+import {
+  applyMove,
+  type Cell,
+  createInitialState,
+  type Disc,
+  type GameState,
+  getLegalMoves,
+  indexOf,
+} from '@reversi/core';
 import { describe, expect, test, vi } from 'vitest';
 import { page } from 'vitest/browser';
-
-import { applyMove, createInitialState, getLegalMoves, indexOf, type Cell, type Disc, type GameState } from '@reversi/core';
 import { createReversiBoard } from '../src/reversiBoard';
 
 function makeBoard(rows: string[]): Cell[] {
@@ -16,7 +23,11 @@ function makeBoard(rows: string[]): Cell[] {
   return board;
 }
 
-function makeState(board: Cell[], currentPlayer: Disc, consecutivePasses = 0): GameState {
+function makeState(
+  board: Cell[],
+  currentPlayer: Disc,
+  consecutivePasses = 0,
+): GameState {
   const legalMoves = getLegalMoves(board, currentPlayer);
   return {
     board,
@@ -28,7 +39,10 @@ function makeState(board: Cell[], currentPlayer: Disc, consecutivePasses = 0): G
   };
 }
 
-function setup(state: GameState, onMove?: (pos: { row: number; col: number }) => void) {
+function setup(
+  state: GameState,
+  onMove?: (pos: { row: number; col: number }) => void,
+) {
   document.body.innerHTML = '<div id="board"></div>';
   const root = document.getElementById('board')!;
   const board = createReversiBoard(root, { state, onMove });
@@ -63,7 +77,9 @@ describe('reversi board ui', () => {
     setup(state, onMove);
 
     const move = state.legalMoves[0];
-    const button = page.getByRole('button', { name: `row ${move.row + 1} column ${move.col + 1}` });
+    const button = page.getByRole('button', {
+      name: `row ${move.row + 1} column ${move.col + 1}`,
+    });
     await button.click();
 
     expect(onMove).toHaveBeenCalledWith({ row: move.row, col: move.col });
@@ -91,7 +107,9 @@ describe('reversi board ui', () => {
     board.setState(next);
 
     // wait for rAF
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve)),
+    );
 
     // opening move: 3 discs of one color + 1 flipped = at least 5 total discs
     const discs = root.querySelectorAll('.rv-disc');
@@ -116,7 +134,9 @@ describe('reversi board ui', () => {
 
     await expect.element(page.getByRole('button').nth(0)).toBeInTheDocument();
     expect(root.querySelectorAll('.rv-hint')).toHaveLength(0);
-    expect(root.querySelectorAll('.rv-square[data-legal="true"]')).toHaveLength(0);
+    expect(root.querySelectorAll('.rv-square[data-legal="true"]')).toHaveLength(
+      0,
+    );
   });
 
   test('destroy removes board content', async () => {

@@ -15,9 +15,12 @@ interface BoardInternalState {
   selected?: Position;
 }
 
-export function createReversiBoard(element: HTMLElement, config: BoardConfig): BoardApi {
+export function createReversiBoard(
+  element: HTMLElement,
+  config: BoardConfig,
+): BoardApi {
   const internal: BoardInternalState = {
-    state: config.state
+    state: config.state,
   };
 
   element.classList.add('rv-board');
@@ -42,15 +45,23 @@ export function createReversiBoard(element: HTMLElement, config: BoardConfig): B
       if (frame) cancelAnimationFrame(frame);
       element.replaceChildren();
       element.classList.remove('rv-board');
-    }
+    },
   };
 }
 
-function render(element: HTMLElement, internal: BoardInternalState, config: BoardConfig): void {
+function render(
+  element: HTMLElement,
+  internal: BoardInternalState,
+  config: BoardConfig,
+): void {
   element.replaceChildren();
 
   const fragment = document.createDocumentFragment();
-  const legalLookup = new Set(internal.state.legalMoves.map((move: Position) => keyOf(move.row, move.col)));
+  const legalLookup = new Set(
+    internal.state.legalMoves.map((move: Position) =>
+      keyOf(move.row, move.col),
+    ),
+  );
   for (let row = 0; row < 8; row += 1) {
     for (let col = 0; col < 8; col += 1) {
       const square = document.createElement('button');
@@ -68,7 +79,8 @@ function render(element: HTMLElement, internal: BoardInternalState, config: Boar
 
       const disc = internal.state.board[row * 8 + col];
       if (disc) square.appendChild(renderDisc(disc));
-      else if (legalLookup.has(keyOf(row, col))) square.appendChild(renderHint());
+      else if (legalLookup.has(keyOf(row, col)))
+        square.appendChild(renderHint());
 
       fragment.appendChild(square);
     }

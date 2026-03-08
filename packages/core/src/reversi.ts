@@ -30,7 +30,7 @@ const DIRECTIONS: ReadonlyArray<readonly [number, number]> = [
   [0, 1],
   [1, -1],
   [1, 0],
-  [1, 1]
+  [1, 1],
 ];
 
 export function createInitialState(): GameState {
@@ -44,11 +44,14 @@ export function createInitialState(): GameState {
     currentPlayer: 'black',
     status: 'playing',
     winner: null,
-    consecutivePasses: 0
+    consecutivePasses: 0,
   });
 }
 
-export function getLegalMoves(board: ReadonlyArray<Cell>, player: Disc): Move[] {
+export function getLegalMoves(
+  board: ReadonlyArray<Cell>,
+  player: Disc,
+): Move[] {
   const moves: Move[] = [];
   for (let row = 0; row < BOARD_SIZE; row += 1) {
     for (let col = 0; col < BOARD_SIZE; col += 1) {
@@ -61,32 +64,37 @@ export function getLegalMoves(board: ReadonlyArray<Cell>, player: Disc): Move[] 
 }
 
 export function applyMove(state: GameState, position: Position): GameState {
-  const move = state.legalMoves.find(candidate => candidate.row === position.row && candidate.col === position.col);
+  const move = state.legalMoves.find(
+    (candidate) =>
+      candidate.row === position.row && candidate.col === position.col,
+  );
   if (!move) {
     throw new Error(`Illegal move at (${position.row}, ${position.col})`);
   }
 
   const board = state.board.slice();
   setCell(board, move.row, move.col, state.currentPlayer);
-  for (const flip of move.flips) setCell(board, flip.row, flip.col, state.currentPlayer);
+  for (const flip of move.flips)
+    setCell(board, flip.row, flip.col, state.currentPlayer);
 
   return withDerivedState({
     board,
     currentPlayer: opposite(state.currentPlayer),
     status: 'playing',
     winner: null,
-    consecutivePasses: 0
+    consecutivePasses: 0,
   });
 }
 
 export function passTurn(state: GameState): GameState {
-  if (state.legalMoves.length > 0) throw new Error('Cannot pass when legal moves are available');
+  if (state.legalMoves.length > 0)
+    throw new Error('Cannot pass when legal moves are available');
   return withDerivedState({
     board: state.board.slice(),
     currentPlayer: opposite(state.currentPlayer),
     status: 'passed',
     winner: null,
-    consecutivePasses: state.consecutivePasses + 1
+    consecutivePasses: state.consecutivePasses + 1,
   });
 }
 
@@ -108,7 +116,10 @@ export function isInsideBoard(row: number, col: number): boolean {
   return row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE;
 }
 
-function withDerivedState(base: Omit<GameState, 'legalMoves' | 'status' | 'winner'> & Partial<Pick<GameState, 'status' | 'winner'>>): GameState {
+function withDerivedState(
+  base: Omit<GameState, 'legalMoves' | 'status' | 'winner'> &
+    Partial<Pick<GameState, 'status' | 'winner'>>,
+): GameState {
   const legalMoves = getLegalMoves(base.board, base.currentPlayer);
   const next: GameState = {
     board: base.board,
@@ -116,7 +127,7 @@ function withDerivedState(base: Omit<GameState, 'legalMoves' | 'status' | 'winne
     legalMoves,
     status: base.status ?? 'playing',
     winner: base.winner ?? null,
-    consecutivePasses: base.consecutivePasses
+    consecutivePasses: base.consecutivePasses,
   };
 
   if (legalMoves.length > 0) {
@@ -134,14 +145,31 @@ function withDerivedState(base: Omit<GameState, 'legalMoves' | 'status' | 'winne
 
   const counts = countDiscs(base.board);
   next.status = 'finished';
-  next.winner = counts.black === counts.white ? 'draw' : counts.black > counts.white ? 'black' : 'white';
+  next.winner =
+    counts.black === counts.white
+      ? 'draw'
+      : counts.black > counts.white
+        ? 'black'
+        : 'white';
   return next;
 }
 
-function collectFlips(board: ReadonlyArray<Cell>, player: Disc, row: number, col: number): Position[] {
+function collectFlips(
+  board: ReadonlyArray<Cell>,
+  player: Disc,
+  row: number,
+  col: number,
+): Position[] {
   const flips: Position[] = [];
   for (const [deltaRow, deltaCol] of DIRECTIONS) {
-    const line = collectDirectionalFlips(board, player, row, col, deltaRow, deltaCol);
+    const line = collectDirectionalFlips(
+      board,
+      player,
+      row,
+      col,
+      deltaRow,
+      deltaCol,
+    );
     if (line.length > 0) flips.push(...line);
   }
   return flips;
@@ -153,7 +181,7 @@ function collectDirectionalFlips(
   startRow: number,
   startCol: number,
   deltaRow: number,
-  deltaCol: number
+  deltaCol: number,
 ): Position[] {
   const seen: Position[] = [];
   let row = startRow + deltaRow;

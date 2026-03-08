@@ -1,5 +1,12 @@
 import { createReversiBoard } from '@reversi/board-ui';
-import { applyMove, countDiscs, createInitialState, passTurn, type GameState, type Position } from '@reversi/core';
+import {
+  applyMove,
+  countDiscs,
+  createInitialState,
+  type GameState,
+  type Position,
+  passTurn,
+} from '@reversi/core';
 
 import './styles.css';
 
@@ -32,7 +39,7 @@ const board = createReversiBoard(boardRoot, {
   onMove(position: Position) {
     state = applyMove(state, position);
     sync(state);
-  }
+  },
 });
 
 passButton.addEventListener('click', () => {
@@ -47,7 +54,10 @@ sync(state);
 function sync(nextState: GameState): void {
   board.setState(nextState);
   const score = countDiscs(nextState.board);
-  const turn = nextState.status === 'finished' ? 'Game over' : `Turn: ${nextState.currentPlayer}`;
+  const turn =
+    nextState.status === 'finished'
+      ? 'Game over'
+      : `Turn: ${nextState.currentPlayer}`;
   const extra =
     nextState.status === 'finished'
       ? nextState.winner === 'draw'
@@ -58,11 +68,13 @@ function sync(nextState: GameState): void {
         : `${nextState.legalMoves.length} legal moves`;
   statusNode.textContent = `${turn}. ${extra}.`;
   scoreNode.textContent = `Black ${score.black} - ${score.white} White`;
-  passButton.disabled = nextState.legalMoves.length > 0 || nextState.status === 'finished';
+  passButton.disabled =
+    nextState.legalMoves.length > 0 || nextState.status === 'finished';
 }
 
 function requireElement<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
-  if (!(element instanceof HTMLElement)) throw new Error(`Missing element #${id}`);
+  if (!(element instanceof HTMLElement))
+    throw new Error(`Missing element #${id}`);
   return element as T;
 }

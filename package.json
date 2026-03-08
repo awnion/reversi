@@ -16,10 +16,12 @@
     "test:e2e": "bun run build && bunx playwright test",
     "test:e2e:headed": "bunx playwright test --headed",
     "install:browsers": "bunx playwright install chromium webkit",
-    "lint": "bunx tsc -b --pretty",
+    "lint": "bunx biome check && bunx tsc -b --pretty",
+    "lint:fix": "bunx biome check --write",
     "check": "bun run lint && bun run test:unit"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.6",
     "@playwright/test": "^1.52.0",
     "@types/bun": "^1.2.5",
     "@vitest/browser": "^4.0.0",

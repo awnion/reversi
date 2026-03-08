@@ -1,8 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
-  applyMove, countDiscs, createInitialState, getLegalMoves, passTurn,
-  indexOf, type Cell, type Disc, type GameState,
+  applyMove,
+  type Cell,
+  countDiscs,
+  createInitialState,
+  type Disc,
+  type GameState,
+  getLegalMoves,
+  indexOf,
+  passTurn,
 } from '../src/reversi';
 
 /** Build a board from 8 rows of space-separated chars: B=black, W=white, .=empty */
@@ -19,7 +26,11 @@ function makeBoard(rows: string[]): Cell[] {
 }
 
 /** Build a minimal GameState from a board (status is approximate — use passTurn/applyMove to get real derived state). */
-function makeState(board: Cell[], currentPlayer: Disc, consecutivePasses = 0): GameState {
+function makeState(
+  board: Cell[],
+  currentPlayer: Disc,
+  consecutivePasses = 0,
+): GameState {
   const legalMoves = getLegalMoves(board, currentPlayer);
   return {
     board,
