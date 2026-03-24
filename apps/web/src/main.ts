@@ -1,5 +1,6 @@
 import { createReversiBoard } from '@reversi/board-ui';
 import { greedyBot } from '@reversi/bot';
+import { createAlphaZeroBot } from '@reversi/bot-alphazero';
 import { createMinimaxBot } from '@reversi/bot-minimax';
 import { countDiscs, createInitialState, type GameState } from '@reversi/core';
 import { GameController, type PlayerConfig } from './gameController';
@@ -8,6 +9,7 @@ import './styles.css';
 
 const minimax1s = await createMinimaxBot('Minimax 1s');
 const minimax5s = await createMinimaxBot('Minimax 5s');
+const alphazero200 = await createAlphaZeroBot('AlphaZero (200)', 200);
 
 const app = document.getElementById('app');
 if (!app) throw new Error('Missing app root');
@@ -34,6 +36,7 @@ app.innerHTML = `
             <option value="bot-greedy">Greedy (instant)</option>
             <option value="bot-minimax-1s">Minimax (1s)</option>
             <option value="bot-minimax-5s">Minimax (5s)</option>
+            <option value="bot-alphazero">AlphaZero (200)</option>
           </select>
         </label>
         <br />
@@ -44,6 +47,7 @@ app.innerHTML = `
             <option value="bot-greedy">Greedy (instant)</option>
             <option value="bot-minimax-1s">Minimax (1s)</option>
             <option value="bot-minimax-5s">Minimax (5s)</option>
+            <option value="bot-alphazero">AlphaZero (200)</option>
           </select>
         </label>
         <br /><br />
@@ -77,6 +81,9 @@ function getPlayerConfig(select: HTMLSelectElement): PlayerConfig {
   }
   if (select.value === 'bot-minimax-5s') {
     return { type: 'bot', player: minimax5s, thinkMs: 5000 };
+  }
+  if (select.value === 'bot-alphazero') {
+    return { type: 'bot', player: alphazero200, thinkMs: 0 };
   }
   return { type: 'human' };
 }

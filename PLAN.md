@@ -12,16 +12,44 @@ The search tree is built using the **PUCT formula**:
 ```
 score(s, a) = Q(s,a) + C * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
 ```
-where `P(s,a)` is the policy prior from the network and `N` is visit counts. This gives
-directed search instead of random exploration.
+where `P(s,a)` is the policy prior from the network and `N` is visit counts.
+
+---
+
+## Hardware Target: MacBook Pro M2 Max
+
+The M2 Max has **unified memory** — CPU and GPU share the same RAM with no copy overhead.
+This fundamentally changes the architecture: Rust workers and the MLX model can exchange
+board states as raw numpy arrays with zero serialization cost.
+
+Key numbers on M2 Max:
+- ~400 GB/s memory bandwidth
+- 30–38 GPU cores (Metal)
+- 12 performance CPU cores (rayon workers)
+- NN inference batch=64: ~0.5 ms on Metal
+- Expected throughput: ~15–25 games/sec → ~1 000–1 500 positions/sec
+- 1 hour of training ≈ 3–5 M positions → sufficient for 8×8 Reversi convergence
 
 ---
 
 ## Key Design Decisions
 
-### Network Architecture
+### ML Framework: MLX (not PyTorch)
 
-A small network is sufficient for 8×8 Reversi:
+| | MLX | PyTorch MPS |
+|-|-----|-------------|
+| Backend | Native Metal | MPS (wrapper) |
+| Memory copies | Zero (unified) | Sometimes |
+| Lazy eval + JIT | Yes | No |
+| Speed on M-series | ✅ Best | Slower |
+
+```python
+import mlx.core as mx
+import mlx.nn as nn
+# mx.default_device() → Metal GPU automatically on M2
+```
+
+### Network Architecture
 
 ```
 Input:  3 × 8 × 8
@@ -31,210 +59,213 @@ Input:  3 × 8 × 8
 
 Body:   4 ResBlocks × 32 channels (3×3 conv + BN + ReLU)
 
-Policy head:  Conv 2×1 → Flatten → 64 logits (one per square)
+Policy head:  Conv 2×1 → Flatten → 64 logits
 Value head:   Conv 1×1 → Flatten → Linear → Tanh → scalar
 ```
 
-~100K parameters → ~200KB fp32 → ~50KB int8 after quantization.
+~100K parameters → ~200 KB fp32 → ~50 KB int8 after quantization.
 
-### NN Inference in WASM
+### Parallelism: Batched Leaf Evaluation
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| `tract` crate (ONNX) | Ready infrastructure | +3–5 MB to WASM |
-| `candle` (HuggingFace) | Modern API | Heavy |
-| Hand-rolled forward pass | Minimal size, full control | Need to implement Conv2d, BN |
-
-**Choice: hand-rolled forward pass.** For a 4-block ResNet this is ~300 lines of Rust.
-The WASM stays small. Weights are loaded from `&[u8]` embedded via `include_bytes!`.
-
-### Training
-
-Python + PyTorch self-play loop, managed with **uv**:
+The key pattern: instead of evaluating each MCTS leaf node individually, accumulate
+requests from N concurrent games and evaluate them as a single GPU batch.
 
 ```
-1. Run tournament: current_model vs current_model via MCTS
-2. Record (state, policy_target, value_target) for each position
-3. Train network on batches of recorded positions
-4. Evaluate: candidate vs champion (run N games via tournament tool)
-5. If candidate win rate > 55% → promote to champion
-6. Repeat
+game_1 MCTS → hit leaf → ─────────────────────────────┐
+game_2 MCTS → hit leaf → ──────────────────────────┐   │
+...                                                 ▼   ▼
+game_N MCTS → hit leaf → ──► [LeafEvalServer] → batch=64 → Metal GPU
+                                                        │
+                              ◄─── (policy, value) ×N ─┘
 ```
 
-Reversi 8×8 converges in a few hours on a GPU (or ~1 day on CPU). Trained weights are
-exported to a binary format and committed to the repo, then embedded into the WASM binary.
+No copies. All in unified memory. Workers suspend (asyncio) while waiting for the batch.
+
+### Rust ↔ Python Bridge: PyO3
+
+MCTS game loop runs in Rust (fast), calls back into Python for leaf evaluation:
+
+```rust
+// rust/mcts/src/lib.rs
+#[pyclass]
+pub struct MctsWorker { ... }
+
+#[pymethods]
+impl MctsWorker {
+    // Called from Python asyncio; eval_fn is LeafEvalServer.evaluate
+    pub fn run_game(&mut self, eval_fn: PyObject) -> PyResult<GameRecord> { ... }
+}
+```
 
 ---
 
-## Tournament Tool
-
-A dedicated **Rust CLI binary** for running games between any two strategies.
-It is the engine driving both self-play data generation and model evaluation.
-
-### Architecture
+## System Architecture
 
 ```
-tools/tournament/
-  src/
-    main.rs      ← CLI: arg parsing, stats output
-    runner.rs    ← plays N games between two strategies, rotates colors
-    strategy.rs  ← Strategy trait + implementations
-    record.rs    ← serialization of game records for training
+┌──────────────────────────────────────────────────────────────┐
+│  Single Python process  (uv run python -m train.loop)        │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  MLX Model  (Metal GPU, unified memory)              │   │
+│  │                                                      │   │
+│  │  LeafEvalServer  batch_size=64, timeout=2ms          │   │
+│  │    ← board states (np.array, zero-copy)              │   │
+│  │    → (policy [64], value scalar)                     │   │
+│  └────────────────────────┬─────────────────────────────┘   │
+│                           │                                  │
+│  ┌────────────────────────▼─────────────────────────────┐   │
+│  │  Rust MCTS Workers  (PyO3 + rayon, N = cpu_count)    │   │
+│  │                                                      │   │
+│  │  game_1: selection → expansion → [eval] → backup    │   │
+│  │  game_2: selection → expansion → [eval] → backup    │   │
+│  │  ...                                                 │   │
+│  └────────────────────────┬─────────────────────────────┘   │
+│                           │  completed GameRecord            │
+│  ┌────────────────────────▼─────────────────────────────┐   │
+│  │  Replay Buffer  (numpy ring buffer, 500K positions)  │   │
+│  └────────────────────────┬─────────────────────────────┘   │
+│                           │  sample batch=256                │
+│  ┌────────────────────────▼─────────────────────────────┐   │
+│  │  Learner  (asyncio task, runs between eval batches)  │   │
+│  │  policy loss + value loss → MLX grad update ~1ms     │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Strategy trait:
-```rust
-trait Strategy {
-    fn choose_move(&mut self, board: Board, is_black: bool) -> Option<u64>;
-}
-// Implementations: Random, Greedy, Minimax { depth }, Mcts { sims, network }
-```
+### Concurrency model
 
-### CLI Interface
-
-```bash
-# Evaluation: candidate vs champion, 200 games
-tournament --black mcts:weights=weights/candidate.bin \
-           --white mcts:weights=weights/champion.bin \
-           --games 200 --eval-mode
-
-# Self-play data generation, saves game records
-tournament --black mcts:weights=weights/v3.bin \
-           --white mcts:weights=weights/v3.bin \
-           --games 500 --save-records records/v3_selfplay.bin
-
-# Ad-hoc: minimax vs random
-tournament --black minimax:depth=6 --white random --games 1000
-```
-
-Output:
-```
-Games: 200  Black: 112W / 43L / 45D (58.5%)
-ELO delta: +47
-Records saved: records/v3_selfplay.bin (500 games, 34 821 positions)
-```
+Everything runs in **one Python process**, one asyncio event loop:
+- `eval_server.run()` — drains the leaf eval queue, fires GPU batches
+- `worker_i.run_game()` — suspends at each leaf eval request, resumes with result
+- `train_loop()` — runs between GPU batches, does one gradient step each time
+- No multiprocessing, no IPC, no locks on the hot path
 
 ### Game Record Format
 
-Binary (not JSON) — one game ≈ 5 KB, 10K games ≈ 50 MB:
-```
-GameRecord {
-  positions: Vec<{
-    board_black:  u64,
-    board_white:  u64,
-    is_black:     bool,
-    mcts_policy:  [f32; 64],   // MCTS visit count distribution
-    outcome:      f32,         // +1 / −1 / 0 from current player's POV
-  }>
-}
+```python
+@dataclass
+class Position:
+    board_black: np.uint64
+    board_white: np.uint64
+    is_black: bool
+    mcts_policy: np.ndarray   # shape [64], float32 — visit count distribution
+    outcome: np.float32       # +1 / −1 / 0 from current player's POV
+
+@dataclass
+class GameRecord:
+    positions: list[Position]
 ```
 
-### Python Training Loop
+---
+
+## Training Loop
 
 ```python
-# python/train/loop.py  (run with: uv run python -m train.loop)
+# python/train/loop.py
 
-for iteration in range(NUM_ITERATIONS):
-    # 1. Generate self-play data
-    run_tournament(
-        black=f"mcts:weights=weights/champion.bin",
-        white=f"mcts:weights=weights/champion.bin",
-        games=500,
-        save_records=f"records/iter_{iteration}.bin",
+async def main():
+    model = AlphaZeroNet()
+    eval_server = LeafEvalServer(model, batch_size=64, timeout_ms=2.0)
+    replay = ReplayBuffer(max_size=500_000)
+
+    async def worker(i):
+        w = reversi_mcts.MctsWorker(simulations=400)
+        while True:
+            record = await w.run_game(eval_server.evaluate)
+            replay.add(record)
+
+    async def train_loop():
+        opt = optim.Adam(learning_rate=1e-3)
+        loss_grad_fn = nn.value_and_grad(model, compute_loss)
+        while True:
+            if len(replay) < 10_000:
+                await asyncio.sleep(0.05)
+                continue
+            boards, policies, values = replay.sample(256)
+            loss, grads = loss_grad_fn(model, mx.array(boards),
+                                       mx.array(policies), mx.array(values))
+            opt.update(model, grads)
+            mx.eval(model.parameters(), opt.state)  # flush lazy ops
+            await asyncio.sleep(0)  # yield to eval_server
+
+    await asyncio.gather(
+        eval_server.run(),
+        train_loop(),
+        *[worker(i) for i in range(os.cpu_count() - 1)],
     )
+```
 
-    # 2. Train on collected records
-    dataset = load_records(f"records/iter_{iteration}.bin")
-    train_epoch(model, dataset)          # policy loss + value loss
-    save_weights(model, "weights/candidate.bin")
+### Self-play schedule (AlphaZero-style)
 
-    # 3. Evaluate candidate vs champion
-    result = run_tournament(
-        black="mcts:weights=weights/candidate.bin",
-        white="mcts:weights=weights/champion.bin",
-        games=200, eval_mode=True,
-    )
-
-    # 4. Promote if better
-    if result.win_rate > 0.55:
-        promote_candidate_to_champion()
+```
+Every 1 000 gradient steps:
+  1. Save checkpoint  weights/iter_{n}.safetensors
+  2. Run 50 eval games: candidate vs previous champion
+  3. If win_rate > 55% → promote candidate to champion
+  4. Export champion weights to binary for WASM: python -m train.export
 ```
 
 ---
 
 ## Implementation Phases
 
-### Phase 1 — Pure MCTS (no network, structural validation)
+### Phase 1 — Pure MCTS (no network)
 
-New crate `rust/mcts`:
-- **Selection** — PUCT with uniform prior (no network yet)
-- **Expansion** — add a node for each legal move
-- **Simulation** — random rollout OR minimax static eval at leaf
-- **Backup** — update `W(s,a)` and `N(s,a)` up the tree
+New crate `rust/mcts`, new PyO3 extension `reversi_mcts`:
+- **Selection** — PUCT with uniform prior
+- **Expansion** — add node for each legal move
+- **Simulation** — minimax static eval at leaf (reuse `rust/minimax`)
+- **Backup** — update `W(s,a)` and `N(s,a)`
+- PyO3 bindings: `MctsWorker.run_game(eval_fn)`
+- Reuses `Board` and `evaluate` from `rust/minimax`
 
-This gives a **working bot immediately**; the network plugs in later as an upgrade.
-Reuses `Board` and `evaluate` from `rust/minimax`.
+This gives a working bot immediately. NN plugs in as the eval function later.
 
-### Phase 2 — Tournament Runner
+### Phase 2 — MLX Network + LeafEvalServer
 
-New binary `tools/tournament`:
-- `Strategy` trait + `Random`, `Greedy`, `Minimax`, `MctsRollout` implementations
-- Parallel game execution (rayon)
-- Game record serialization
-- ELO tracking across runs
+```
+python/train/
+  model.py        ← AlphaZeroNet (mlx.nn.Module)
+  eval_server.py  ← LeafEvalServer (asyncio + batching)
+  replay.py       ← ReplayBuffer (numpy ring buffer)
+```
 
-This enables immediate benchmarking of Phase 1 MCTS against minimax,
-and becomes the data pipeline for training.
+Validate that Rust workers can call Python eval_fn and get results back.
 
-### Phase 3 — NN Inference Engine in Rust
+### Phase 3 — Training Loop
+
+```
+python/train/
+  loop.py         ← asyncio main: workers + eval_server + train_loop
+  loss.py         ← policy cross-entropy + value MSE
+  export.py       ← save weights to binary for Rust WASM
+```
+
+Run: `uv run python -m train.loop`
+
+### Phase 4 — NN Inference in Rust (for WASM)
 
 New crate `rust/nn`:
+- Hand-rolled forward pass: `Conv2d`, `BatchNorm2d`, `Linear`, `ReLU`, `Tanh`
+- Loads weights from `&[u8]` via `include_bytes!`
+- ~300 lines, zero dependencies
 
-```rust
-struct Network { /* layer weights */ }
+Custom weight format: `[magic: u32][version: u16][n_layers: u16][layer blobs...]`
 
-impl Network {
-    fn load(weights: &[u8]) -> Self { ... }
-    fn forward(&self, planes: &[f32; 3 * 64]) -> (PolicyOutput, ValueOutput) { ... }
-}
-```
+### Phase 5 — AlphaZero WASM Bot
 
-Layers: `Conv2d`, `BatchNorm2d`, `Linear`, `ReLU`, `Tanh`.
-Weight binary format: custom (magic bytes + version + raw f32/i8 blobs per layer).
-
-### Phase 4 — Python Self-Play Pipeline
-
-```
-python/                      # managed with uv
-  pyproject.toml
-  train/
-    model.py       ← PyTorch model (mirrors Rust architecture exactly)
-    self_play.py   ← calls tournament binary, parses records
-    loop.py        ← main training loop
-    export.py      ← export weights to binary format for Rust
-
-weights/
-  champion.bin     ← current champion (committed to repo)
-  history/         ← checkpoint archive
-```
-
-Run with: `uv run python -m train.loop`
-
-### Phase 5 — Integration: MCTS + NN → BotPlayer
-
-New crate `rust/alphazero` (or extend `rust/mcts`):
-- Loads weights via `include_bytes!("../../weights/champion.bin")`
-- MCTS leaf evaluation: instead of rollout → `network.forward(state)`
+New crate `rust/alphazero`:
+- MCTS + `rust/nn` inference
+- `include_bytes!("../../weights/champion.bin")`
 - Exported via wasm-pack as `packages/bot-alphazero`
-- Implements the same `BotPlayer` interface as `bot-minimax`
-- Tournament `Strategy` implementation added: `MctsNN { weights_path }`
+- Same `BotPlayer` interface as `bot-minimax`
 
 ### Phase 6 — Improvements
 
 - Int8 weight quantization (−75% weight size)
-- Temperature parameter for Analysis mode (expose policy distribution)
-- Dirichlet noise at tree root (exploration during self-play)
-- Progressive widening for very early tree nodes
+- Temperature schedule: high early in game (exploration), low late (exploitation)
+- Dirichlet noise at tree root during self-play
+- `mlx.optimizers.cosine_decay` learning rate schedule
 
 ---
 
@@ -242,23 +273,22 @@ New crate `rust/alphazero` (or extend `rust/mcts`):
 
 ```
 rust/
-  minimax/          ← exists
-  mcts/             ← new: pure MCTS + NN-guided MCTS
-  nn/               ← new: hand-rolled inference engine
+  minimax/          ← exists: alpha-beta search
+  mcts/             ← new: MCTS engine + PyO3 bindings
+  nn/               ← new: hand-rolled inference for WASM
 
-tools/
-  tournament/       ← new: Rust CLI binary for running strategy vs strategy
-
-python/             ← managed with uv (pyproject.toml)
+python/             ← uv project (pyproject.toml)
   train/
-    model.py
-    loop.py
-    self_play.py
-    export.py
+    model.py        ← AlphaZeroNet (mlx.nn)
+    eval_server.py  ← batched leaf evaluation
+    replay.py       ← replay buffer
+    loop.py         ← main training loop
+    loss.py         ← policy + value loss
+    export.py       ← weights → binary for Rust
 
 weights/
-  champion.bin      ← trained weights committed to the repo
-  history/          ← version archive
+  champion.bin      ← latest champion (committed, embedded in WASM)
+  history/          ← checkpoint archive (.safetensors)
 
 packages/
   bot-minimax/      ← exists
@@ -267,17 +297,20 @@ packages/
 
 ---
 
-## Tooling & Linting
+## Tooling
 
-| Layer | Tool | How to run |
-|-------|------|------------|
-| Rust | `cargo fmt` + `cargo clippy` | `cargo fmt && cargo clippy --workspace` |
+| Layer | Tool | Command |
+|-------|------|---------|
+| Rust | cargo fmt + clippy | `cargo fmt && cargo clippy --workspace` |
 | JS/TS | Biome | `bunx biome check` |
 | Python | Ruff | `uvx ruff check python/` |
 | TOML | Taplo | `uvx taplo fmt` |
-| All (pre-commit) | pre-commit | `uvx pre-commit run --all-files` |
+| All | pre-commit | `uvx pre-commit run --all-files` |
 
 Install hook: `uvx pre-commit install`
+
+Python deps: `uv sync` in `python/`
+Run training: `uv run python -m train.loop`
 
 ---
 
@@ -285,15 +318,15 @@ Install hook: `uvx pre-commit install`
 
 | Component | Complexity | Notes |
 |-----------|------------|-------|
-| Phase 1: Pure MCTS | Medium | Pure Rust, well-understood algorithm |
-| Phase 2: Tournament runner | Medium | Straightforward CLI, parallelism with rayon |
-| Phase 3: NN inference in Rust | Medium | ~300 lines, needs care with Conv2d |
-| Phase 4: Python self-play | High | Many moving parts, fragile to get right |
-| Training to good quality | High | Hyperparameter tuning, stability |
-| Phase 5: Integration + WASM | Low | Mirrors existing bot-minimax pattern |
+| Phase 1: Rust MCTS + PyO3 | Medium | PyO3 async bridge is non-trivial |
+| Phase 2: MLX model + eval server | Low | MLX API is clean, asyncio batching is ~50 lines |
+| Phase 3: Training loop | Medium | Many moving parts but each piece is simple |
+| Training to good quality | Medium | M2 Max + MLX makes iteration fast |
+| Phase 4: Rust NN inference | Medium | ~300 lines, tedious but mechanical |
+| Phase 5: WASM integration | Low | Mirrors bot-minimax pattern |
 
-The hardest part is the **Python self-play pipeline** and **training stability**.
-Everything else is straightforward engineering.
+The hardest piece is the **PyO3 async bridge** between Rust workers and the Python
+asyncio eval server. Everything else is straightforward given the architecture above.
 
 ---
 
@@ -301,10 +334,10 @@ Everything else is straightforward engineering.
 
 | # | What | Why first |
 |---|------|-----------|
-| 1 | Pure MCTS in `rust/mcts` | Validate tree structure, get a working bot |
-| 2 | Tournament runner `tools/tournament` | Enables benchmarking + data generation |
-| 3 | NN inference engine `rust/nn` | Foundation for plugging in the network |
-| 4 | Python model + export script | Defines the weight format both sides agree on |
-| 5 | Python self-play + training loop | Actual learning, most iteration needed |
-| 6 | Wire NN into MCTS, build WASM | Connect all pieces |
-| 7 | Quantization + Analysis mode polish | Nice to have once it works |
+| 1 | Rust MCTS crate (`rust/mcts`) | Core algorithm, test in isolation |
+| 2 | PyO3 bindings (`reversi_mcts` Python ext) | Connects Rust speed to Python orchestration |
+| 3 | MLX model + LeafEvalServer | Enables NN-guided search |
+| 4 | Training loop + replay buffer | Actual learning |
+| 5 | Checkpoint eval + promotion | Quality gate for weights |
+| 6 | `rust/nn` inference engine | Required for WASM deployment |
+| 7 | `bot-alphazero` WASM package | Final browser integration |

@@ -6,6 +6,7 @@
   "dependencies": {
     "@reversi/board-ui": "workspace:*",
     "@reversi/bot": "workspace:*",
+    "@reversi/bot-alphazero": "workspace:*",
     "@reversi/bot-minimax": "workspace:*",
     "@reversi/core": "workspace:*"
   },

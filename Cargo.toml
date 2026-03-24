@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust/minimax"]
+members = ["rust/alphazero", "rust/mcts", "rust/minimax", "rust/nn"]
 resolver = "2"
 
 [workspace.package]

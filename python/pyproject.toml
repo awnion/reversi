@@ -3,13 +3,21 @@ name = "reversi-train"
 version = "0.1.0"
 description = "AlphaZero self-play training pipeline for Reversi"
 requires-python = ">=3.12"
-dependencies = ["numpy>=2.4.3", "torch>=2.10.0", "tqdm>=4.67.3"]
+dependencies = ["numpy>=2.4.3", "mlx>=0.26.0", "tqdm>=4.67.3"]
 
 [dependency-groups]
-dev = ["ruff>=0.15.7", "tensorboard>=2.20.0"]
+dev = ["ruff>=0.15.7", "tensorboard>=2.20.0", "maturin>=1.8"]
+
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
 
 [tool.uv]
 package = false
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "../rust/mcts/Cargo.toml"
 
 [tool.ruff]
 target-version = "py312"

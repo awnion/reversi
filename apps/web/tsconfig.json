@@ -10,6 +10,7 @@
     { "path": "../../packages/core" },
     { "path": "../../packages/board-ui" },
     { "path": "../../packages/bot" },
-    { "path": "../../packages/bot-minimax" }
+    { "path": "../../packages/bot-minimax" },
+    { "path": "../../packages/bot-alphazero" }
   ]
 }

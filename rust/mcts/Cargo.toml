@@ -1,0 +1,19 @@
+[package]
+name = "reversi_mcts"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "reversi_mcts"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+python = ["pyo3/extension-module"]
+
+[dependencies]
+reversi_minimax = { path = "../minimax" }
+
+[dependencies.pyo3]
+features = ["abi3-py312"]
+optional = true
+version = "0.23"

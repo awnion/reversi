@@ -22,6 +22,7 @@
       "dependencies": {
         "@reversi/board-ui": "workspace:*",
         "@reversi/bot": "workspace:*",
+        "@reversi/bot-alphazero": "workspace:*",
         "@reversi/bot-minimax": "workspace:*",
         "@reversi/core": "workspace:*",
       },
@@ -36,6 +37,13 @@
     "packages/bot": {
       "name": "@reversi/bot",
       "version": "0.0.0",
+      "dependencies": {
+        "@reversi/core": "workspace:*",
+      },
+    },
+    "packages/bot-alphazero": {
+      "name": "@reversi/bot-alphazero",
+      "version": "0.0.1",
       "dependencies": {
         "@reversi/core": "workspace:*",
       },
@@ -92,6 +100,8 @@
     "@reversi/board-ui": ["@reversi/board-ui@workspace:packages/board-ui"],
 
     "@reversi/bot": ["@reversi/bot@workspace:packages/bot"],
+
+    "@reversi/bot-alphazero": ["@reversi/bot-alphazero@workspace:packages/bot-alphazero"],
 
     "@reversi/bot-minimax": ["@reversi/bot-minimax@workspace:packages/bot-minimax"],
 

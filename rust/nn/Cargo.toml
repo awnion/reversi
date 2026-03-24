@@ -1,0 +1,12 @@
+[package]
+name = "reversi_nn"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+# Enables AlphaZeroNet::zeros() — used by integration tests and benchmarks.
+# Not included in release builds.
+test-utils = []
+
+[dev-dependencies]
+reversi_nn = { path = ".", features = ["test-utils"] }

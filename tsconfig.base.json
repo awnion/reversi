@@ -19,7 +19,8 @@
       "@reversi/core": ["./packages/core/src/index.ts"],
       "@reversi/board-ui": ["./packages/board-ui/src/index.ts"],
       "@reversi/bot": ["./packages/bot/src/index.ts"],
-      "@reversi/bot-minimax": ["./packages/bot-minimax/src/index.ts"]
+      "@reversi/bot-minimax": ["./packages/bot-minimax/src/index.ts"],
+      "@reversi/bot-alphazero": ["./packages/bot-alphazero/src/index.ts"]
     }
   }
 }
