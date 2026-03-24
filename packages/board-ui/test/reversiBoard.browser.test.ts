@@ -44,7 +44,7 @@ function setup(
   onMove?: (pos: { row: number; col: number }) => void,
 ) {
   document.body.innerHTML = '<div id="board"></div>';
-  const root = document.getElementById('board')!;
+  const root = document.getElementById('board') as HTMLElement;
   const board = createReversiBoard(root, { state, onMove });
   return { root, board };
 }
