@@ -62,7 +62,7 @@ EVAL_BATCH_SIZE = 64
 
 # Tournament settings
 TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
-TOURNAMENT_GAMES = 10  # games per tournament (use even number)
+TOURNAMENT_GAMES = 40  # games per tournament (use even number)
 TOURNAMENT_SIMS = 50  # MCTS simulations per move in tournament
 WIN_THRESHOLD = 0.55  # win rate required to crown a new champion
 CHAMPION_HISTORY = 5  # keep this many past champion snapshots
@@ -127,9 +127,9 @@ async def train_loop(
             continue
         replay_at_last_step = replay.total_added
 
-        bb, bw, ib, policies, outcomes = replay.sample(BATCH_SIZE)
+        bb, bw, ib, legal, policies, outcomes = replay.sample(BATCH_SIZE)
         with lock:
-            loss, grads = loss_and_grad(model, bb, bw, ib, policies, outcomes)
+            loss, grads = loss_and_grad(model, bb, bw, ib, legal, policies, outcomes)
             grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
             opt.update(model, grads)
             mx.eval(model.parameters(), opt.state, loss)
@@ -385,8 +385,9 @@ def _record_champion(
 
 
 def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
-    """Load the checkpoint with the lowest loss.
-    Falls back to champion.bin if no .npz checkpoints exist.
+    """Load the strongest known checkpoint for continued training.
+    Prefer champion.bin because promotion is strength-based; fall back to the
+    latest .npz checkpoint only when no deployed champion exists.
     Returns (step, loss).
     """
 
@@ -396,21 +397,6 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
         except ValueError:
             return float("inf")
 
-    checkpoints = sorted(WEIGHTS_DIR.glob("iter_*.npz"), key=_loss)
-    if checkpoints:
-        best = checkpoints[0]
-        data = np.load(str(best))
-        weights = [(k, mx.array(data[k])) for k in data.files]
-        model.load_weights(weights, strict=False)
-        mx.eval(model.parameters())
-        try:
-            step = int(best.stem.split("_")[1])
-            loss = _loss(best)
-        except (IndexError, ValueError):
-            step, loss = 0, float("inf")
-        print(f"[train] resumed from {best.name} (step={step}, loss={loss:.4f})")
-        return step, loss
-
     if CHAMPION_BIN.exists():
         try:
             loaded = _load_model_from_bin(CHAMPION_BIN)
@@ -418,9 +404,28 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
                 [(k, mx.array(v)) for k, v in _iter_params(loaded)], strict=False
             )
             mx.eval(model.parameters())
-            print("[train] no .npz checkpoints; resumed from champion.bin (step=0)")
+            print("[train] resumed from champion.bin (step=0)")
+            return 0, float("inf")
         except Exception as e:
             print(f"[train] failed to load champion.bin: {e}; starting fresh")
+
+    checkpoints = sorted(
+        WEIGHTS_DIR.glob("iter_*.npz"),
+        key=lambda p: int(p.stem.split("_")[1]) if "_" in p.stem else 0,
+    )
+    if checkpoints:
+        latest = checkpoints[-1]
+        data = np.load(str(latest))
+        weights = [(k, mx.array(data[k])) for k in data.files]
+        model.load_weights(weights, strict=False)
+        mx.eval(model.parameters())
+        try:
+            step = int(latest.stem.split("_")[1])
+            loss = _loss(latest)
+        except (IndexError, ValueError):
+            step, loss = 0, float("inf")
+        print(f"[train] resumed from {latest.name} (step={step}, loss={loss:.4f})")
+        return step, loss
 
     return 0, float("inf")
 

@@ -116,6 +116,20 @@ impl MctsSearch {
         policy
     }
 
+    /// Blend root priors with externally-supplied exploration noise.
+    ///
+    /// `noise` must have one entry per root child and sum to 1.
+    pub fn add_root_noise(&mut self, noise: &[f32], epsilon: f32) {
+        let children = self.nodes[0].children.clone();
+        if children.is_empty() || children.len() != noise.len() {
+            return;
+        }
+        for (child_idx, &n) in children.iter().zip(noise.iter()) {
+            let child = &mut self.nodes[*child_idx];
+            child.p = (1.0 - epsilon) * child.p + epsilon * n;
+        }
+    }
+
     // ── private ───────────────────────────────────────────────────────────────
 
     /// Walk down the tree from `start` using PUCT until reaching an unexpanded node.

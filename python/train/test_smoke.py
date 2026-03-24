@@ -39,6 +39,7 @@ def test_replay_buffer():
             "board_black": 1,
             "board_white": 2,
             "is_black": True,
+            "legal": 4,
             "mcts_policy": np.ones(64) / 64,
             "outcome": 1.0,
         }
@@ -46,7 +47,7 @@ def test_replay_buffer():
     buf.add(fake_record)
     assert len(buf) == 1
     sample = buf.sample(1)
-    assert len(sample) == 5
+    assert len(sample) == 6
     print("✓ replay buffer")
 
 
@@ -58,10 +59,11 @@ def test_compute_loss():
     boards_black = np.array([1, 2, 3, 4], dtype=np.uint64)
     boards_white = np.array([8, 16, 32, 64], dtype=np.uint64)
     is_black_arr = np.array([True, False, True, False])
+    legal_arr = np.array([4, 8, 16, 32], dtype=np.uint64)
     policies = np.ones((B, 64), dtype=np.float32) / 64
     outcomes = np.array([1.0, -1.0, 0.0, 1.0], dtype=np.float32)
     loss = compute_loss(
-        net, boards_black, boards_white, is_black_arr, policies, outcomes
+        net, boards_black, boards_white, is_black_arr, legal_arr, policies, outcomes
     )
     mx.eval(loss)
     loss_val = float(loss.item())

@@ -11,6 +11,7 @@ class ReplayBuffer:
         self._boards_black = np.zeros(max_size, dtype=np.uint64)
         self._boards_white = np.zeros(max_size, dtype=np.uint64)
         self._is_black = np.zeros(max_size, dtype=bool)
+        self._legal = np.zeros(max_size, dtype=np.uint64)
         self._policies = np.zeros((max_size, 64), dtype=np.float32)
         self._outcomes = np.zeros(max_size, dtype=np.float32)
         self._ptr = 0
@@ -24,6 +25,7 @@ class ReplayBuffer:
             self._boards_black[i] = pos["board_black"]
             self._boards_white[i] = pos["board_white"]
             self._is_black[i] = pos["is_black"]
+            self._legal[i] = pos["legal"]
             self._policies[i] = pos["mcts_policy"]
             self._outcomes[i] = pos["outcome"]
             self._ptr = (self._ptr + 1) % self.max_size
@@ -36,6 +38,7 @@ class ReplayBuffer:
             self._boards_black[idx],
             self._boards_white[idx],
             self._is_black[idx],
+            self._legal[idx],
             self._policies[idx],
             self._outcomes[idx],
         )
@@ -50,6 +53,7 @@ class ReplayBuffer:
             boards_black=self._boards_black[: self._size],
             boards_white=self._boards_white[: self._size],
             is_black=self._is_black[: self._size],
+            legal=self._legal[: self._size],
             policies=self._policies[: self._size],
             outcomes=self._outcomes[: self._size],
             ptr=np.array(self._ptr % self._size if self._size else 0),
@@ -63,6 +67,9 @@ class ReplayBuffer:
         if not path.exists():
             return
         data = np.load(str(path))
+        if "legal" not in data:
+            print(f"[replay] {path} has no legal-move plane; ignoring stale buffer")
+            return
         n = len(data["boards_black"])
         if n == 0:
             return
@@ -70,6 +77,7 @@ class ReplayBuffer:
         self._boards_black[:n] = data["boards_black"][:n]
         self._boards_white[:n] = data["boards_white"][:n]
         self._is_black[:n] = data["is_black"][:n]
+        self._legal[:n] = data["legal"][:n]
         self._policies[:n] = data["policies"][:n]
         self._outcomes[:n] = data["outcomes"][:n]
         self._size = n

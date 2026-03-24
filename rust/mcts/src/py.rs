@@ -76,7 +76,7 @@ impl MctsWorker {
     /// When `None` (or omitted), falls back to the minimax static evaluator.
     ///
     /// Returns a list of dicts, one per move:
-    ///   `{board_black, board_white, is_black, mcts_policy, outcome}`
+    ///   `{board_black, board_white, is_black, legal, mcts_policy, outcome}`
     #[pyo3(signature = (eval_fn=None))]
     pub fn run_game<'py>(
         &self,
@@ -99,6 +99,7 @@ impl MctsWorker {
             d.set_item("board_black", pos.board.black)?;
             d.set_item("board_white", pos.board.white)?;
             d.set_item("is_black", pos.is_black)?;
+            d.set_item("legal", pos.legal)?;
             d.set_item("mcts_policy", pos.mcts_policy.to_vec())?;
             d.set_item("outcome", pos.outcome)?;
             list.append(d)?;

@@ -7,12 +7,19 @@ from .model import AlphaZeroNet
 
 
 def compute_loss(
-    model: AlphaZeroNet, boards_black, boards_white, is_black_arr, policies, outcomes
+    model: AlphaZeroNet,
+    boards_black,
+    boards_white,
+    is_black_arr,
+    legal_arr,
+    policies,
+    outcomes,
 ):
     """
     boards_black, boards_white: (B,) uint64 numpy arrays
     boards_black, boards_white: (batch_size,) uint64 numpy arrays
     is_black_arr: (batch_size,) bool numpy array
+    legal_arr: (batch_size,) uint64 numpy array
     policies: (batch_size, 64) float32 — MCTS visit-count targets
     outcomes: (batch_size,) float32 — game outcomes from current player's POV
 
@@ -23,7 +30,10 @@ def compute_loss(
     planes = np.stack(
         [
             board_to_planes(
-                int(boards_black[i]), int(boards_white[i]), bool(is_black_arr[i]), 0
+                int(boards_black[i]),
+                int(boards_white[i]),
+                bool(is_black_arr[i]),
+                int(legal_arr[i]),
             )
             for i in range(batch_size)
         ]
