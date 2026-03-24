@@ -1,24 +1,22 @@
 import { createReversiBoard } from '@reversi/board-ui';
 import { greedyBot } from '@reversi/bot';
-import { createAlphaZeroBot } from '@reversi/bot-alphazero';
-import { createMinimaxBot } from '@reversi/bot-minimax';
 import { countDiscs, createInitialState, type GameState } from '@reversi/core';
 import { GameController, type PlayerConfig } from './gameController';
+import { BotWorkerPool, createWorkerBot } from './workerBot';
 
 import './styles.css';
 
-const minimax1s = await createMinimaxBot('Minimax 1s');
-const minimax5s = await createMinimaxBot('Minimax 5s');
-const alphazero200 = await createAlphaZeroBot('AlphaZero (200)', 200);
+const pool = new BotWorkerPool();
+const minimaxBot = createWorkerBot(pool, 'minimax', 'Minimax');
+const alphazeroBot = createWorkerBot(pool, 'alphazero', 'AlphaZero');
 
 const app = document.getElementById('app');
 if (!app) throw new Error('Missing app root');
 
 function requireElement<T extends HTMLElement>(id: string): T {
-  const element = document.getElementById(id);
-  if (!(element instanceof HTMLElement))
-    throw new Error(`Missing element #${id}`);
-  return element as T;
+  const el = document.getElementById(id);
+  if (!(el instanceof HTMLElement)) throw new Error(`Missing element #${id}`);
+  return el as T;
 }
 
 app.innerHTML = `
@@ -29,28 +27,31 @@ app.innerHTML = `
     <aside class="sidebar">
       <h1>Reversi</h1>
       <div class="player-selection" style="margin-bottom: 20px;">
-        <label>
-          Black:
-          <select id="player-black">
+        <div class="player-row">
+          <span class="player-label">Black:</span>
+          <select id="strategy-black">
             <option value="human">Human</option>
-            <option value="bot-greedy">Greedy (instant)</option>
-            <option value="bot-minimax-1s">Minimax (1s)</option>
-            <option value="bot-minimax-5s">Minimax (5s)</option>
-            <option value="bot-alphazero">AlphaZero (200)</option>
+            <option value="greedy">Greedy</option>
+            <option value="minimax">Minimax</option>
+            <option value="alphazero">AlphaZero</option>
           </select>
-        </label>
+          <select id="time-black" class="time-select" disabled>
+            ${timeOptions()}
+          </select>
+        </div>
+        <div class="player-row" style="margin-top: 8px;">
+          <span class="player-label">White:</span>
+          <select id="strategy-white">
+            <option value="human">Human</option>
+            <option value="greedy">Greedy</option>
+            <option value="minimax">Minimax</option>
+            <option value="alphazero">AlphaZero</option>
+          </select>
+          <select id="time-white" class="time-select" disabled>
+            ${timeOptions()}
+          </select>
+        </div>
         <br />
-        <label>
-          White:
-          <select id="player-white">
-            <option value="human">Human</option>
-            <option value="bot-greedy">Greedy (instant)</option>
-            <option value="bot-minimax-1s">Minimax (1s)</option>
-            <option value="bot-minimax-5s">Minimax (5s)</option>
-            <option value="bot-alphazero">AlphaZero (200)</option>
-          </select>
-        </label>
-        <br /><br />
         <button id="new-game-button" type="button">New Game</button>
       </div>
       <hr style="margin-bottom: 20px;" />
@@ -64,26 +65,54 @@ app.innerHTML = `
   </main>
 `;
 
+function timeOptions(): string {
+  return Array.from({ length: 10 }, (_, i) => i + 1)
+    .map(
+      (s) =>
+        `<option value="${s * 1000}"${s === 1 ? ' selected' : ''}>${s}s</option>`,
+    )
+    .join('');
+}
+
+const strategyBlack = requireElement<HTMLSelectElement>('strategy-black');
+const strategyWhite = requireElement<HTMLSelectElement>('strategy-white');
+const timeBlack = requireElement<HTMLSelectElement>('time-black');
+const timeWhite = requireElement<HTMLSelectElement>('time-white');
 const boardRoot = requireElement<HTMLDivElement>('board-root');
 const statusNode = requireElement<HTMLParagraphElement>('status');
 const scoreNode = requireElement<HTMLParagraphElement>('score');
 const passButton = requireElement<HTMLButtonElement>('pass-button');
 const newGameButton = requireElement<HTMLButtonElement>('new-game-button');
-const playerBlackSelect = requireElement<HTMLSelectElement>('player-black');
-const playerWhiteSelect = requireElement<HTMLSelectElement>('player-white');
 
-function getPlayerConfig(select: HTMLSelectElement): PlayerConfig {
-  if (select.value === 'bot-greedy') {
+function syncTimeSelect(
+  strategy: HTMLSelectElement,
+  time: HTMLSelectElement,
+): void {
+  const needsTime =
+    strategy.value === 'minimax' || strategy.value === 'alphazero';
+  time.disabled = !needsTime;
+}
+
+strategyBlack.addEventListener('change', () =>
+  syncTimeSelect(strategyBlack, timeBlack),
+);
+strategyWhite.addEventListener('change', () =>
+  syncTimeSelect(strategyWhite, timeWhite),
+);
+
+function getPlayerConfig(
+  strategy: HTMLSelectElement,
+  time: HTMLSelectElement,
+): PlayerConfig {
+  const thinkMs = parseInt(time.value, 10);
+  if (strategy.value === 'greedy') {
     return { type: 'bot', player: greedyBot, thinkMs: 300 };
   }
-  if (select.value === 'bot-minimax-1s') {
-    return { type: 'bot', player: minimax1s, thinkMs: 1000 };
+  if (strategy.value === 'minimax') {
+    return { type: 'bot', player: minimaxBot, thinkMs };
   }
-  if (select.value === 'bot-minimax-5s') {
-    return { type: 'bot', player: minimax5s, thinkMs: 5000 };
-  }
-  if (select.value === 'bot-alphazero') {
-    return { type: 'bot', player: alphazero200, thinkMs: 0 };
+  if (strategy.value === 'alphazero') {
+    return { type: 'bot', player: alphazeroBot, thinkMs };
   }
   return { type: 'human' };
 }
@@ -121,8 +150,8 @@ function sync(nextState: GameState): void {
 controller = new GameController(
   createInitialState(),
   {
-    black: getPlayerConfig(playerBlackSelect),
-    white: getPlayerConfig(playerWhiteSelect),
+    black: getPlayerConfig(strategyBlack, timeBlack),
+    white: getPlayerConfig(strategyWhite, timeWhite),
   },
   sync,
 );
@@ -131,28 +160,28 @@ passButton.addEventListener('click', () => {
   if (controller) void controller.pass();
 });
 
-const analyzeButton = requireElement<HTMLButtonElement>('analyze-button');
-const analysisResultsNode = requireElement<HTMLDivElement>('analysis-results');
-
 newGameButton.addEventListener('click', () => {
   if (controller) {
-    analysisResultsNode.innerHTML = '';
+    requireElement<HTMLDivElement>('analysis-results').innerHTML = '';
     controller.newGame(
       {
-        black: getPlayerConfig(playerBlackSelect),
-        white: getPlayerConfig(playerWhiteSelect),
+        black: getPlayerConfig(strategyBlack, timeBlack),
+        white: getPlayerConfig(strategyWhite, timeWhite),
       },
       createInitialState(),
     );
   }
 });
 
+const analyzeButton = requireElement<HTMLButtonElement>('analyze-button');
+const analysisResultsNode = requireElement<HTMLDivElement>('analysis-results');
+
 analyzeButton.addEventListener('click', async () => {
   if (!controller) return;
   analyzeButton.disabled = true;
   analysisResultsNode.innerHTML = 'Analyzing...';
   try {
-    const analysis = await minimax5s.analyzePosition(controller.state, 1000);
+    const analysis = await minimaxBot.analyzePosition(controller.state, 5000);
     analysisResultsNode.innerHTML = `
       <h4>Ranked Moves</h4>
       <ul style="padding-left: 20px;">
@@ -160,7 +189,7 @@ analyzeButton.addEventListener('click', async () => {
         ${analysis.moves.map((m) => `<li>R${m.position.row} C${m.position.col}: Score ${m.score}</li>`).join('')}
       </ul>
     `;
-  } catch (e) {
+  } catch {
     analysisResultsNode.innerHTML = 'Analysis unavailable.';
   } finally {
     analyzeButton.disabled = false;

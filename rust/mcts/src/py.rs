@@ -3,7 +3,7 @@ use pyo3::types::PyDict;
 use pyo3::types::PyList;
 use reversi_minimax::board::Board;
 
-use crate::game::play_game;
+use crate::game::{play_game, play_match};
 use crate::search::EvalFn;
 use crate::search::StaticEval;
 
@@ -106,7 +106,23 @@ impl MctsWorker {
     }
 }
 
+/// Play one game between two Python eval callables.
+/// Returns +1.0 if black wins, -1.0 if white wins, 0.0 if draw.
+#[pyfunction]
+#[pyo3(signature = (eval_black, eval_white, simulations=50))]
+pub fn run_match(
+    py: Python,
+    eval_black: PyObject,
+    eval_white: PyObject,
+    simulations: u32,
+) -> PyResult<f32> {
+    let eb = PyEvalFn { callable: eval_black };
+    let ew = PyEvalFn { callable: eval_white };
+    Ok(py.allow_threads(|| play_match(&eb, &ew, simulations)))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MctsWorker>()?;
+    m.add_function(wrap_pyfunction!(run_match, m)?)?;
     Ok(())
 }

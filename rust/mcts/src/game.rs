@@ -25,6 +25,45 @@ pub struct GameRecord {
 
 // ── play_game ──────────────────────────────────────────────────────────────
 
+/// Play one game between two different evaluators.
+/// Returns +1 if black wins, -1 if white wins, 0 if draw.
+pub fn play_match(eval_black: &dyn EvalFn, eval_white: &dyn EvalFn, simulations: u32) -> f32 {
+    let mut board = Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36));
+    let mut is_black = true;
+    let mut pass_count = 0;
+
+    loop {
+        let legal = board.legal_moves(is_black);
+        if legal == 0 {
+            pass_count += 1;
+            if pass_count >= 2 {
+                break;
+            }
+            is_black = !is_black;
+            continue;
+        }
+        pass_count = 0;
+
+        let eval: &dyn EvalFn = if is_black { eval_black } else { eval_white };
+        let mut mcts = MctsSearch::new(board, is_black);
+        for _ in 0..simulations {
+            mcts.simulate(eval);
+        }
+        if let Some(m) = mcts.best_move() {
+            board = board.apply_move(is_black, m);
+        }
+        is_black = !is_black;
+    }
+
+    let b = board.black.count_ones();
+    let w = board.white.count_ones();
+    match b.cmp(&w) {
+        std::cmp::Ordering::Greater => 1.0,
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => 0.0,
+    }
+}
+
 /// Play one complete game of self-play using MCTS, returning all positions.
 ///
 /// `simulations` — number of MCTS simulations per move.

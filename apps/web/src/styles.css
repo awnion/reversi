@@ -145,3 +145,17 @@ button {
     width: min(92vw, 720px);
   }
 }
+
+.player-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.player-label {
+  min-width: 44px;
+}
+
+.time-select:disabled {
+  opacity: 0.35;
+}

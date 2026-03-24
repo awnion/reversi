@@ -32,18 +32,14 @@ function toBitboards(state: GameState) {
 
 export async function createAlphaZeroBot(
   name: string = 'AlphaZero',
-  simulations: number = 200,
 ): Promise<BotPlayer> {
   await init();
-  const wasm = new WasmBot(simulations);
+  const wasm = new WasmBot();
 
   return {
     name,
 
-    async chooseMove(
-      state: GameState,
-      _timeLimitMs: number,
-    ): Promise<Position> {
+    async chooseMove(state: GameState, timeLimitMs: number): Promise<Position> {
       const { blackLow, blackHigh, whiteLow, whiteHigh } = toBitboards(state);
       const moveIdx = wasm.choose_move(
         blackLow,
@@ -51,6 +47,7 @@ export async function createAlphaZeroBot(
         whiteLow,
         whiteHigh,
         state.currentPlayer === 'black',
+        timeLimitMs,
       );
       if (moveIdx === -1) {
         throw new Error('AlphaZero bot could not find a valid move');
@@ -60,7 +57,7 @@ export async function createAlphaZeroBot(
 
     async analyzePosition(
       state: GameState,
-      _timeLimitMs: number,
+      timeLimitMs: number,
     ): Promise<PositionAnalysis> {
       const { blackLow, blackHigh, whiteLow, whiteHigh } = toBitboards(state);
       const policyArr = wasm.analyze_position(
@@ -69,6 +66,7 @@ export async function createAlphaZeroBot(
         whiteLow,
         whiteHigh,
         state.currentPlayer === 'black',
+        timeLimitMs,
       );
 
       const moves: MoveEval[] = [];

@@ -14,7 +14,6 @@ struct NnEval {
 
 impl EvalFn for NnEval {
     fn evaluate(&self, board: Board, is_black: bool, legal: u64) -> ([f32; 64], f32) {
-        // Build 3×8×8 channel-first planes
         let my_bits = if is_black { board.black } else { board.white };
         let opp_bits = if is_black { board.white } else { board.black };
         let mut planes = [0.0f32; 3 * 64];
@@ -40,21 +39,41 @@ fn make_eval() -> Box<dyn EvalFn> {
     }
 }
 
+fn run_mcts_timed(mcts: &mut MctsSearch, eval: &dyn EvalFn, time_ms: f64) {
+    let deadline = js_sys::Date::now() + time_ms;
+    loop {
+        for _ in 0..10 {
+            mcts.simulate(eval);
+        }
+        if js_sys::Date::now() >= deadline {
+            break;
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct AlphaZeroBot {
-    simulations: u32,
+    eval: Box<dyn EvalFn>,
 }
 
 #[wasm_bindgen]
 impl AlphaZeroBot {
     #[wasm_bindgen(constructor)]
-    pub fn new(simulations: u32) -> AlphaZeroBot {
-        AlphaZeroBot { simulations }
+    pub fn new() -> AlphaZeroBot {
+        AlphaZeroBot { eval: make_eval() }
     }
 
-    /// Choose best move. Returns bit index (0–63) or -1 if no legal moves.
-    /// Board passed as four u32 (split from two u64).
-    pub fn choose_move(&self, bl: u32, bh: u32, wl: u32, wh: u32, is_black: bool) -> i32 {
+    /// Choose best move within `think_ms` milliseconds.
+    /// Returns bit index (0–63) or -1 if no legal moves.
+    pub fn choose_move(
+        &self,
+        bl: u32,
+        bh: u32,
+        wl: u32,
+        wh: u32,
+        is_black: bool,
+        think_ms: f64,
+    ) -> i32 {
         let black = (bh as u64) << 32 | bl as u64;
         let white = (wh as u64) << 32 | wl as u64;
         let board = Board::new(black, white);
@@ -64,11 +83,8 @@ impl AlphaZeroBot {
             return -1;
         }
 
-        let eval = make_eval();
         let mut mcts = MctsSearch::new(board, is_black);
-        for _ in 0..self.simulations {
-            mcts.simulate(eval.as_ref());
-        }
+        run_mcts_timed(&mut mcts, self.eval.as_ref(), think_ms);
 
         mcts.best_move().map(|m| m.trailing_zeros() as i32).unwrap_or(-1)
     }
@@ -81,20 +97,17 @@ impl AlphaZeroBot {
         wl: u32,
         wh: u32,
         is_black: bool,
+        think_ms: f64,
     ) -> js_sys::Float32Array {
         let black = (bh as u64) << 32 | bl as u64;
         let white = (wh as u64) << 32 | wl as u64;
         let board = Board::new(black, white);
 
         let legal = board.legal_moves(is_black);
-        let eval = make_eval();
         let mut mcts = MctsSearch::new(board, is_black);
-        for _ in 0..self.simulations {
-            mcts.simulate(eval.as_ref());
-        }
+        run_mcts_timed(&mut mcts, self.eval.as_ref(), think_ms);
 
         let policy = mcts.policy_target();
-        // Zero out illegal squares
         let mut result = policy;
         for i in 0..64 {
             if (legal >> i) & 1 == 0 {
@@ -107,6 +120,6 @@ impl AlphaZeroBot {
 
 impl Default for AlphaZeroBot {
     fn default() -> Self {
-        Self::new(200)
+        Self::new()
     }
 }

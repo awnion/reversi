@@ -7,23 +7,19 @@ import numpy as np
 
 from .model import AlphaZeroNet
 
+_SHIFTS = np.arange(64, dtype=np.uint64)
+
 
 def board_to_planes(
     board_black: int, board_white: int, is_black: bool, legal: int
 ) -> np.ndarray:
-    """Convert bitboard ints to 3x8x8 float32 planes."""
-    planes = np.zeros((3, 8, 8), dtype=np.float32)
+    """Convert bitboard ints to 3×8×8 float32 planes (vectorised)."""
     my_bits = board_black if is_black else board_white
     opp_bits = board_white if is_black else board_black
-    for i in range(64):
-        r, c = i // 8, i % 8
-        if (my_bits >> i) & 1:
-            planes[0, r, c] = 1.0
-        if (opp_bits >> i) & 1:
-            planes[1, r, c] = 1.0
-        if (legal >> i) & 1:
-            planes[2, r, c] = 1.0
-    return planes
+    bits = np.array([my_bits, opp_bits, legal], dtype=np.uint64)
+    return (
+        ((bits[:, None] >> _SHIFTS) & np.uint64(1)).astype(np.float32).reshape(3, 8, 8)
+    )
 
 
 class LeafEvalServer:
@@ -117,10 +113,12 @@ class SyncBatchEval:
         model: AlphaZeroNet,
         batch_size: int = 16,
         timeout: float = 0.005,
+        lock=None,
     ):
         self.model = model
         self.batch_size = batch_size
         self.timeout = timeout
+        self.lock = lock or threading.Lock()
         self._q: queue.Queue = queue.Queue()
         self._running = True
         self._thread = threading.Thread(target=self._model_loop, daemon=True)
@@ -145,9 +143,13 @@ class SyncBatchEval:
 
             planes_batch = np.stack([it[0] for it in items])  # (N, 3, 8, 8)
             x = mx.array(planes_batch)
-            self.model.eval()
-            policy_logits, values = self.model(x)
-            self.model.train()
+
+            with self.lock:
+                self.model.eval()
+                policy_logits, values = self.model(x)
+                mx.eval(policy_logits, values)
+                self.model.train()
+
             policies_np = np.array(policy_logits)
             values_np = np.array(values)
 

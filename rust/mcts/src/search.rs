@@ -130,7 +130,9 @@ impl MctsSearch {
                 .children
                 .iter()
                 .max_by(|&&a, &&b| {
-                    self.puct(a, parent_n).partial_cmp(&self.puct(b, parent_n)).unwrap()
+                    let pa = self.puct(a, parent_n);
+                    let pb = self.puct(b, parent_n);
+                    pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
         }
