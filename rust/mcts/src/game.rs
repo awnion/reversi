@@ -17,6 +17,8 @@ pub struct PositionRecord {
     pub mcts_policy: [f32; 64],
     /// Game outcome from this player's perspective: +1 win, -1 loss, 0 draw.
     pub outcome: f32,
+    pub policy_weight: f32,
+    pub value_weight: f32,
 }
 
 /// Full record of one self-play game.
@@ -82,8 +84,8 @@ pub fn play_game(eval: &dyn EvalFn, simulations: u32) -> GameRecord {
     let mut ply = 0usize;
     let mut rng = SimpleRng::new();
 
-    // Collect (board, is_black, legal, policy) before we know the outcome.
-    let mut raw: Vec<(Board, bool, u64, [f32; 64])> = Vec::new();
+    // Collect raw samples before we know the final outcome.
+    let mut raw: Vec<(Board, bool, u64, [f32; 64], f32, f32)> = Vec::new();
 
     loop {
         let legal = board.legal_moves(is_black);
@@ -111,7 +113,10 @@ pub fn play_game(eval: &dyn EvalFn, simulations: u32) -> GameRecord {
         }
 
         let policy = mcts.policy_target();
-        raw.push((board, is_black, legal, policy));
+        raw.push((board, is_black, legal, policy, 1.0, 1.0));
+        if (board.black | board.white).count_ones() == 63 {
+            raw.push((board, is_black, legal, policy, 0.0, 2.0));
+        }
 
         // Sample from visit counts in the opening to keep self-play diverse.
         let selected = if ply < SELF_PLAY_TEMPERATURE_MOVES {
@@ -138,10 +143,38 @@ pub fn play_game(eval: &dyn EvalFn, simulations: u32) -> GameRecord {
 
     let positions = raw
         .into_iter()
-        .map(|(b, ib, legal, policy)| {
+        .map(|(b, ib, legal, policy, policy_weight, value_weight)| {
             let outcome = if ib { black_outcome } else { -black_outcome };
-            PositionRecord { board: b, is_black: ib, legal, mcts_policy: policy, outcome }
+            PositionRecord {
+                board: b,
+                is_black: ib,
+                legal,
+                mcts_policy: policy,
+                outcome,
+                policy_weight,
+                value_weight,
+            }
         })
+        .chain([
+            PositionRecord {
+                board,
+                is_black: true,
+                legal: 0,
+                mcts_policy: [0.0; 64],
+                outcome: black_outcome,
+                policy_weight: 0.0,
+                value_weight: 2.0,
+            },
+            PositionRecord {
+                board,
+                is_black: false,
+                legal: 0,
+                mcts_policy: [0.0; 64],
+                outcome: -black_outcome,
+                policy_weight: 0.0,
+                value_weight: 2.0,
+            },
+        ])
         .collect();
 
     GameRecord { positions, black_discs, white_discs }

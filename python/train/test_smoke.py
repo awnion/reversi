@@ -10,7 +10,7 @@ from train.replay import ReplayBuffer
 
 def test_model_forward():
     net = AlphaZeroNet()
-    x = mx.random.normal((4, 3, 8, 8))
+    x = mx.random.normal((4, 4, 8, 8))
     policy, value = net(x)
     mx.eval(policy, value)
     assert policy.shape == (4, 64), f"bad policy shape: {policy.shape}"
@@ -26,9 +26,10 @@ def test_board_planes():
     white = (1 << 27) | (1 << 36)
     legal = 0  # just test shape
     planes = board_to_planes(black, white, True, legal)
-    assert planes.shape == (3, 8, 8)
+    assert planes.shape == (4, 8, 8)
     assert planes[0].sum() == 2  # 2 black discs
     assert planes[1].sum() == 2  # 2 white discs
+    assert np.allclose(planes[3], 4 / 64)
     print("✓ board_to_planes")
 
 
@@ -42,12 +43,14 @@ def test_replay_buffer():
             "legal": 4,
             "mcts_policy": np.ones(64) / 64,
             "outcome": 1.0,
+            "policy_weight": 1.0,
+            "value_weight": 1.0,
         }
     ]
     buf.add(fake_record)
     assert len(buf) == 1
     sample = buf.sample(1)
-    assert len(sample) == 6
+    assert len(sample) == 8
     print("✓ replay buffer")
 
 
@@ -62,8 +65,18 @@ def test_compute_loss():
     legal_arr = np.array([4, 8, 16, 32], dtype=np.uint64)
     policies = np.ones((B, 64), dtype=np.float32) / 64
     outcomes = np.array([1.0, -1.0, 0.0, 1.0], dtype=np.float32)
+    policy_weights = np.ones(B, dtype=np.float32)
+    value_weights = np.ones(B, dtype=np.float32)
     loss = compute_loss(
-        net, boards_black, boards_white, is_black_arr, legal_arr, policies, outcomes
+        net,
+        boards_black,
+        boards_white,
+        is_black_arr,
+        legal_arr,
+        policies,
+        outcomes,
+        policy_weights,
+        value_weights,
     )
     mx.eval(loss)
     loss_val = float(loss.item())

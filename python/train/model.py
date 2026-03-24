@@ -21,7 +21,7 @@ class AlphaZeroNet(nn.Module):
     def __init__(self, channels: int = 32, n_blocks: int = 4):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, channels, 3, padding=1),
+            nn.Conv2d(4, channels, 3, padding=1),
             nn.BatchNorm(channels),
             nn.ReLU(),
         )
@@ -37,9 +37,8 @@ class AlphaZeroNet(nn.Module):
         self.value_fc2 = nn.Linear(64, 1)
 
     def __call__(self, x):
-        # x: (B, 3, 8, 8) — MLX uses (B, H, W, C) internally but we transpose
-        # MLX Conv2d expects (B, H, W, C)
-        x = mx.transpose(x, (0, 2, 3, 1))  # → (B, 8, 8, 3)
+        # Input planes: my pieces, opp pieces, legal moves, phase.
+        x = mx.transpose(x, (0, 2, 3, 1))  # → (B, 8, 8, 4)
         x = self.stem(x)
         for block in self.blocks:
             x = block(x)

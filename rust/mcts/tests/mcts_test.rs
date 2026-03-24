@@ -47,7 +47,12 @@ fn game_policies_sum_to_one() {
     let record = play_game(&eval, 20);
     for (i, pos) in record.positions.iter().enumerate() {
         let sum: f32 = pos.mcts_policy.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "position {i} policy sum = {sum}");
+        if pos.policy_weight > 0.0 {
+            assert!((sum - 1.0).abs() < 1e-5, "position {i} policy sum = {sum}");
+        } else {
+            let valid = sum.abs() < 1e-5 || (sum - 1.0).abs() < 1e-5;
+            assert!(valid, "value-only position {i} policy sum = {sum}");
+        }
     }
 }
 

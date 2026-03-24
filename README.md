@@ -67,16 +67,21 @@ tail -f /tmp/reversi_train.log
 
 Training runs continuously and:
 - Waits until 30 000 positions are collected before starting gradient updates
+- Uses 80 MCTS simulations per move during self-play
 - Rate-limits training to 1 gradient step per 10 new positions (prevents overfitting)
 - Uses AdamW (`lr=3e-4`, `weight_decay=1e-4`) with step-decay ×0.1 every 5 000 steps
 - Policy targets use label smoothing (ε=0.1) to prevent memorisation of peaked MCTS distributions;
   loss floor with smoothing is ~0.69, healthy training range is 0.70–0.80
 - Auto-resumes from `weights/champion.bin` on restart; falls back to the latest checkpoint in `weights/`
-- Stores the legal-move bitmask in replay so training sees the same 3 input planes as self-play/eval
+- Stores the legal-move bitmask in replay so training sees the same spatial planes as self-play/eval
+- Adds a phase feature (`occupied_count / 64`) so the net can distinguish opening from endgame
+- Adds value-only endgame samples for forced last moves and terminal boards
 - Self-play uses stochastic openings (root noise + sampling from visit counts in the early game)
 - Saves checkpoints to `weights/iter_<step>_loss<value>.npz`
-- Runs a **mini-tournament** every 3 000 steps: current model plays 40 games vs `champion.bin`;
-  if it wins ≥55 % it becomes the new champion automatically
+- Runs a **mini-tournament** every 3 000 steps: `champion.bin`, the current model,
+  and 2 recent checkpoints play a small round-robin (8 games per pairing)
+- If the winner is not the current champion and scores at least 55 % of the maximum points,
+  it becomes the new champion automatically
 - Keeps the last 5 champions with date and win-rate in `weights/champions/history.json`
 
 ### Run tournament (manual)

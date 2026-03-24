@@ -25,7 +25,7 @@ import numpy as np
 
 from .eval_server import board_to_planes
 from .export import MAGIC, VERSION, export_model
-from .loop import _record_champion
+from .loop import _load_compatible_weights, _record_champion
 from .model import AlphaZeroNet
 
 WEIGHTS_DIR = Path(__file__).parent.parent.parent / "weights"
@@ -37,7 +37,7 @@ def load_model(checkpoint: Path) -> AlphaZeroNet:
     model = AlphaZeroNet()
     data = np.load(str(checkpoint))
     weights = [(k, mx.array(data[k])) for k in data.files]
-    model.load_weights(weights, strict=False)
+    _load_compatible_weights(model, weights)
     mx.eval(model.parameters())
     model.eval()
     return model
@@ -62,7 +62,7 @@ def load_model_from_bin(bin_path: Path) -> AlphaZeroNet:
             arr = np.frombuffer(f.read(n_elems * 4), dtype=np.float32).reshape(shape)
             weights.append((name, mx.array(arr)))
     model = AlphaZeroNet()
-    model.load_weights(weights, strict=False)
+    _load_compatible_weights(model, weights)
     mx.eval(model.parameters())
     model.eval()
     return model

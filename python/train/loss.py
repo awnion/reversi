@@ -14,6 +14,8 @@ def compute_loss(
     legal_arr,
     policies,
     outcomes,
+    policy_weights,
+    value_weights,
 ):
     """
     boards_black, boards_white: (B,) uint64 numpy arrays
@@ -22,11 +24,12 @@ def compute_loss(
     legal_arr: (batch_size,) uint64 numpy array
     policies: (batch_size, 64) float32 — MCTS visit-count targets
     outcomes: (batch_size,) float32 — game outcomes from current player's POV
+    policy_weights, value_weights: per-sample weights
 
     Returns scalar loss.
     """
     batch_size = len(boards_black)
-    # Build input planes (batch_size, 3, 8, 8)
+    # Build input planes (batch_size, 4, 8, 8)
     planes = np.stack(
         [
             board_to_planes(
@@ -47,10 +50,25 @@ def compute_loss(
     log_probs = nn.log_softmax(policy_logits, axis=-1)
     policy_targets = mx.array(policies)
     policy_targets = 0.9 * policy_targets + 0.1 / 64.0
-    policy_loss = -mx.mean(mx.sum(policy_targets * log_probs, axis=-1))
+    policy_weights = mx.array(policy_weights)
+    policy_loss_per = -mx.sum(policy_targets * log_probs, axis=-1)
+    policy_norm = mx.maximum(mx.sum(policy_weights), mx.array(1.0))
+    policy_loss = mx.sum(policy_loss_per * policy_weights) / policy_norm
 
     # Value loss: MSE
     value_targets = mx.array(outcomes)
-    value_loss = mx.mean((values - value_targets) ** 2)
+    phase = mx.array(
+        np.array(
+            [
+                ((int(boards_black[i]) | int(boards_white[i])).bit_count()) / 64.0
+                for i in range(batch_size)
+            ],
+            dtype=np.float32,
+        )
+    )
+    value_weights = mx.array(value_weights) * (0.5 + 1.5 * phase)
+    value_loss_per = (values - value_targets) ** 2
+    value_norm = mx.maximum(mx.sum(value_weights), mx.array(1.0))
+    value_loss = mx.sum(value_loss_per * value_weights) / value_norm
 
     return policy_loss + value_loss

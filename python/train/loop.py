@@ -36,7 +36,7 @@ from .replay import ReplayBuffer
 
 # --- hyper-parameters --------------------------------------------------------
 
-SIMULATIONS = 50
+SIMULATIONS = 80
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
@@ -62,7 +62,8 @@ EVAL_BATCH_SIZE = 64
 
 # Tournament settings
 TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
-TOURNAMENT_GAMES = 40  # games per tournament (use even number)
+TOURNAMENT_POOL_CHECKPOINTS = 2  # recent checkpoints to include with champion/current
+TOURNAMENT_GAMES_PER_PAIR = 8  # games for each pairing inside the tournament pool
 TOURNAMENT_SIMS = 50  # MCTS simulations per move in tournament
 WIN_THRESHOLD = 0.55  # win rate required to crown a new champion
 CHAMPION_HISTORY = 5  # keep this many past champion snapshots
@@ -71,6 +72,13 @@ CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
 REPLAY_SAVE_EVERY = 1_000  # save replay buffer every N training steps
 PID_FILE = WEIGHTS_DIR / "train.pid"
+
+
+def log_event(component: str, message: str, **fields) -> None:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    suffix = f" {payload}" if payload else ""
+    print(f"{stamp} [{component}] {message}{suffix}", flush=True)
 
 
 # --- self-play worker --------------------------------------------------------
@@ -91,9 +99,13 @@ def _self_play_worker(
         record = w.run_game(batch_eval.evaluate)
         replay.add(record)
         games_counter[0] += 1
-        if games_counter[0] % 10 == 0:
-            print(
-                f"[worker {worker_id}] games={games_counter[0]}, replay={len(replay)}"
+        if games_counter[0] % 25 == 0:
+            log_event(
+                "selfplay",
+                "worker-progress",
+                worker=worker_id,
+                games=games_counter[0],
+                replay=len(replay),
             )
 
 
@@ -127,9 +139,28 @@ async def train_loop(
             continue
         replay_at_last_step = replay.total_added
 
-        bb, bw, ib, legal, policies, outcomes = replay.sample(BATCH_SIZE)
+        (
+            bb,
+            bw,
+            ib,
+            legal,
+            policies,
+            outcomes,
+            policy_weights,
+            value_weights,
+        ) = replay.sample(BATCH_SIZE)
         with lock:
-            loss, grads = loss_and_grad(model, bb, bw, ib, legal, policies, outcomes)
+            loss, grads = loss_and_grad(
+                model,
+                bb,
+                bw,
+                ib,
+                legal,
+                policies,
+                outcomes,
+                policy_weights,
+                value_weights,
+            )
             grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
             opt.update(model, grads)
             mx.eval(model.parameters(), opt.state, loss)
@@ -142,14 +173,20 @@ async def train_loop(
             decay = LR_DECAY_FACTOR ** (step // LR_DECAY_EVERY)
             new_lr = max(BASE_LR * decay, LR_MIN)
             opt.learning_rate = mx.array(new_lr)
-            print(f"[train] LR → {new_lr:.2e} at step={step}")
+            log_event("train", "lr-decay", step=step, lr=f"{new_lr:.2e}")
 
         if math.isnan(loss_val):
-            print(f"[train] NaN loss at step={step}, skipping")
+            log_event("train", "nan-loss", step=step)
             continue
 
         if step % LOG_EVERY == 0:
-            print(f"[train] step={step}, loss={loss_val:.4f}, replay={len(replay)}")
+            log_event(
+                "train",
+                "step",
+                step=step,
+                loss=f"{loss_val:.4f}",
+                replay=len(replay),
+            )
 
         save = step % CHECKPOINT_EVERY == 0
         if loss_val < best_loss:
@@ -159,7 +196,7 @@ async def train_loop(
         if save:
             path = WEIGHTS_DIR / f"iter_{step:06d}_loss{loss_val:.4f}.npz"
             _save_checkpoint(model, path)
-            print(f"[train] checkpoint → {path}")
+            log_event("train", "checkpoint", step=step, path=path.name)
             _prune_checkpoints()
 
         # Periodically persist replay buffer so restarts don't lose data
@@ -174,7 +211,8 @@ async def train_loop(
             )
             task.add_done_callback(
                 lambda t: (
-                    t.exception() and print(f"[tournament] ERROR: {t.exception()}")
+                    t.exception()
+                    and log_event("tournament", "task-error", error=repr(t.exception()))
                 )
             )
 
@@ -202,10 +240,34 @@ def _load_model_from_bin(bin_path: Path) -> AlphaZeroNet:
             arr = np.frombuffer(f.read(n_elems * 4), dtype=np.float32).reshape(shape)
             weights.append((name, mx.array(arr)))
     m = AlphaZeroNet()
-    m.load_weights(weights, strict=False)
+    applied = _load_compatible_weights(m, weights)
     mx.eval(m.parameters())
+    log_event(
+        "weights",
+        "loaded-compatible",
+        source=bin_path.name,
+        applied=applied,
+        total=len(weights),
+    )
     m.eval()
     return m
+
+
+def _load_model_from_checkpoint(checkpoint: Path) -> AlphaZeroNet:
+    data = np.load(str(checkpoint))
+    weights = [(k, mx.array(data[k])) for k in data.files]
+    model = AlphaZeroNet()
+    applied = _load_compatible_weights(model, weights)
+    mx.eval(model.parameters())
+    log_event(
+        "weights",
+        "loaded-compatible",
+        source=checkpoint.name,
+        applied=applied,
+        total=len(weights),
+    )
+    model.eval()
+    return model
 
 
 def _make_eval_fn(model: AlphaZeroNet, lock: threading.Lock | None = None):
@@ -236,30 +298,10 @@ async def _run_mini_tournament(
     current_loss: float = float("inf"),
     batch_eval: SyncBatchEval | None = None,
 ) -> None:
-    """Run TOURNAMENT_GAMES games vs the stored champion.bin.
-    Runs in the background without blocking the training loop.
-    If the current model achieves WIN_THRESHOLD win rate, it becomes champion.
-    """
+    """Run a small round-robin over champion/current/recent checkpoints."""
     import traceback
 
     import reversi_mcts
-
-    if not CHAMPION_BIN.exists():
-        print("[tournament] no champion.bin yet — skipping")
-        return
-
-    print(
-        f"[tournament] starting {TOURNAMENT_GAMES} games "
-        f"(sims={TOURNAMENT_SIMS}) vs champion"
-    )
-    try:
-        champion_model = _load_model_from_bin(CHAMPION_BIN)
-    except Exception as e:
-        print(f"[tournament] failed to load champion: {e}")
-        return
-
-    # Use the same lock for champion eval to avoid concurrent GPU access
-    champion_eval = _make_eval_fn(champion_model, lock)
 
     # Take a snapshot of current model weights to avoid interference from
     # training updates while the tournament games are running.
@@ -271,56 +313,163 @@ async def _run_mini_tournament(
         )
         mx.eval(snapshot.parameters())
     snapshot.eval()
-    current_eval = _make_eval_fn(snapshot, lock)
 
-    def run_games() -> float:
+    if not CHAMPION_BIN.exists():
+        log_event("tournament", "bootstrap-champion")
+        with lock:
+            export_model(snapshot, CHAMPION_BIN)
+            _record_champion(snapshot, win_rate=1.0, loss=current_loss)
+        log_event("tournament", "promoted", path=CHAMPION_BIN.name, mode="bootstrap")
+        return
+
+    try:
+        champion_model = _load_model_from_bin(CHAMPION_BIN)
+    except Exception as e:
+        log_event("tournament", "load-failed", error=repr(e))
+        return
+
+    def _loss_from_path(path: Path) -> float:
+        try:
+            return float(path.stem.split("loss")[-1])
+        except ValueError:
+            return float("inf")
+
+    def _step_from_path(path: Path) -> int:
+        try:
+            return int(path.stem.split("_")[1])
+        except (IndexError, ValueError):
+            return -1
+
+    recent_paths = sorted(
+        WEIGHTS_DIR.glob("iter_*.npz"),
+        key=_step_from_path,
+        reverse=True,
+    )[:TOURNAMENT_POOL_CHECKPOINTS]
+
+    entrants: list[dict] = [
+        {
+            "name": "champion.bin",
+            "source": CHAMPION_BIN,
+            "model": champion_model,
+            "loss": float("inf"),
+            "is_champion": True,
+            "is_current": False,
+        },
+        {
+            "name": "current",
+            "source": None,
+            "model": snapshot,
+            "loss": current_loss,
+            "is_champion": False,
+            "is_current": True,
+        },
+    ]
+    for path in recent_paths:
+        try:
+            entrants.append(
+                {
+                    "name": path.name,
+                    "source": path,
+                    "model": _load_model_from_checkpoint(path),
+                    "loss": _loss_from_path(path),
+                    "is_champion": False,
+                    "is_current": False,
+                }
+            )
+        except Exception as e:
+            log_event("tournament", "checkpoint-skip", file=path.name, error=repr(e))
+
+    log_event(
+        "tournament",
+        "start",
+        entrants=len(entrants),
+        games_per_pair=TOURNAMENT_GAMES_PER_PAIR,
+        sims=TOURNAMENT_SIMS,
+    )
+
+    eval_fns = {
+        entrant["name"]: _make_eval_fn(entrant["model"], lock) for entrant in entrants
+    }
+
+    def run_games():
         if batch_eval is not None:
             batch_eval.pause()
-            print("[tournament] self-play paused for GPU exclusivity")
+            log_event("tournament", "pause-selfplay")
         try:
-            score = 0.0
-            for i in range(TOURNAMENT_GAMES):
-                # Alternate colours to remove first-mover advantage
-                if i % 2 == 0:
-                    outcome = reversi_mcts.run_match(
-                        current_eval, champion_eval, TOURNAMENT_SIMS
+            scores = {entrant["name"]: 0.0 for entrant in entrants}
+            pairings = [
+                (entrants[i], entrants[j])
+                for i in range(len(entrants))
+                for j in range(i + 1, len(entrants))
+            ]
+            total_games = len(pairings) * TOURNAMENT_GAMES_PER_PAIR
+            done = 0
+            for left, right in pairings:
+                left_eval = eval_fns[left["name"]]
+                right_eval = eval_fns[right["name"]]
+                for i in range(TOURNAMENT_GAMES_PER_PAIR):
+                    black_eval, white_eval = (
+                        (left_eval, right_eval)
+                        if i % 2 == 0
+                        else (right_eval, left_eval)
                     )
-                    score += 1.0 if outcome > 0 else (0.5 if outcome == 0 else 0.0)
-                else:
                     outcome = reversi_mcts.run_match(
-                        champion_eval, current_eval, TOURNAMENT_SIMS
+                        black_eval, white_eval, TOURNAMENT_SIMS
                     )
-                    score += 1.0 if outcome < 0 else (0.5 if outcome == 0 else 0.0)
-                g, t = i + 1, TOURNAMENT_GAMES
-                print(f"[tournament] game {g}/{t} done, score={score:.1f}")
-            return score
+                    if i % 2 == 0:
+                        black_name, white_name = left["name"], right["name"]
+                    else:
+                        black_name, white_name = right["name"], left["name"]
+                    if outcome > 0:
+                        scores[black_name] += 1.0
+                    elif outcome < 0:
+                        scores[white_name] += 1.0
+                    else:
+                        scores[black_name] += 0.5
+                        scores[white_name] += 0.5
+                    done += 1
+                if done % max(1, total_games // 4) == 0 or done == total_games:
+                    log_event(
+                        "tournament",
+                        "progress",
+                        games=f"{done}/{total_games}",
+                    )
+            ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            return ranking, total_games
         except Exception:
-            print(f"[tournament] run_games exception:\n{traceback.format_exc()}")
-            return -1.0
+            log_event("tournament", "run-error", error=traceback.format_exc().strip())
+            return None, 0
         finally:
             if batch_eval is not None:
                 batch_eval.resume()
-                print("[tournament] self-play resumed")
+                log_event("tournament", "resume-selfplay")
 
     loop = asyncio.get_running_loop()
-    score = await loop.run_in_executor(None, run_games)
-    if score < 0:
-        print("[tournament] aborted due to error")
+    ranking, total_games = await loop.run_in_executor(None, run_games)
+    if ranking is None:
+        log_event("tournament", "aborted")
         return
-    win_rate = score / TOURNAMENT_GAMES
-    print(
-        f"[tournament] score={score:.1f}/{TOURNAMENT_GAMES} "
-        f"(win_rate={win_rate:.0%}) vs champion"
+    winner_name, winner_score = ranking[0]
+    entrants_by_name = {entrant["name"]: entrant for entrant in entrants}
+    winner = entrants_by_name[winner_name]
+    max_points = (len(entrants) - 1) * TOURNAMENT_GAMES_PER_PAIR
+    win_rate = winner_score / max_points if max_points > 0 else 0.0
+    log_event(
+        "tournament",
+        "result",
+        winner=winner_name,
+        score=f"{winner_score:.1f}/{max_points}",
+        win_rate=f"{win_rate:.0%}",
     )
 
-    if win_rate >= WIN_THRESHOLD:
-        print("[tournament] New champion! Exporting champion.bin...")
+    if not winner["is_champion"] and win_rate >= WIN_THRESHOLD:
+        log_event("tournament", "promote", threshold=f"{WIN_THRESHOLD:.0%}")
         with lock:
-            export_model(current_model, CHAMPION_BIN)
-            _record_champion(snapshot, win_rate, current_loss)
-        print("[tournament] champion.bin updated")
+            export_model(winner["model"], CHAMPION_BIN)
+            _record_champion(winner["model"], win_rate, winner["loss"])
+        log_event("tournament", "promoted", path=CHAMPION_BIN.name, winner=winner_name)
     else:
-        print("[tournament] champion holds")
+        log_event("tournament", "retain-champion")
 
 
 def _iter_params(model: AlphaZeroNet):
@@ -328,6 +477,25 @@ def _iter_params(model: AlphaZeroNet):
     arrays: dict = {}
     _collect_params(model.parameters(), "", arrays)
     yield from arrays.items()
+
+
+def _load_compatible_weights(
+    model: AlphaZeroNet,
+    weights: list[tuple[str, mx.array]],
+) -> int:
+    """Load only tensors whose names and shapes match the current model."""
+    current = dict(_iter_params(model))
+    compatible: list[tuple[str, mx.array]] = []
+    for name, arr in weights:
+        target = current.get(name)
+        if target is None:
+            continue
+        if tuple(arr.shape) != tuple(target.shape):
+            continue
+        compatible.append((name, arr))
+    if compatible:
+        model.load_weights(compatible, strict=False)
+    return len(compatible)
 
 
 def _record_champion(
@@ -363,9 +531,12 @@ def _record_champion(
         "win_rate": round(win_rate, 3),
     }
     history.append(entry)
-    print(
-        f"[champion] recorded {snap_path.name} "
-        f"(loss={loss_tag}, win_rate={win_rate:.0%})"
+    log_event(
+        "champion",
+        "recorded",
+        file=snap_path.name,
+        loss=loss_tag,
+        win_rate=f"{win_rate:.0%}",
     )
 
     # Prune to keep only the most recent CHAMPION_HISTORY entries
@@ -376,7 +547,7 @@ def _record_champion(
             old_path = champions_dir / old["file"]
             if old_path.exists():
                 old_path.unlink()
-                print(f"[champion] pruned {old['file']}")
+                log_event("champion", "pruned", file=old["file"])
 
     history_file.write_text(json.dumps(history, indent=2))
 
@@ -400,14 +571,14 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
     if CHAMPION_BIN.exists():
         try:
             loaded = _load_model_from_bin(CHAMPION_BIN)
-            model.load_weights(
-                [(k, mx.array(v)) for k, v in _iter_params(loaded)], strict=False
+            _load_compatible_weights(
+                model, [(k, mx.array(v)) for k, v in _iter_params(loaded)]
             )
             mx.eval(model.parameters())
-            print("[train] resumed from champion.bin (step=0)")
+            log_event("train", "resume", source="champion.bin", step=0)
             return 0, float("inf")
         except Exception as e:
-            print(f"[train] failed to load champion.bin: {e}; starting fresh")
+            log_event("train", "resume-failed", source="champion.bin", error=repr(e))
 
     checkpoints = sorted(
         WEIGHTS_DIR.glob("iter_*.npz"),
@@ -417,14 +588,21 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
         latest = checkpoints[-1]
         data = np.load(str(latest))
         weights = [(k, mx.array(data[k])) for k in data.files]
-        model.load_weights(weights, strict=False)
+        applied = _load_compatible_weights(model, weights)
         mx.eval(model.parameters())
         try:
             step = int(latest.stem.split("_")[1])
             loss = _loss(latest)
         except (IndexError, ValueError):
             step, loss = 0, float("inf")
-        print(f"[train] resumed from {latest.name} (step={step}, loss={loss:.4f})")
+        log_event(
+            "train",
+            "resume",
+            source=latest.name,
+            step=step,
+            loss=f"{loss:.4f}",
+            tensors=f"{applied}/{len(weights)}",
+        )
         return step, loss
 
     return 0, float("inf")
@@ -445,7 +623,7 @@ def _save_checkpoint(model: AlphaZeroNet, path: Path) -> None:
     arrays: dict = {}
     _collect_params(model.parameters(), "", arrays)
     np.savez(str(path), **arrays)
-    print(f"[train] saved {len(arrays)} tensors → {path}")
+    log_event("weights", "saved-checkpoint", tensors=len(arrays), path=path.name)
 
 
 def _prune_checkpoints() -> None:
@@ -468,7 +646,7 @@ def _prune_checkpoints() -> None:
     for p in checkpoints:
         if p.name not in keep:
             p.unlink()
-            print(f"[train] pruned {p.name}")
+            log_event("train", "pruned-checkpoint", file=p.name)
 
 
 # --- entry point -------------------------------------------------------------
@@ -481,10 +659,7 @@ async def main() -> None:
         old_pid = int(PID_FILE.read_text().strip())
         try:
             os.kill(old_pid, 0)  # check if process exists
-            print(
-                f"[train] ERROR: another instance is already running (PID {old_pid}). "
-                "Stop it first with: kill -TERM {old_pid}"
-            )
+            log_event("system", "already-running", pid=old_pid)
             return
         except ProcessLookupError:
             pass  # stale pid file, proceed
@@ -500,13 +675,15 @@ async def main() -> None:
 
     batch_eval = SyncBatchEval(model, batch_size=EVAL_BATCH_SIZE, lock=lock)
 
-    print(
-        f"Starting {N_WORKERS} self-play workers "
-        f"(SIMULATIONS={SIMULATIONS}, eval_batch={EVAL_BATCH_SIZE})"
-    )
-    print(
-        f"MIN_REPLAY={MIN_REPLAY}, TRAIN_RATIO={TRAIN_RATIO}, "
-        f"tournament every {TOURNAMENT_EVERY} steps"
+    log_event(
+        "system",
+        "startup",
+        workers=N_WORKERS,
+        simulations=SIMULATIONS,
+        eval_batch=EVAL_BATCH_SIZE,
+        min_replay=MIN_REPLAY,
+        train_ratio=TRAIN_RATIO,
+        tournament_every=TOURNAMENT_EVERY,
     )
 
     stop_flag = [False]
@@ -517,7 +694,7 @@ async def main() -> None:
 
     def _shutdown(signum, frame):
         """SIGTERM handler: save state and stop gracefully."""
-        print(f"\n[train] received signal {signum}, saving state...")
+        log_event("system", "signal", signum=signum, action="save-and-stop")
         replay.save(REPLAY_PATH)
         stop_flag[0] = True
         stop_event.set()
@@ -545,7 +722,7 @@ async def main() -> None:
             *worker_futures,
         )
     except KeyboardInterrupt:
-        print("\nStopping...")
+        log_event("system", "keyboard-interrupt")
         replay.save(REPLAY_PATH)
     finally:
         stop_flag[0] = True

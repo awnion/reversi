@@ -13,13 +13,16 @@ _SHIFTS = np.arange(64, dtype=np.uint64)
 def board_to_planes(
     board_black: int, board_white: int, is_black: bool, legal: int
 ) -> np.ndarray:
-    """Convert bitboard ints to 3×8×8 float32 planes (vectorised)."""
+    """Convert bitboards to 4×8×8 planes: my, opp, legal, phase."""
     my_bits = board_black if is_black else board_white
     opp_bits = board_white if is_black else board_black
     bits = np.array([my_bits, opp_bits, legal], dtype=np.uint64)
-    return (
+    occupied = (int(board_black) | int(board_white)).bit_count() / 64.0
+    spatial = (
         ((bits[:, None] >> _SHIFTS) & np.uint64(1)).astype(np.float32).reshape(3, 8, 8)
     )
+    phase_plane = np.full((1, 8, 8), occupied, dtype=np.float32)
+    return np.concatenate((spatial, phase_plane), axis=0)
 
 
 class LeafEvalServer:
@@ -77,7 +80,7 @@ class LeafEvalServer:
                 break
 
             planes_list, futures = zip(*items, strict=False)
-            batch = mx.array(np.stack(planes_list))  # (N, 3, 8, 8)
+            batch = mx.array(np.stack(planes_list))  # (N, 4, 8, 8)
             policy_logits, values = self.model(batch)
             mx.eval(policy_logits, values)
 
@@ -155,7 +158,7 @@ class SyncBatchEval:
                 except queue.Empty:
                     break
 
-            planes_batch = np.stack([it[0] for it in items])  # (N, 3, 8, 8)
+            planes_batch = np.stack([it[0] for it in items])  # (N, 4, 8, 8)
             x = mx.array(planes_batch)
 
             with self.lock:
