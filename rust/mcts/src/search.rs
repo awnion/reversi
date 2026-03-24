@@ -27,9 +27,9 @@ impl EvalFn for StaticEval {
         let n_legal = legal.count_ones() as f32;
         let mut policy = [0.0_f32; 64];
         if n_legal > 0.0 {
-            for i in 0..64_usize {
+            for (i, p) in policy.iter_mut().enumerate() {
                 if (legal >> i) & 1 == 1 {
-                    policy[i] = 1.0 / n_legal;
+                    *p = 1.0 / n_legal;
                 }
             }
         }
@@ -195,10 +195,10 @@ impl MctsSearch {
 
         // Collect moves before mutating self.nodes to satisfy the borrow checker.
         let mut moves: Vec<(u64, Board, f32)> = Vec::new();
-        for i in 0..64_usize {
+        for (i, &prior) in policy.iter().enumerate() {
             if (legal >> i) & 1 == 1 {
                 let m = 1u64 << i;
-                moves.push((m, board.apply_move(is_black, m), policy[i]));
+                moves.push((m, board.apply_move(is_black, m), prior));
             }
         }
 

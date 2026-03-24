@@ -1,0 +1,12 @@
+# Training checkpoints (too many/large to track)
+iter_*.npz
+
+# Replay buffer (large, regenerated from self-play)
+replay_buffer.npz
+*.tmp.npz
+
+# PID file
+train.pid
+
+# Keep champion.bin tracked (deployed to WASM bot)
+!champion.bin

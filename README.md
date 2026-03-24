@@ -58,28 +58,43 @@ uv run maturin develop --features python
 ### Run training
 
 ```sh
-PYTHONUNBUFFERED=1 uv run python -m train.loop > /tmp/reversi_train.log 2>&1 &
+# Start in background, append to log
+nohup uv run python -u -m train.loop >> /tmp/reversi_train.log 2>&1 &
+
+# Watch the log
 tail -f /tmp/reversi_train.log
 ```
 
-Training auto-resumes from the best checkpoint in `weights/` on restart.
-Checkpoints are saved to `weights/iter_<step>_loss<value>.npz`.
+Training runs continuously and:
+- Waits until 30 000 positions are collected before starting gradient updates
+- Rate-limits training to 1 gradient step per 10 new positions (prevents overfitting)
+- Uses AdamW (`lr=3e-4`, `weight_decay=1e-4`) with step-decay ×0.1 every 5 000 steps
+- Policy targets use label smoothing (ε=0.1) to prevent memorisation of peaked MCTS distributions
+- Auto-resumes from the best checkpoint in `weights/` on restart; falls back to `weights/champion.bin`
+- Saves checkpoints to `weights/iter_<step>_loss<value>.npz`
+- Runs a **mini-tournament** every 3 000 steps: current model plays 10 games vs `champion.bin`;
+  if it wins ≥55 % it becomes the new champion automatically
+- Keeps the last 5 champions with date and win-rate in `weights/champions/history.json`
 
-### Run tournament
+### Run tournament (manual)
 
-After accumulating checkpoints, run a round-robin tournament to find the true champion
-(loss alone doesn't reflect actual playing strength):
+Run a round-robin tournament over the top N checkpoints to find the true champion
+(loss alone doesn't reflect playing strength):
 
 ```sh
-# Top 10 checkpoints by loss, 4 games per pair, 50 MCTS sims per move
-uv run python -m train.tournament --top 10 --games 4 --sims 50
+# Top 10 checkpoints by loss + current champion as baseline, 4 games/pair, 100 sims/move
+uv run python -m train.tournament --top 10 --games 4 --sims 100
+
+# Exclude the current champion from the bracket
+uv run python -m train.tournament --top 10 --games 4 --sims 100 --no-champion
 ```
 
 The tournament automatically:
-1. Plays all pairs against each other (alternating colors)
-2. Ranks by win points
-3. Exports the winner to `weights/champion.bin`
-4. Rebuilds the WASM bot
+1. Loads all candidates (including `champion.bin` as reference baseline)
+2. Plays every pair against each other, alternating colours
+3. Ranks by win points
+4. If the winner is not the current champion: exports it to `weights/champion.bin`,
+   rebuilds the WASM bot, and records it in `weights/champions/history.json`
 
 ### Export champion manually
 
@@ -95,10 +110,21 @@ After exporting a new `champion.bin`, rebuild the browser bot:
 
 ```sh
 cd ..  # repo root
-bun run build:wasm
+bun --filter '@reversi/bot-alphazero' build:wasm
 ```
 
 The WASM bot embeds `weights/champion.bin` at compile time — the file must exist before building.
+
+### Champion history
+
+Past champions are stored in `weights/champions/` (last 5 kept):
+
+```
+weights/champions/
+  history.json                              # date, loss, win_rate for each
+  champion_20260324_142030_loss0.0938.npz   # model weights snapshot
+  ...
+```
 
 ## License
 

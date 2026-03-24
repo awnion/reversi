@@ -1,4 +1,5 @@
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from .eval_server import board_to_planes
@@ -31,11 +32,11 @@ def compute_loss(
 
     policy_logits, values = model(x)  # (batch_size, 64), (batch_size,)
 
-    # Policy loss: cross-entropy (log-softmax vs target distribution)
-    log_probs = policy_logits - mx.log(
-        mx.sum(mx.exp(policy_logits), axis=-1, keepdims=True)
-    )
+    # Policy loss: cross-entropy with label smoothing to prevent memorization
+    # of peaked MCTS distributions (ε=0.1 mixes with uniform over 64 moves)
+    log_probs = nn.log_softmax(policy_logits, axis=-1)
     policy_targets = mx.array(policies)
+    policy_targets = 0.9 * policy_targets + 0.1 / 64.0
     policy_loss = -mx.mean(mx.sum(policy_targets * log_probs, axis=-1))
 
     # Value loss: MSE

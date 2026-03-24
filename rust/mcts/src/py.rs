@@ -3,7 +3,8 @@ use pyo3::types::PyDict;
 use pyo3::types::PyList;
 use reversi_minimax::board::Board;
 
-use crate::game::{play_game, play_match};
+use crate::game::play_game;
+use crate::game::play_match;
 use crate::search::EvalFn;
 use crate::search::StaticEval;
 

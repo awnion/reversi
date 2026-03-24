@@ -109,9 +109,9 @@ impl AlphaZeroBot {
 
         let policy = mcts.policy_target();
         let mut result = policy;
-        for i in 0..64 {
+        for (i, r) in result.iter_mut().enumerate() {
             if (legal >> i) & 1 == 0 {
-                result[i] = 0.0;
+                *r = 0.0;
             }
         }
         js_sys::Float32Array::from(result.as_ref())

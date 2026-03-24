@@ -121,14 +121,28 @@ class SyncBatchEval:
         self.lock = lock or threading.Lock()
         self._q: queue.Queue = queue.Queue()
         self._running = True
+        self._paused = threading.Event()  # set = paused, clear = running
         self._thread = threading.Thread(target=self._model_loop, daemon=True)
         self._thread.start()
+
+    def pause(self) -> None:
+        """Pause GPU inference (tournament uses GPU exclusively)."""
+        self._paused.set()
+
+    def resume(self) -> None:
+        """Resume GPU inference after tournament."""
+        self._paused.clear()
 
     def _model_loop(self) -> None:
         """
         Dedicated inference thread: batches requests → one GPU call → notify workers.
         """
         while self._running:
+            if self._paused.is_set():
+                import time
+
+                time.sleep(0.01)
+                continue
             items: list = []
             try:
                 items.append(self._q.get(timeout=self.timeout))
