@@ -14,19 +14,19 @@ export class BotWorkerPool {
   private worker: Worker;
   private pending = new Map<number, PendingEntry>();
   private idCounter = 0;
-  readonly ready: Promise<void>;
+  readonly ready: Promise<{ alphazeroName: string }>;
 
   constructor() {
     this.worker = new Worker(new URL('./botWorker.ts', import.meta.url), {
       type: 'module',
     });
-    let resolveReady!: () => void;
+    let resolveReady!: (value: { alphazeroName: string }) => void;
     this.ready = new Promise((res) => {
       resolveReady = res;
     });
     this.worker.addEventListener('message', (e: MessageEvent) => {
       if (e.data.type === 'ready') {
-        resolveReady();
+        resolveReady({ alphazeroName: e.data.alphazeroName as string });
         return;
       }
       const entry = this.pending.get(e.data.id as number);
@@ -47,7 +47,7 @@ export class BotWorkerPool {
     thinkMs: number,
   ): Promise<unknown> {
     return this.ready.then(
-      () =>
+      (_) =>
         new Promise((resolve, reject) => {
           const id = ++this.idCounter;
           this.pending.set(id, { resolve, reject });

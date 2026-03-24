@@ -8,9 +8,9 @@ let alphazero: BotPlayer;
 (async () => {
   [minimax, alphazero] = await Promise.all([
     createMinimaxBot('Minimax'),
-    createAlphaZeroBot('AlphaZero'),
+    createAlphaZeroBot(),
   ]);
-  self.postMessage({ type: 'ready' });
+  self.postMessage({ type: 'ready', alphazeroName: alphazero.name });
 })();
 
 export type WorkerRequest = {

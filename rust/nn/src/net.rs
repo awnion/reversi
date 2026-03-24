@@ -136,7 +136,7 @@ impl AlphaZeroNet {
 
     /// Build the network from an already-parsed `WeightStore`.
     pub fn from_store(store: &WeightStore) -> Result<Self, String> {
-        let stem_conv = load_conv(store, "stem.conv", 3, 32, 3, 1)?;
+        let stem_conv = load_conv(store, "stem.conv", 4, 32, 3, 1)?;
         let stem_bn = load_bn(store, "stem.bn")?;
 
         let mut blocks = Vec::with_capacity(4);
@@ -171,12 +171,13 @@ impl AlphaZeroNet {
 
     /// Forward pass.
     ///
-    /// `planes`: channel-first f32 slice of length `3 * 8 * 8 = 192`.
+    /// `planes`: channel-first f32 slice of length `4 * 8 * 8 = 256`.
+    /// Planes: my_pieces, opp_pieces, legal_moves, phase (count_occupied/64).
     ///
     /// Returns `(policy, value)` where `policy` sums to 1 (softmax applied)
     /// and `value` is in `[-1, 1]` (tanh applied).
     pub fn forward(&self, planes: &[f32]) -> ([f32; 64], f32) {
-        assert_eq!(planes.len(), 3 * BOARD * BOARD, "expected 3×8×8 input");
+        assert_eq!(planes.len(), 4 * BOARD * BOARD, "expected 4×8×8 input");
 
         // ── Stem ──────────────────────────────────────────────────────────────
         let mut x = self.stem_conv.forward(planes, BOARD, BOARD);
@@ -250,7 +251,7 @@ impl AlphaZeroNet {
         }
 
         Self {
-            stem_conv: conv(3, 32, 3, 1),
+            stem_conv: conv(4, 32, 3, 1),
             stem_bn: bn(32),
             blocks: (0..4).map(|_| res_block()).collect(),
             pol_conv: conv(32, 2, 1, 0),

@@ -8,6 +8,18 @@ use wasm_bindgen::prelude::*;
 // Embed champion weights at compile time.
 static CHAMPION_WEIGHTS: &[u8] = include_bytes!("../../../weights/champion.bin");
 
+/// Returns JSON metadata about this compiled champion.
+/// Known-static fields are hardcoded; champion-specific fields
+/// are embedded at build time via env vars (empty string if unset).
+#[wasm_bindgen]
+pub fn meta() -> String {
+    let build_date = env!("BUILD_DATE");
+    let tournament_score = option_env!("TOURNAMENT_SCORE").unwrap_or("");
+    format!(
+        r#"{{"build_date":"{build_date}","tournament_score":"{tournament_score}","loss":"policy:CE+LS(0.1)+value:MSE+phase","input_shape":"4x8x8","input_features":["my_pieces","opp_pieces","legal_moves","phase_occupied_64"]}}"#
+    )
+}
+
 struct NnEval {
     net: AlphaZeroNet,
 }
@@ -16,7 +28,7 @@ impl EvalFn for NnEval {
     fn evaluate(&self, board: Board, is_black: bool, legal: u64) -> ([f32; 64], f32) {
         let my_bits = if is_black { board.black } else { board.white };
         let opp_bits = if is_black { board.white } else { board.black };
-        let mut planes = [0.0f32; 3 * 64];
+        let mut planes = [0.0f32; 4 * 64];
         for i in 0..64usize {
             if (my_bits >> i) & 1 == 1 {
                 planes[i] = 1.0;
@@ -28,6 +40,8 @@ impl EvalFn for NnEval {
                 planes[128 + i] = 1.0;
             }
         }
+        let phase = (board.black | board.white).count_ones() as f32 / 64.0;
+        planes[192..].fill(phase);
         self.net.forward(&planes)
     }
 }

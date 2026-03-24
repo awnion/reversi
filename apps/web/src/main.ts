@@ -197,3 +197,12 @@ analyzeButton.addEventListener('click', async () => {
 });
 
 void controller.start();
+
+pool.ready.then(({ alphazeroName }) => {
+  for (const select of [strategyBlack, strategyWhite]) {
+    const opt = select.querySelector<HTMLOptionElement>(
+      'option[value="alphazero"]',
+    );
+    if (opt) opt.textContent = alphazeroName;
+  }
+});

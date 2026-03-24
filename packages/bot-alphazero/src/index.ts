@@ -5,7 +5,18 @@ import type {
   Position,
   PositionAnalysis,
 } from '@reversi/core';
-import init, { AlphaZeroBot as WasmBot } from '../wasm/reversi_alphazero.js';
+import init, {
+  meta,
+  AlphaZeroBot as WasmBot,
+} from '../wasm/reversi_alphazero.js';
+
+export interface AlphaZeroMeta {
+  build_date: string;
+  tournament_score: string;
+  loss: string;
+  input_shape: string;
+  input_features: string[];
+}
 
 function toBitboards(state: GameState) {
   let blackLow = 0,
@@ -30,14 +41,14 @@ function toBitboards(state: GameState) {
   };
 }
 
-export async function createAlphaZeroBot(
-  name: string = 'AlphaZero',
-): Promise<BotPlayer> {
+export async function createAlphaZeroBot(name?: string): Promise<BotPlayer> {
   await init();
   const wasm = new WasmBot();
+  const m: AlphaZeroMeta = JSON.parse(meta());
+  const displayName = name ?? `AlphaZero (${m.build_date})`;
 
   return {
-    name,
+    name: displayName,
 
     async chooseMove(state: GameState, timeLimitMs: number): Promise<Position> {
       const { blackLow, blackHigh, whiteLow, whiteHigh } = toBitboards(state);

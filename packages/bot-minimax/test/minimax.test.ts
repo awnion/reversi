@@ -15,6 +15,6 @@ describe('MinimaxBot', () => {
     );
     expect(isLegal).toBeDefined();
 
-    bot.destroy && bot.destroy();
+    bot.destroy?.();
   });
 });

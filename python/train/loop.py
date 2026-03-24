@@ -36,7 +36,7 @@ from .replay import ReplayBuffer
 
 # --- hyper-parameters --------------------------------------------------------
 
-SIMULATIONS = 80
+SIMULATIONS = 300
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
@@ -48,7 +48,7 @@ KEEP_CHECKPOINTS = 20
 LOG_EVERY = 100
 BASE_LR = 3e-4
 LR_DECAY_EVERY = 5_000  # multiply LR by LR_DECAY_FACTOR every N steps
-LR_DECAY_FACTOR = 0.1
+LR_DECAY_FACTOR = 0.5
 LR_MIN = 1e-5
 WEIGHTS_DIR = Path(__file__).parent.parent.parent / "weights"
 CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
@@ -64,7 +64,7 @@ EVAL_BATCH_SIZE = 64
 TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
 TOURNAMENT_POOL_CHECKPOINTS = 2  # recent checkpoints to include with champion/current
 TOURNAMENT_GAMES_PER_PAIR = 8  # games for each pairing inside the tournament pool
-TOURNAMENT_SIMS = 50  # MCTS simulations per move in tournament
+TOURNAMENT_SIMS = 200  # MCTS simulations per move in tournament
 WIN_THRESHOLD = 0.55  # win rate required to crown a new champion
 CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 

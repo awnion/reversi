@@ -2,7 +2,7 @@ import type { BotPlayer, GameState, Position } from '@reversi/core';
 
 export const greedyBot: BotPlayer = {
   name: 'Greedy',
-  async chooseMove(state: GameState, timeLimitMs: number): Promise<Position> {
+  async chooseMove(state: GameState, _timeLimitMs: number): Promise<Position> {
     let bestMove: Position | null = null;
     let maxFlips = -1;
 
@@ -22,7 +22,7 @@ export const greedyBot: BotPlayer = {
 
     return bestMove;
   },
-  async analyzePosition(state: GameState, timeLimitMs: number) {
+  async analyzePosition(state: GameState, _timeLimitMs: number) {
     const moves = state.legalMoves.map((move) => ({
       position: { row: move.row, col: move.col },
       score: move.flips.length,

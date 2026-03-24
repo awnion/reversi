@@ -49,7 +49,7 @@ def compute_loss(
     # of peaked MCTS distributions (ε=0.1 mixes with uniform over 64 moves)
     log_probs = nn.log_softmax(policy_logits, axis=-1)
     policy_targets = mx.array(policies)
-    policy_targets = 0.9 * policy_targets + 0.1 / 64.0
+    policy_targets = 0.97 * policy_targets + 0.03 / 64.0
     policy_weights = mx.array(policy_weights)
     policy_loss_per = -mx.sum(policy_targets * log_probs, axis=-1)
     policy_norm = mx.maximum(mx.sum(policy_weights), mx.array(1.0))

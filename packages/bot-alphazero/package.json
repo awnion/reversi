@@ -6,7 +6,7 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "build:wasm": "wasm-pack build --target web ../../rust/alphazero --out-dir $(cd ../.. && pwd)/packages/bot-alphazero/wasm",
+    "build:wasm": "BUILD_DATE=$(date '+%Y-%m-%d') wasm-pack build --target web ../../rust/alphazero --out-dir $(cd ../.. && pwd)/packages/bot-alphazero/wasm",
     "build": "bun run build:wasm && bunx tsc -b",
     "test": "bun test"
   },
