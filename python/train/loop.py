@@ -479,18 +479,25 @@ def _iter_params(model: AlphaZeroNet):
     yield from arrays.items()
 
 
+def _iter_param_shapes(model: AlphaZeroNet):
+    """Yield (flat_key, shape) pairs without materializing arrays."""
+    shapes: dict = {}
+    _collect_param_shapes(model.parameters(), "", shapes)
+    yield from shapes.items()
+
+
 def _load_compatible_weights(
     model: AlphaZeroNet,
     weights: list[tuple[str, mx.array]],
 ) -> int:
     """Load only tensors whose names and shapes match the current model."""
-    current = dict(_iter_params(model))
+    current_shapes = dict(_iter_param_shapes(model))
     compatible: list[tuple[str, mx.array]] = []
     for name, arr in weights:
-        target = current.get(name)
-        if target is None:
+        target_shape = current_shapes.get(name)
+        if target_shape is None:
             continue
-        if tuple(arr.shape) != tuple(target.shape):
+        if tuple(arr.shape) != tuple(target_shape):
             continue
         compatible.append((name, arr))
     if compatible:
@@ -617,6 +624,17 @@ def _collect_params(obj, prefix: str, arrays: dict) -> None:
             _collect_params(v, f"{prefix}.{i}" if prefix else str(i), arrays)
     elif hasattr(obj, "shape"):
         arrays[prefix] = np.array(obj)
+
+
+def _collect_param_shapes(obj, prefix: str, shapes: dict) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _collect_param_shapes(v, f"{prefix}.{k}" if prefix else k, shapes)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _collect_param_shapes(v, f"{prefix}.{i}" if prefix else str(i), shapes)
+    elif hasattr(obj, "shape"):
+        shapes[prefix] = tuple(obj.shape)
 
 
 def _save_checkpoint(model: AlphaZeroNet, path: Path) -> None:
