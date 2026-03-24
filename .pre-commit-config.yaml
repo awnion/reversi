@@ -1,0 +1,48 @@
+# Install: uvx pre-commit install
+# Run manually: uvx pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      # ── Rust ──────────────────────────────────────────────────────────────
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --manifest-path rust/minimax/Cargo.toml -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --manifest-path rust/minimax/Cargo.toml -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # ── JavaScript / TypeScript ────────────────────────────────────────────
+      - id: biome
+        name: biome check
+        entry: bunx biome check
+        language: system
+        files: \.(js|ts|jsx|tsx|json)$
+        pass_filenames: false
+
+      # ── Python ────────────────────────────────────────────────────────────
+      - id: ruff-lint
+        name: ruff lint
+        entry: uvx ruff check
+        language: system
+        types: [python]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uvx ruff format --check
+        language: system
+        types: [python]
+
+      # ── TOML ──────────────────────────────────────────────────────────────
+      - id: taplo-fmt
+        name: taplo fmt
+        entry: uvx taplo fmt --check
+        language: system
+        types: [toml]

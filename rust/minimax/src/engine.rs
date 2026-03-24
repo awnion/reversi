@@ -11,7 +11,8 @@ pub fn evaluate_all_moves(board: Board, is_black: bool, depth: u8) -> Vec<(u64, 
         if (legal & m) != 0 {
             let next = board.apply_move(is_black, m);
             // Search from opponent's perspective at depth-1; negate score.
-            let (_, opp_score) = search(next, !is_black, depth.saturating_sub(1), -MAX_SCORE, MAX_SCORE);
+            let (_, opp_score) =
+                search(next, !is_black, depth.saturating_sub(1), -MAX_SCORE, MAX_SCORE);
             results.push((m, -opp_score));
         }
     }
@@ -21,7 +22,13 @@ pub fn evaluate_all_moves(board: Board, is_black: bool, depth: u8) -> Vec<(u64, 
 pub const MIN_SCORE: i32 = -100000;
 pub const MAX_SCORE: i32 = 100000;
 
-pub fn search(board: Board, is_black: bool, depth: u8, mut alpha: i32, beta: i32) -> (Option<u64>, i32) {
+pub fn search(
+    board: Board,
+    is_black: bool,
+    depth: u8,
+    mut alpha: i32,
+    beta: i32,
+) -> (Option<u64>, i32) {
     if depth == 0 {
         return (None, evaluate(&board, is_black));
     }

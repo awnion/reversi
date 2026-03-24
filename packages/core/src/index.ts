@@ -1,2 +1,2 @@
-export * from './reversi';
 export * from './bot';
+export * from './reversi';

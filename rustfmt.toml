@@ -1,0 +1,24 @@
+# we can't rely on contributors using .editorconfig
+newline_style = "Unix"
+# require the shorthand instead of it being optional
+use_field_init_shorthand = true
+# outdated default — `?` was unstable at the time; `try!` is deprecated
+use_try_shorthand = true
+# use 100-char width everywhere
+use_small_heuristics = "Max"
+
+style_edition = "2024"
+unstable_features = true
+
+# better grepping — one import per line
+imports_granularity = "Item"
+group_imports = "StdExternalCrate"
+
+normalize_comments = true
+reorder_impl_items = true
+reorder_modules = true
+wrap_comments = false
+
+format_code_in_doc_comments = true
+format_macro_bodies = true
+format_macro_matchers = true

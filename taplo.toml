@@ -1,0 +1,20 @@
+include = ["**/*.toml"]
+
+[formatting]
+reorder_arrays = false
+indent_string = "    "
+column_width = 80
+
+[[rule]]
+include = ["**/Cargo.toml"]
+formatting.inline_table_expand = false
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = ["dependencies", "*-dependencies", "workspace.dependencies"]
+formatting.reorder_keys = true
+
+[[rule]]
+include = ["Cargo.toml"]
+keys = ["workspace", "members"]
+formatting.reorder_arrays = true

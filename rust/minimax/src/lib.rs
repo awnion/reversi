@@ -1,19 +1,26 @@
-pub mod utils;
 pub mod board;
-pub mod eval;
 pub mod engine;
+pub mod eval;
+pub mod utils;
 
-use wasm_bindgen::prelude::*;
 use board::Board;
-use engine::{search, evaluate_all_moves, MIN_SCORE, MAX_SCORE};
+use engine::MAX_SCORE;
+use engine::MIN_SCORE;
+use engine::evaluate_all_moves;
+use engine::search;
+use wasm_bindgen::prelude::*;
 
 /// Returns current time in milliseconds (WASM only; returns 0 on native).
 #[inline]
 fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
-    { js_sys::Date::now() }
+    {
+        js_sys::Date::now()
+    }
     #[cfg(not(target_arch = "wasm32"))]
-    { 0.0 }
+    {
+        0.0
+    }
 }
 
 fn board_from_parts(bl: u32, bh: u32, wl: u32, wh: u32) -> Board {
@@ -32,7 +39,16 @@ impl MinimaxBot {
         crate::utils::set_panic_hook();
         MinimaxBot {}
     }
+}
 
+impl Default for MinimaxBot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[wasm_bindgen]
+impl MinimaxBot {
     /// Returns the best move index (0–63) or -1 if no moves available.
     /// Uses iterative deepening for the given time budget (milliseconds).
     pub fn choose_move(
@@ -44,7 +60,8 @@ impl MinimaxBot {
         is_black: bool,
         time_ms: f64,
     ) -> i32 {
-        let board = board_from_parts(board_black_low, board_black_high, board_white_low, board_white_high);
+        let board =
+            board_from_parts(board_black_low, board_black_high, board_white_low, board_white_high);
 
         let deadline = now_ms() + time_ms;
         let mut best_move: Option<u64> = None;
@@ -74,7 +91,8 @@ impl MinimaxBot {
         is_black: bool,
         time_ms: f64,
     ) -> Box<[i32]> {
-        let board = board_from_parts(board_black_low, board_black_high, board_white_low, board_white_high);
+        let board =
+            board_from_parts(board_black_low, board_black_high, board_white_low, board_white_high);
 
         if board.legal_moves(is_black) == 0 {
             return Box::new([]);

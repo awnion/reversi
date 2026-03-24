@@ -1,12 +1,12 @@
 [package]
 name = "reversi_minimax"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1.7"
-js-sys = "0.3"
+js-sys = "0.3.91"
+wasm-bindgen = "0.2.114"

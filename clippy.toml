@@ -1,0 +1,19 @@
+msrv = "1.86"
+
+allow-unwrap-in-tests = true
+type-complexity-threshold = 2000
+
+# https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_methods
+disallowed-methods = [
+    # WASM is single-threaded by default; use wasm-bindgen-rayon if you need threads
+    { path = "std::thread::spawn", reason = "WASM target does not support threads; use wasm-bindgen-rayon or restructure as async" },
+]
+
+# https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_types
+disallowed-types = [
+    # Not safe in WASM single-threaded context
+    { path = "std::sync::RwLock", reason = "use a single-threaded alternative; WASM has no threads" },
+    { path = "std::sync::Condvar", reason = "use a single-threaded alternative; WASM has no threads" },
+]
+
+doc-valid-idents = []

@@ -1,11 +1,7 @@
 import { createReversiBoard } from '@reversi/board-ui';
-import {
-  countDiscs,
-  createInitialState,
-  type GameState,
-} from '@reversi/core';
 import { greedyBot } from '@reversi/bot';
 import { createMinimaxBot } from '@reversi/bot-minimax';
+import { countDiscs, createInitialState, type GameState } from '@reversi/core';
 import { GameController, type PlayerConfig } from './gameController';
 
 import './styles.css';
@@ -22,7 +18,6 @@ function requireElement<T extends HTMLElement>(id: string): T {
     throw new Error(`Missing element #${id}`);
   return element as T;
 }
-
 
 app.innerHTML = `
   <main class="app-shell">
@@ -86,7 +81,6 @@ function getPlayerConfig(select: HTMLSelectElement): PlayerConfig {
   return { type: 'human' };
 }
 
-
 let controller: GameController | null = null;
 
 const board = createReversiBoard(boardRoot, {
@@ -119,8 +113,11 @@ function sync(nextState: GameState): void {
 
 controller = new GameController(
   createInitialState(),
-  { black: getPlayerConfig(playerBlackSelect), white: getPlayerConfig(playerWhiteSelect) },
-  sync
+  {
+    black: getPlayerConfig(playerBlackSelect),
+    white: getPlayerConfig(playerWhiteSelect),
+  },
+  sync,
 );
 
 passButton.addEventListener('click', () => {
@@ -134,8 +131,11 @@ newGameButton.addEventListener('click', () => {
   if (controller) {
     analysisResultsNode.innerHTML = '';
     controller.newGame(
-      { black: getPlayerConfig(playerBlackSelect), white: getPlayerConfig(playerWhiteSelect) },
-      createInitialState()
+      {
+        black: getPlayerConfig(playerBlackSelect),
+        white: getPlayerConfig(playerWhiteSelect),
+      },
+      createInitialState(),
     );
   }
 });
@@ -150,7 +150,7 @@ analyzeButton.addEventListener('click', async () => {
       <h4>Ranked Moves</h4>
       <ul style="padding-left: 20px;">
         ${analysis.moves.length === 0 ? '<li>No valid moves</li>' : ''}
-        ${analysis.moves.map(m => `<li>R${m.position.row} C${m.position.col}: Score ${m.score}</li>`).join('')}
+        ${analysis.moves.map((m) => `<li>R${m.position.row} C${m.position.col}: Score ${m.score}</li>`).join('')}
       </ul>
     `;
   } catch (e) {
@@ -161,4 +161,3 @@ analyzeButton.addEventListener('click', async () => {
 });
 
 void controller.start();
-
