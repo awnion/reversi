@@ -49,11 +49,11 @@ export class GameController {
   }
 
   private async triggerBotMove(): Promise<void> {
-    if ((this._state.status as string) === 'finished') return;
+    if (this._state.status === 'finished') return;
 
     const currentPlayerConfig = this._state.currentPlayer === 'black' ? this.players.black : this.players.white;
     if (currentPlayerConfig.type !== 'bot') {
-       if (this._state.legalMoves.length === 0 && this._state.status !== 'finished') {
+       if (this._state.legalMoves.length === 0) {
           this._state = passTurn(this._state);
           this.onStateChange(this._state);
           void this.triggerBotMove();

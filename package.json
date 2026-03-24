@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "bun --filter @reversi/web dev",
     "build": "bun run build:packages && bun --filter @reversi/web build",
-    "build:packages": "bun --filter @reversi/core build && bun --filter @reversi/board-ui build",
+    "build:wasm": "wasm-pack build --target web rust/minimax --out-dir packages/bot-minimax/wasm",
+    "build:packages": "bun run build:wasm && bun --filter @reversi/core build && bun --filter @reversi/board-ui build && bun --filter @reversi/bot build && bun --filter @reversi/bot-minimax build",
     "test": "bun run test:unit && bun run test:browser",
     "test:all": "bun run test:unit && bun run test:browser && bun run test:e2e",
     "test:unit": "bun test packages/core/test",

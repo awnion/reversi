@@ -1,8 +1,25 @@
 use crate::board::Board;
 use crate::eval::evaluate;
 
-const MIN_SCORE: i32 = -100000;
-const MAX_SCORE: i32 = 100000;
+/// Evaluates every legal move for `is_black` at the given depth.
+/// Returns a list of `(move_bit_mask, score_for_current_player)` pairs.
+pub fn evaluate_all_moves(board: Board, is_black: bool, depth: u8) -> Vec<(u64, i32)> {
+    let legal = board.legal_moves(is_black);
+    let mut results = Vec::new();
+    for i in 0..64 {
+        let m = 1u64 << i;
+        if (legal & m) != 0 {
+            let next = board.apply_move(is_black, m);
+            // Search from opponent's perspective at depth-1; negate score.
+            let (_, opp_score) = search(next, !is_black, depth.saturating_sub(1), -MAX_SCORE, MAX_SCORE);
+            results.push((m, -opp_score));
+        }
+    }
+    results
+}
+
+pub const MIN_SCORE: i32 = -100000;
+pub const MAX_SCORE: i32 = 100000;
 
 pub fn search(board: Board, is_black: bool, depth: u8, mut alpha: i32, beta: i32) -> (Option<u64>, i32) {
     if depth == 0 {

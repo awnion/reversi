@@ -1,5 +1,26 @@
-import type { BotPlayer, GameState, Position, PositionAnalysis } from '@reversi/core';
+import type { BotPlayer, GameState, MoveEval, Position, PositionAnalysis } from '@reversi/core';
 import init, { MinimaxBot as WasmBot } from '../wasm/reversi_minimax.js';
+
+function toBitboards(state: GameState) {
+  let blackLow = 0, blackHigh = 0;
+  let whiteLow = 0, whiteHigh = 0;
+  for (let idx = 0; idx < 64; idx++) {
+    const cell = state.board[idx];
+    if (cell === 'black') {
+      if (idx < 32) blackLow |= (1 << idx);
+      else blackHigh |= (1 << (idx - 32));
+    } else if (cell === 'white') {
+      if (idx < 32) whiteLow |= (1 << idx);
+      else whiteHigh |= (1 << (idx - 32));
+    }
+  }
+  return {
+    blackLow: blackLow >>> 0,
+    blackHigh: blackHigh >>> 0,
+    whiteLow: whiteLow >>> 0,
+    whiteHigh: whiteHigh >>> 0,
+  };
+}
 
 export async function createMinimaxBot(name: string = 'Minimax'): Promise<BotPlayer> {
   await init();
@@ -7,55 +28,56 @@ export async function createMinimaxBot(name: string = 'Minimax'): Promise<BotPla
 
   return {
     name,
+
     async chooseMove(state: GameState, timeLimitMs: number): Promise<Position> {
-      let blackLow = 0, blackHigh = 0;
-      let whiteLow = 0, whiteHigh = 0;
-
-      for (let r = 0; r < 8; r++) {
-        for (let c = 0; c < 8; c++) {
-          const idx = r * 8 + c;
-          const cell = state.board[idx];
-          if (cell === 'black') {
-            if (idx < 32) blackLow |= (1 << idx);
-            else blackHigh |= (1 << (idx - 32));
-          } else if (cell === 'white') {
-            if (idx < 32) whiteLow |= (1 << idx);
-            else whiteHigh |= (1 << (idx - 32));
-          }
-        }
-      }
-
-      // We actually want unsigned shift because JS bitwise ops convert to signed 32-bit.
-      // So use `>>> 0` if needed, but the WASM takes unsigned u32 anyway.
+      const { blackLow, blackHigh, whiteLow, whiteHigh } = toBitboards(state);
       const moveIdx = wasm.choose_move(
-        blackLow >>> 0, blackHigh >>> 0,
-        whiteLow >>> 0, whiteHigh >>> 0,
+        blackLow, blackHigh,
+        whiteLow, whiteHigh,
         state.currentPlayer === 'black',
-        timeLimitMs
+        timeLimitMs,
       );
-
       if (moveIdx === -1) {
         throw new Error('Minimax bot could not find a valid move');
       }
-
-      const row = Math.floor(moveIdx / 8);
-      const col = moveIdx % 8;
-
-      return { row, col };
+      return { row: Math.floor(moveIdx / 8), col: moveIdx % 8 };
     },
 
     async analyzePosition(state: GameState, timeLimitMs: number): Promise<PositionAnalysis> {
-      // Stub to satisfy interface
+      const { blackLow, blackHigh, whiteLow, whiteHigh } = toBitboards(state);
+      const raw = wasm.analyze_position(
+        blackLow, blackHigh,
+        whiteLow, whiteHigh,
+        state.currentPlayer === 'black',
+        timeLimitMs,
+      );
+
+      // No legal moves
+      if (raw.length === 0) {
+        return { bestMove: null, score: 0, depth: 0, moves: [] };
+      }
+
+      // Layout: [depth, idx0, score0, idx1, score1, ...]
+      const depth = raw[0] as number;
+      const moves: MoveEval[] = [];
+      for (let i = 1; i < raw.length; i += 2) {
+        const idx = raw[i] as number;
+        const score = raw[i + 1] as number;
+        moves.push({ position: { row: Math.floor(idx / 8), col: idx % 8 }, score, depth });
+      }
+      moves.sort((a, b) => b.score - a.score);
+
+      const best = moves[0];
       return {
-         bestMove: null,
-         score: 0,
-         depth: 0,
-         moves: []
+        bestMove: best?.position ?? null,
+        score: best?.score ?? 0,
+        depth,
+        moves,
       };
     },
 
     destroy() {
       wasm.free();
-    }
+    },
   };
 }
