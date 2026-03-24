@@ -15,9 +15,11 @@ Usage:
 """
 
 import argparse
+import os
 import struct
 import subprocess
 from itertools import combinations
+from multiprocessing import Pool
 from pathlib import Path
 
 import mlx.core as mx
@@ -72,38 +74,65 @@ def make_eval_fn(model: AlphaZeroNet):
     def evaluate(board_black: int, board_white: int, is_black: bool, legal: int):
         planes = board_to_planes(board_black, board_white, is_black, legal)
         x = mx.array(planes[None])
-        policy_logits, value = model(x)
-        mx.eval(policy_logits, value)
+        with mx.stream(mx.cpu):
+            policy_logits, value = model(x)
+            mx.eval(policy_logits, value)
         return policy_logits[0].tolist(), float(value[0])
 
     return evaluate
+
+
+# Module-level state for multiprocessing workers (populated by initializer)
+_worker_eval_fns: dict = {}
+
+
+def _worker_init(checkpoint_paths: list):
+    for cp in checkpoint_paths:
+        cp = Path(cp)
+        m = load_model_from_bin(cp) if cp.suffix == ".bin" else load_model(cp)
+        _worker_eval_fns[str(cp)] = make_eval_fn(m)
+
+
+def _play_game(args):
+    import reversi_mcts
+
+    cp_a, cp_b, black_is_a, sims = args
+    black, white = (cp_a, cp_b) if black_is_a else (cp_b, cp_a)
+    outcome = reversi_mcts.run_match(
+        _worker_eval_fns[black], _worker_eval_fns[white], sims
+    )
+    return cp_a, cp_b, black_is_a, outcome
 
 
 def run_tournament(
     checkpoints: list[Path],
     games_per_pair: int,
     sims: int,
+    workers: int | None = None,
 ) -> tuple[list[tuple[Path, float]], dict[Path, AlphaZeroNet]]:
     """Returns (ranking, models_dict) — models kept in memory to allow safe export."""
-    import reversi_mcts
+    n_workers = workers or max(1, (os.cpu_count() or 4) // 2)
+    cp_strs = [str(cp) for cp in checkpoints]
+    pairs = list(combinations(cp_strs, 2))
+    tasks = [
+        (cp_a, cp_b, i % 2 == 0, sims)
+        for cp_a, cp_b in pairs
+        for i in range(games_per_pair)
+    ]
+    total = len(tasks)
 
-    print(f"Loading {len(checkpoints)} models...")
+    print(f"Loading {len(checkpoints)} models... workers={n_workers}")
+    scores: dict[str, float] = {cp: 0.0 for cp in cp_strs}
 
-    def _load(cp: Path) -> AlphaZeroNet:
-        return load_model_from_bin(cp) if cp.suffix == ".bin" else load_model(cp)
-
-    models = {cp: _load(cp) for cp in checkpoints}
-    eval_fns = {cp: make_eval_fn(m) for cp, m in models.items()}
-
-    scores: dict[Path, float] = {cp: 0.0 for cp in checkpoints}
-    pairs = list(combinations(checkpoints, 2))
-    total = len(pairs) * games_per_pair
-    done = 0
-
-    for cp_a, cp_b in pairs:
-        for i in range(games_per_pair):
-            black, white = (cp_a, cp_b) if i % 2 == 0 else (cp_b, cp_a)
-            outcome = reversi_mcts.run_match(eval_fns[black], eval_fns[white], sims)
+    with Pool(
+        processes=n_workers,
+        initializer=_worker_init,
+        initargs=(cp_strs,),
+    ) as pool:
+        for done, (cp_a, cp_b, black_is_a, outcome) in enumerate(
+            pool.imap_unordered(_play_game, tasks), 1
+        ):
+            black, white = (cp_a, cp_b) if black_is_a else (cp_b, cp_a)
             if outcome > 0:
                 scores[black] += 1.0
             elif outcome < 0:
@@ -111,22 +140,34 @@ def run_tournament(
             else:
                 scores[black] += 0.5
                 scores[white] += 0.5
-            done += 1
             if done % max(1, total // 20) == 0 or done == total:
                 print(f"  [{done}/{total}]", end="\r", flush=True)
 
     print()
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True), models
+
+    # Load models in main process only for the winner export
+    def _load(cp: Path) -> AlphaZeroNet:
+        return load_model_from_bin(cp) if cp.suffix == ".bin" else load_model(cp)
+
+    ranking_paths = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    # Only load the winner model (needed for potential export)
+    winner_cp = Path(ranking_paths[0][0])
+    models = {winner_cp: _load(winner_cp)}
+
+    return [(Path(cp), s) for cp, s in ranking_paths], models
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", type=int, default=10, help="Top N checkpoints by loss")
     parser.add_argument(
-        "--games", type=int, default=4, help="Games per pair (use even number)"
+        "--games", type=int, default=2, help="Games per pair (use even number)"
     )
     parser.add_argument(
         "--sims", type=int, default=50, help="MCTS simulations per move"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None, help="Parallel game workers"
     )
     parser.add_argument(
         "--no-champion",
@@ -160,7 +201,7 @@ def main():
         print(f"  {cp.name}{tag}")
     print()
 
-    ranking, models = run_tournament(checkpoints, args.games, args.sims)
+    ranking, models = run_tournament(checkpoints, args.games, args.sims, args.workers)
 
     max_pts = (len(checkpoints) - 1) * args.games
     print("\n=== Results ===")

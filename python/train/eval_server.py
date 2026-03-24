@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import threading
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -128,6 +129,13 @@ class SyncBatchEval:
         self._thread = threading.Thread(target=self._model_loop, daemon=True)
         self._thread.start()
 
+    def _fail_pending(self, items: list) -> None:
+        for _, event, result_box in items:
+            # During shutdown return a neutral fallback to unblock waiting MCTS
+            # threads without throwing through the PyO3 callback boundary.
+            result_box.append(([0.0] * 64, 0.0))
+            event.set()
+
     def pause(self) -> None:
         """Pause GPU inference (tournament uses GPU exclusively)."""
         self._paused.set()
@@ -142,8 +150,6 @@ class SyncBatchEval:
         """
         while self._running:
             if self._paused.is_set():
-                import time
-
                 time.sleep(0.01)
                 continue
             items: list = []
@@ -157,6 +163,10 @@ class SyncBatchEval:
                     items.append(self._q.get_nowait())
                 except queue.Empty:
                     break
+
+            if not self._running:
+                self._fail_pending(items)
+                break
 
             planes_batch = np.stack([it[0] for it in items])  # (N, 4, 8, 8)
             x = mx.array(planes_batch)
@@ -185,9 +195,21 @@ class SyncBatchEval:
         result_box: list = []
         event = threading.Event()
         self._q.put((planes, event, result_box))
-        event.wait()
-        return result_box[0]
+        while True:
+            event.wait(timeout=0.1)
+            if result_box:
+                return result_box[0]
+            if not self._running:
+                return [0.0] * 64, 0.0
 
     def stop(self) -> None:
         self._running = False
+        pending = []
+        while True:
+            try:
+                pending.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        if pending:
+            self._fail_pending(pending)
         self._thread.join(timeout=2.0)

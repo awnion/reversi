@@ -7,9 +7,18 @@ Usage: uv run python -m train.export \
 
 import argparse
 import struct
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+
+def _log(component: str, message: str, **fields) -> None:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    payload = " ".join(f"{k}={v}" for k, v in fields.items())
+    suffix = f" {payload}" if payload else ""
+    print(f"{stamp} [{component}] {message}{suffix}", flush=True)
+
 
 MAGIC = 0x52455653  # "REVS"
 VERSION = 1
@@ -36,7 +45,13 @@ def export(checkpoint_path: Path, output_path: Path):
     with open(output_path, "wb") as f:
         _write_tensors(f, tensors)
     size_kb = output_path.stat().st_size / 1024
-    print(f"Exported {len(tensors)} tensors → {output_path} ({size_kb:.1f} KB)")
+    _log(
+        "export",
+        "saved",
+        tensors=len(tensors),
+        path=output_path.name,
+        kb=f"{size_kb:.1f}",
+    )
 
 
 def export_model(model, output_path: Path):
@@ -49,7 +64,13 @@ def export_model(model, output_path: Path):
     with open(output_path, "wb") as f:
         _write_tensors(f, arrays)
     size_kb = output_path.stat().st_size / 1024
-    print(f"Exported {len(arrays)} tensors → {output_path} ({size_kb:.1f} KB)")
+    _log(
+        "export",
+        "saved",
+        tensors=len(arrays),
+        path=output_path.name,
+        kb=f"{size_kb:.1f}",
+    )
 
 
 def main():

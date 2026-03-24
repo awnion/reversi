@@ -2,23 +2,27 @@
 Run with: uv run python -m train.loop
 
 Architecture:
-- N_WORKERS self-play threads generate game records into the replay buffer.
-- One background model-thread (SyncBatchEval) batches leaf evaluations → GPU.
-- The asyncio train loop runs gradient steps, rate-limited to TRAIN_RATIO new
-  positions per step so it can't outrun data generation.
-- Every TOURNAMENT_EVERY training steps a mini-tournament pits the current
-  model against the stored champion; if it wins, it becomes the new champion.
+- One learner process owns optimizer state, checkpoints, tournaments and the
+  in-memory replay buffer.
+- N self-play processes generate game records into replay shard files.
+- Each self-play process runs its own SyncBatchEval thread and MCTS workers.
+- The learner asynchronously ingests shard files, trains, and periodically
+  exports fresh weights for self-play workers to hot-reload.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import math
 import os
 import signal
 import struct
+import subprocess
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +37,7 @@ from .export import MAGIC, VERSION, export_model
 from .loss import compute_loss
 from .model import AlphaZeroNet
 from .replay import ReplayBuffer
+from .replay_spool import ReplayShardWriter, ingest_replay_shards
 
 # --- hyper-parameters --------------------------------------------------------
 
@@ -63,7 +68,7 @@ EVAL_BATCH_SIZE = 96
 # Tournament settings
 TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
 TOURNAMENT_POOL_CHECKPOINTS = 2  # recent checkpoints to include with champion/current
-TOURNAMENT_GAMES_PER_PAIR = 8  # games for each pairing inside the tournament pool
+TOURNAMENT_GAMES_PER_PAIR = 2  # games for each pairing inside the tournament pool
 TOURNAMENT_SIMS = 200  # MCTS simulations per move in tournament
 WIN_THRESHOLD = 0.55  # win rate required to crown a new champion
 CHAMPION_HISTORY = 5  # keep this many past champion snapshots
@@ -72,6 +77,11 @@ CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
 REPLAY_SAVE_EVERY = 1_000  # save replay buffer every N training steps
 PID_FILE = WEIGHTS_DIR / "train.pid"
+REPLAY_SPOOL_DIR = WEIGHTS_DIR / "replay_spool"
+SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
+DEFAULT_SELFPLAY_PROCESSES = max(1, os.cpu_count() // 2)
+DEFAULT_SHARD_POSITIONS = 4_096
+WEIGHT_REFRESH_GAMES = 5
 
 
 def log_event(component: str, message: str, **fields) -> None:
@@ -87,9 +97,10 @@ def log_event(component: str, message: str, **fields) -> None:
 def _self_play_worker(
     worker_id: int,
     batch_eval: SyncBatchEval,
-    replay: ReplayBuffer,
+    sink,  # ReplayBuffer (inline) or ReplayShardWriter (subprocess)
     games_counter: list,
     stop_flag: list,
+    refresh_weights=None,
 ) -> None:
     """Runs in a ThreadPoolExecutor thread."""
     import reversi_mcts
@@ -97,15 +108,21 @@ def _self_play_worker(
     w = reversi_mcts.MctsWorker(SIMULATIONS)
     while not stop_flag[0]:
         record = w.run_game(batch_eval.evaluate)
-        replay.add(record)
+        if isinstance(sink, ReplayBuffer):
+            sink.add(record)
+            positions = len(record)
+        else:
+            positions = sink.add_record(record)
         games_counter[0] += 1
-        if games_counter[0] % 25 == 0:
+        if refresh_weights is not None and games_counter[0] % WEIGHT_REFRESH_GAMES == 0:
+            refresh_weights()
+        if games_counter[0] == 1 or games_counter[0] % 25 == 0:
             log_event(
                 "selfplay",
                 "worker-progress",
                 worker=worker_id,
                 games=games_counter[0],
-                replay=len(replay),
+                positions=positions,
             )
 
 
@@ -118,17 +135,42 @@ async def train_loop(
     stop_event: asyncio.Event,
     lock: threading.Lock,
     next_tournament_step: list,
-    batch_eval: SyncBatchEval,
 ) -> None:
     opt = optim.AdamW(learning_rate=3e-4, weight_decay=1e-4)
     loss_and_grad = nn.value_and_grad(model, compute_loss)
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     step, best_loss = _load_best_checkpoint(model)
     replay_at_last_step = replay.total_added
+    _publish_selfplay_weights(model)
+
+    warmup_log_t = time.monotonic()
+    warmup_pos0 = len(replay)
+    step_log_t = time.monotonic()
 
     while not stop_event.is_set():
+        ingest_replay_shards(replay, REPLAY_SPOOL_DIR)
+
         # Wait for enough data before starting
         if len(replay) < MIN_REPLAY:
+            now = time.monotonic()
+            if now - warmup_log_t >= 10.0:
+                elapsed = now - warmup_log_t
+                gained = len(replay) - warmup_pos0
+                rate = gained / elapsed if elapsed > 0 else 0
+                remaining = MIN_REPLAY - len(replay)
+                eta = int(remaining / rate) if rate > 0 else 0
+                log_event(
+                    "train",
+                    "warmup",
+                    positions=len(replay),
+                    needed=MIN_REPLAY,
+                    pct=f"{len(replay) / MIN_REPLAY * 100:.0f}%",
+                    rate=f"{rate:.0f}/s",
+                    eta=f"{eta}s",
+                )
+                warmup_log_t = now
+                warmup_pos0 = len(replay)
+
             await asyncio.sleep(0.1)
             continue
 
@@ -140,20 +182,30 @@ async def train_loop(
         replay_at_last_step = replay.total_added
 
         (
-            planes,
-            policies,
-            outcomes,
-            policy_weights,
-            value_weights,
+            planes_np,
+            policies_np,
+            outcomes_np,
+            policy_weights_np,
+            value_weights_np,
         ) = replay.sample(BATCH_SIZE)
+
+        # Convert numpy → MLX outside the lock to minimize lock hold time
+        x = mx.array(np.asarray(planes_np, dtype=np.float32))
+        phase = x[:, 3, 0, 0]
+        policy_targets = 0.97 * mx.array(policies_np) + 0.03 / 64.0
+        value_targets = mx.array(outcomes_np)
+        policy_weights_mx = mx.array(policy_weights_np)
+        value_weights_mx = mx.array(value_weights_np)
+
         with lock:
             loss, grads = loss_and_grad(
                 model,
-                planes,
-                policies,
-                outcomes,
-                policy_weights,
-                value_weights,
+                x,
+                policy_targets,
+                value_targets,
+                policy_weights_mx,
+                value_weights_mx,
+                phase,
             )
             grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
             opt.update(model, grads)
@@ -173,14 +225,19 @@ async def train_loop(
             log_event("train", "nan-loss", step=step)
             continue
 
-        if step % LOG_EVERY == 0:
+        now = time.monotonic()
+        if step % LOG_EVERY == 0 or now - step_log_t >= 30.0:
+            elapsed = now - step_log_t
+            sps = LOG_EVERY / elapsed if elapsed > 0 and step % LOG_EVERY == 0 else None
             log_event(
                 "train",
                 "step",
                 step=step,
                 loss=f"{loss_val:.4f}",
                 replay=len(replay),
+                **({"sps": f"{sps:.1f}"} if sps is not None else {}),
             )
+            step_log_t = now
 
         save = step % CHECKPOINT_EVERY == 0
         if loss_val < best_loss:
@@ -190,6 +247,7 @@ async def train_loop(
         if save:
             path = WEIGHTS_DIR / f"iter_{step:06d}_loss{loss_val:.4f}.npz"
             _save_checkpoint(model, path)
+            _publish_selfplay_weights(model)
             log_event("train", "checkpoint", step=step, path=path.name)
             _prune_checkpoints()
 
@@ -201,7 +259,7 @@ async def train_loop(
         if step >= next_tournament_step[0]:
             next_tournament_step[0] = step + TOURNAMENT_EVERY
             task = asyncio.create_task(
-                _run_mini_tournament(model, lock, best_loss, batch_eval)
+                _run_mini_tournament(model, lock, best_loss, None)
             )
             task.add_done_callback(
                 lambda t: (
@@ -279,8 +337,9 @@ def _make_eval_fn(model: AlphaZeroNet, lock: threading.Lock | None = None):
                 mx.eval(p, v)
                 model.train()
         else:
-            p, v = model(x)
-            mx.eval(p, v)
+            with mx.stream(mx.cpu):
+                p, v = model(x)
+                mx.eval(p, v)
         return p[0].tolist(), float(v[0])
 
     return evaluate
@@ -382,7 +441,7 @@ async def _run_mini_tournament(
     )
 
     eval_fns = {
-        entrant["name"]: _make_eval_fn(entrant["model"], lock) for entrant in entrants
+        entrant["name"]: _make_eval_fn(entrant["model"]) for entrant in entrants
     }
 
     def run_games():
@@ -638,6 +697,13 @@ def _save_checkpoint(model: AlphaZeroNet, path: Path) -> None:
     log_event("weights", "saved-checkpoint", tensors=len(arrays), path=path.name)
 
 
+def _publish_selfplay_weights(model: AlphaZeroNet) -> None:
+    tmp = SELFPLAY_MODEL_BIN.with_suffix(".bin.tmp")
+    export_model(model, tmp)
+    tmp.replace(SELFPLAY_MODEL_BIN)
+    log_event("weights", "published-selfplay", path=SELFPLAY_MODEL_BIN.name)
+
+
 def _prune_checkpoints() -> None:
     def _loss(p: Path) -> float:
         try:
@@ -664,7 +730,184 @@ def _prune_checkpoints() -> None:
 # --- entry point -------------------------------------------------------------
 
 
-async def main() -> None:
+def _resolve_selfplay_source() -> Path | None:
+    if SELFPLAY_MODEL_BIN.exists():
+        return SELFPLAY_MODEL_BIN
+    if CHAMPION_BIN.exists():
+        return CHAMPION_BIN
+    checkpoints = sorted(
+        WEIGHTS_DIR.glob("iter_*.npz"),
+        key=lambda p: int(p.stem.split("_")[1]) if "_" in p.stem else 0,
+    )
+    return checkpoints[-1] if checkpoints else None
+
+
+def _load_weights_into_model(
+    model: AlphaZeroNet,
+    path: Path,
+    lock: threading.Lock | None = None,
+) -> None:
+    loaded = (
+        _load_model_from_bin(path)
+        if path.suffix == ".bin"
+        else _load_model_from_checkpoint(path)
+    )
+    weights = [(k, mx.array(v)) for k, v in _iter_params(loaded)]
+    if lock is None:
+        _load_compatible_weights(model, weights)
+        mx.eval(model.parameters())
+    else:
+        with lock:
+            _load_compatible_weights(model, weights)
+            mx.eval(model.parameters())
+
+
+def _spawn_selfplay_processes(
+    count: int,
+    workers_per_process: int,
+    positions_per_shard: int,
+) -> list[subprocess.Popen]:
+    children: list[subprocess.Popen] = []
+    for process_index in range(count):
+        cmd = [
+            sys.executable,
+            "-m",
+            "train.loop",
+            "--role",
+            "selfplay",
+            "--process-index",
+            str(process_index),
+            "--selfplay-workers",
+            str(workers_per_process),
+            "--positions-per-shard",
+            str(positions_per_shard),
+        ]
+        child = subprocess.Popen(cmd)
+        children.append(child)
+        log_event(
+            "system",
+            "spawn-selfplay",
+            process=process_index,
+            pid=child.pid,
+            workers=workers_per_process,
+        )
+    return children
+
+
+def _stop_child_processes(children: list[subprocess.Popen]) -> None:
+    for child in children:
+        if child.poll() is None:
+            child.terminate()
+    for child in children:
+        if child.poll() is None:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+
+
+async def _run_selfplay_process(
+    process_index: int,
+    selfplay_workers: int,
+    positions_per_shard: int,
+) -> None:
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    REPLAY_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    model = AlphaZeroNet()
+    lock = threading.Lock()
+    source = _resolve_selfplay_source()
+    if source is not None:
+        _load_weights_into_model(model, source, lock)
+        log_event(
+            "selfplay",
+            "weights-loaded",
+            process=process_index,
+            source=source.name,
+        )
+    else:
+        log_event("selfplay", "weights-random-init", process=process_index)
+
+    batch_eval = SyncBatchEval(model, batch_size=EVAL_BATCH_SIZE, lock=lock)
+    shard_writer = ReplayShardWriter(
+        REPLAY_SPOOL_DIR,
+        producer_id=f"sp{process_index}_pid{os.getpid()}",
+        positions_per_shard=positions_per_shard,
+    )
+    stop_event = asyncio.Event()
+    stop_flag = [False]
+    event_loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=selfplay_workers)
+    games_counters = [[0] for _ in range(selfplay_workers)]
+    weight_state = {"mtime_ns": None}
+    refresh_lock = threading.Lock()
+
+    def refresh_weights() -> None:
+        source = _resolve_selfplay_source()
+        if source is None:
+            return
+        stat = source.stat()
+        mtime_ns = stat.st_mtime_ns
+        if weight_state["mtime_ns"] == mtime_ns:
+            return
+        if not refresh_lock.acquire(blocking=False):
+            return
+        try:
+            if weight_state["mtime_ns"] == mtime_ns:
+                return
+            _load_weights_into_model(model, source, lock)
+            weight_state["mtime_ns"] = mtime_ns
+            log_event(
+                "selfplay",
+                "weights-reloaded",
+                process=process_index,
+                source=source.name,
+            )
+        finally:
+            refresh_lock.release()
+
+    if source is not None:
+        weight_state["mtime_ns"] = source.stat().st_mtime_ns
+
+    def _shutdown(signum, frame):
+        log_event("selfplay", "signal", process=process_index, signum=signum)
+        stop_flag[0] = True
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    worker_futures = [
+        event_loop.run_in_executor(
+            executor,
+            _self_play_worker,
+            i,
+            batch_eval,
+            shard_writer,
+            games_counters[i],
+            stop_flag,
+            refresh_weights,
+        )
+        for i in range(selfplay_workers)
+    ]
+
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(1.0)
+    finally:
+        stop_flag[0] = True
+        shard_writer.flush()
+        batch_eval.stop()
+        executor.shutdown(wait=False)
+        for future in worker_futures:
+            future.cancel()
+
+
+async def _run_learner(
+    selfplay_processes: int,
+    selfplay_workers: int,
+    positions_per_shard: int,
+    inline_workers: int = 0,
+) -> None:
     # Guard against duplicate instances
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     if PID_FILE.exists():
@@ -681,68 +924,123 @@ async def main() -> None:
     replay = ReplayBuffer(max_size=500_000)
     stop_event = asyncio.Event()
     lock = threading.Lock()
+    children: list[subprocess.Popen] = []
 
     # Restore replay buffer from previous run if available
     replay.load(REPLAY_PATH)
 
-    batch_eval = SyncBatchEval(model, batch_size=EVAL_BATCH_SIZE, lock=lock)
-
     log_event(
         "system",
         "startup",
-        workers=N_WORKERS,
+        selfplay_processes=selfplay_processes,
+        inline_workers=inline_workers,
         simulations=SIMULATIONS,
         eval_batch=EVAL_BATCH_SIZE,
         min_replay=MIN_REPLAY,
         train_ratio=TRAIN_RATIO,
         tournament_every=TOURNAMENT_EVERY,
     )
-
-    stop_flag = [False]
-    games_counters = [[0] for _ in range(N_WORKERS)]
-    executor = ThreadPoolExecutor(max_workers=N_WORKERS)
-    event_loop = asyncio.get_event_loop()
     next_tournament_step = [TOURNAMENT_EVERY]
+
+    inline_executor = None
+    inline_batch_eval = None
+    if inline_workers > 0:
+        inline_batch_eval = SyncBatchEval(model, batch_size=EVAL_BATCH_SIZE, lock=lock)
+        stop_flag = [False]
+        games_counters = [[0] for _ in range(inline_workers)]
+        inline_executor = ThreadPoolExecutor(max_workers=inline_workers)
+        event_loop = asyncio.get_event_loop()
+        for i in range(inline_workers):
+            event_loop.run_in_executor(
+                inline_executor,
+                _self_play_worker,
+                i,
+                inline_batch_eval,
+                replay,
+                games_counters[i],
+                stop_flag,
+            )
 
     def _shutdown(signum, frame):
         """SIGTERM handler: save state and stop gracefully."""
         log_event("system", "signal", signum=signum, action="save-and-stop")
         replay.save(REPLAY_PATH)
-        stop_flag[0] = True
         stop_event.set()
+        if inline_workers > 0:
+            stop_flag[0] = True
 
     signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
-    worker_futures = [
-        event_loop.run_in_executor(
-            executor,
-            _self_play_worker,
-            i,
-            batch_eval,
-            replay,
-            games_counters[i],
-            stop_flag,
+    if selfplay_processes > 0:
+        children = _spawn_selfplay_processes(
+            selfplay_processes, selfplay_workers, positions_per_shard
         )
-        for i in range(N_WORKERS)
-    ]
 
     try:
-        await asyncio.gather(
-            train_loop(
-                model, replay, stop_event, lock, next_tournament_step, batch_eval
-            ),
-            *worker_futures,
-        )
+        await train_loop(model, replay, stop_event, lock, next_tournament_step)
     except KeyboardInterrupt:
         log_event("system", "keyboard-interrupt")
         replay.save(REPLAY_PATH)
     finally:
-        stop_flag[0] = True
         stop_event.set()
-        batch_eval.stop()
-        executor.shutdown(wait=False)
+        if inline_workers > 0:
+            stop_flag[0] = True
+            inline_batch_eval.stop()
+            inline_executor.shutdown(wait=False)
+        ingest_replay_shards(replay, REPLAY_SPOOL_DIR, limit=10_000)
+        replay.save(REPLAY_PATH)
+        _stop_child_processes(children)
         if PID_FILE.exists():
             PID_FILE.unlink(missing_ok=True)
+
+
+def _default_selfplay_workers(processes: int) -> int:
+    total_workers = N_WORKERS
+    return max(1, total_workers // max(1, processes))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--role",
+        choices=("learner", "selfplay"),
+        default="learner",
+    )
+    parser.add_argument(
+        "--selfplay-processes",
+        type=int,
+        default=DEFAULT_SELFPLAY_PROCESSES,
+    )
+    parser.add_argument("--selfplay-workers", type=int, default=None)
+    parser.add_argument("--inline-workers", type=int, default=0)
+    parser.add_argument(
+        "--positions-per-shard",
+        type=int,
+        default=DEFAULT_SHARD_POSITIONS,
+    )
+    parser.add_argument("--process-index", type=int, default=0)
+    return parser.parse_args()
+
+
+async def main() -> None:
+    args = _parse_args()
+    workers = args.selfplay_workers
+    if workers is None:
+        workers = _default_selfplay_workers(args.selfplay_processes)
+    if args.role == "selfplay":
+        await _run_selfplay_process(
+            process_index=args.process_index,
+            selfplay_workers=workers,
+            positions_per_shard=args.positions_per_shard,
+        )
+        return
+    await _run_learner(
+        selfplay_processes=args.selfplay_processes,
+        selfplay_workers=workers,
+        positions_per_shard=args.positions_per_shard,
+        inline_workers=args.inline_workers,
+    )
 
 
 if __name__ == "__main__":

@@ -79,13 +79,21 @@ def test_compute_loss():
             for i in range(B)
         ]
     )
+    # Convert to MLX (as loop does outside the lock)
+    x = mx.array(all_planes)
+    phase = x[:, 3, 0, 0]
+    policy_targets = 0.97 * mx.array(policies) + 0.03 / 64.0
+    value_targets = mx.array(outcomes)
+    policy_weights_mx = mx.array(policy_weights)
+    value_weights_mx = mx.array(value_weights)
     loss = compute_loss(
         net,
-        all_planes,
-        policies,
-        outcomes,
-        policy_weights,
-        value_weights,
+        x,
+        policy_targets,
+        value_targets,
+        policy_weights_mx,
+        value_weights_mx,
+        phase,
     )
     mx.eval(loss)
     loss_val = float(loss.item())
