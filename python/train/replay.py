@@ -16,26 +16,30 @@ def log_event(component: str, message: str, **fields) -> None:
 class ReplayBuffer:
     def __init__(self, max_size: int = 500_000):
         self.max_size = max_size
-        self._boards_black = np.zeros(max_size, dtype=np.uint64)
-        self._boards_white = np.zeros(max_size, dtype=np.uint64)
-        self._is_black = np.zeros(max_size, dtype=bool)
-        self._legal = np.zeros(max_size, dtype=np.uint64)
         self._policies = np.zeros((max_size, 64), dtype=np.float32)
         self._outcomes = np.zeros(max_size, dtype=np.float32)
         self._policy_weights = np.ones(max_size, dtype=np.float32)
         self._value_weights = np.ones(max_size, dtype=np.float32)
+        # Precomputed input planes: (4, 8, 8) float32 per entry
+        # planes[3] = phase plane (popcount/64 repeated spatially)
+        self._planes = np.zeros((max_size, 4, 8, 8), dtype=np.float32)
         self._ptr = 0
         self._size = 0
         self._total_added = 0
 
     def add(self, record) -> None:
         """Add all positions from a GameRecord (list of dicts from MctsWorker)."""
+        from .eval_server import board_to_planes
+
         for pos in record:
             i = self._ptr
-            self._boards_black[i] = pos["board_black"]
-            self._boards_white[i] = pos["board_white"]
-            self._is_black[i] = pos["is_black"]
-            self._legal[i] = pos["legal"]
+            planes = board_to_planes(
+                pos["board_black"],
+                pos["board_white"],
+                pos["is_black"],
+                pos["legal"],
+            )
+            self._planes[i] = planes
             self._policies[i] = pos["mcts_policy"]
             self._outcomes[i] = pos["outcome"]
             self._policy_weights[i] = pos.get("policy_weight", 1.0)
@@ -47,10 +51,7 @@ class ReplayBuffer:
     def sample(self, batch_size: int):
         idx = np.random.choice(self._size, batch_size, replace=False)
         return (
-            self._boards_black[idx],
-            self._boards_white[idx],
-            self._is_black[idx],
-            self._legal[idx],
+            self._planes[idx],
             self._policies[idx],
             self._outcomes[idx],
             self._policy_weights[idx],
@@ -64,14 +65,11 @@ class ReplayBuffer:
         tmp = path.with_suffix(".tmp.npz")
         np.savez_compressed(
             str(tmp),
-            boards_black=self._boards_black[: self._size],
-            boards_white=self._boards_white[: self._size],
-            is_black=self._is_black[: self._size],
-            legal=self._legal[: self._size],
             policies=self._policies[: self._size],
             outcomes=self._outcomes[: self._size],
             policy_weights=self._policy_weights[: self._size],
             value_weights=self._value_weights[: self._size],
+            planes=self._planes[: self._size],
             ptr=np.array(self._ptr % self._size if self._size else 0),
         )
         tmp.replace(path)
@@ -83,21 +81,32 @@ class ReplayBuffer:
         if not path.exists():
             return
         data = np.load(str(path))
-        if (
-            "legal" not in data
-            or "policy_weights" not in data
-            or "value_weights" not in data
-        ):
+        if "planes" not in data:
             log_event("replay", "ignore-stale-schema", path=path.name)
             return
-        n = len(data["boards_black"])
+        n = len(data["planes"])
         if n == 0:
             return
         n = min(n, self.max_size)
-        self._boards_black[:n] = data["boards_black"][:n]
-        self._boards_white[:n] = data["boards_white"][:n]
-        self._is_black[:n] = data["is_black"][:n]
-        self._legal[:n] = data["legal"][:n]
+        loaded_planes = data["planes"][:n]
+        if loaded_planes.shape[1:] == (3, 8, 8):
+            # Old format: (N, 3, 8, 8) uint8 + separate phase → convert
+            log_event("replay", "convert-planes-3-to-4", positions=n)
+            spatial = loaded_planes.astype(np.float32)
+            if "phase" in data:
+                phase_vals = data["phase"][:n].astype(np.float32)
+            else:
+                # No phase data, reconstruct zeros (will be backfilled by workers)
+                phase_vals = np.zeros(n, dtype=np.float32)
+            phase_plane = np.repeat(phase_vals[:, None, None], 64, axis=-1).reshape(
+                n, 1, 8, 8
+            )
+            self._planes[:n] = np.concatenate([spatial, phase_plane], axis=1)
+        elif loaded_planes.shape[1:] == (4, 8, 8):
+            self._planes[:n] = loaded_planes
+        else:
+            log_event("replay", "ignore-bad-planes-shape", shape=loaded_planes.shape)
+            return
         self._policies[:n] = data["policies"][:n]
         self._outcomes[:n] = data["outcomes"][:n]
         self._policy_weights[:n] = data["policy_weights"][:n]

@@ -58,7 +58,7 @@ CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 N_WORKERS = (os.cpu_count() or 4) * 4
 
 # Larger batches = better GPU utilisation.
-EVAL_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 96
 
 # Tournament settings
 TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
@@ -140,10 +140,7 @@ async def train_loop(
         replay_at_last_step = replay.total_added
 
         (
-            bb,
-            bw,
-            ib,
-            legal,
+            planes,
             policies,
             outcomes,
             policy_weights,
@@ -152,10 +149,7 @@ async def train_loop(
         with lock:
             loss, grads = loss_and_grad(
                 model,
-                bb,
-                bw,
-                ib,
-                legal,
+                planes,
                 policies,
                 outcomes,
                 policy_weights,

@@ -50,7 +50,7 @@ def test_replay_buffer():
     buf.add(fake_record)
     assert len(buf) == 1
     sample = buf.sample(1)
-    assert len(sample) == 8
+    assert len(sample) == 5
     print("✓ replay buffer")
 
 
@@ -67,12 +67,21 @@ def test_compute_loss():
     outcomes = np.array([1.0, -1.0, 0.0, 1.0], dtype=np.float32)
     policy_weights = np.ones(B, dtype=np.float32)
     value_weights = np.ones(B, dtype=np.float32)
+    # Precompute planes (phase is inside planes[:,3])
+    all_planes = np.stack(
+        [
+            board_to_planes(
+                int(boards_black[i]),
+                int(boards_white[i]),
+                bool(is_black_arr[i]),
+                int(legal_arr[i]),
+            )
+            for i in range(B)
+        ]
+    )
     loss = compute_loss(
         net,
-        boards_black,
-        boards_white,
-        is_black_arr,
-        legal_arr,
+        all_planes,
         policies,
         outcomes,
         policy_weights,
