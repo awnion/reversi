@@ -21,11 +21,27 @@
       "version": "0.0.0",
       "dependencies": {
         "@reversi/board-ui": "workspace:*",
+        "@reversi/bot": "workspace:*",
+        "@reversi/bot-minimax": "workspace:*",
         "@reversi/core": "workspace:*",
       },
     },
     "packages/board-ui": {
       "name": "@reversi/board-ui",
+      "version": "0.0.0",
+      "dependencies": {
+        "@reversi/core": "workspace:*",
+      },
+    },
+    "packages/bot": {
+      "name": "@reversi/bot",
+      "version": "0.0.0",
+      "dependencies": {
+        "@reversi/core": "workspace:*",
+      },
+    },
+    "packages/bot-minimax": {
+      "name": "@reversi/bot-minimax",
       "version": "0.0.0",
       "dependencies": {
         "@reversi/core": "workspace:*",
@@ -74,6 +90,10 @@
     "@polka/url": ["@polka/url@1.0.0-next.29", "", {}, "sha512-wwQAWhWSuHaag8c4q/KN/vCoeOJYshAIvMQwD4GpSb3OiZklFfvAgmj0VCBBImRpuF/aFgIRzllXlVX93Jevww=="],
 
     "@reversi/board-ui": ["@reversi/board-ui@workspace:packages/board-ui"],
+
+    "@reversi/bot": ["@reversi/bot@workspace:packages/bot"],
+
+    "@reversi/bot-minimax": ["@reversi/bot-minimax@workspace:packages/bot-minimax"],
 
     "@reversi/core": ["@reversi/core@workspace:packages/core"],
 

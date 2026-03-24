@@ -1,50 +1,34 @@
-# TODO
+# Reversi Bot Players TODO
 
-## Foundation
+## Phase 1: Types and Interfaces (`@reversi/core`)
+- [x] Add `MoveEval` and `PositionAnalysis` interfaces to `@reversi/core`.
+- [x] Add `BotPlayer` interface to `@reversi/core`.
 
-- [x] Define initial implementation plan for the monorepo
-- [x] Create Bun workspace monorepo scaffold
-- [x] Add root TypeScript and tooling configuration
-- [x] Add root scripts for build, dev, test, and lint
+## Phase 2: JS bot package (`@reversi/bot`)
+- [x] Set up `@reversi/bot` package (`package.json`, `tsconfig.json`).
+- [x] Implement `greedyBot.ts`.
+- [x] Export the bot.
 
-## Core Game Logic
+## Phase 3: Game Controller & UI (`apps/web`)
+- [x] Create `GameController` logic (handle human vs bot, bot vs bot).
+- [x] Update Game board to use `GameController`.
+- [x] Add Player Selection UI to sidebar (Dropdowns for Black/White).
+- [x] Implement `New Game` button logic.
 
-- [x] Create `packages/core`
-- [x] Implement board and move types
-- [x] Implement initial Reversi position
-- [x] Implement legal move generation
-- [x] Implement move application and disc flipping
-- [x] Implement pass and game-over detection
-- [x] Add unit tests for core rules
+## Phase 4: Rust + WASM Bot (`rust/minimax`)
+- [x] Initialize `rust/minimax` crate.
+- [x] Implement bitboard representation.
+- [x] Implement Negamax with alpha-beta pruning.
+- [x] Implement evaluation function.
+- [x] Expose WASM API via `wasm-bindgen`.
+- [x] Set up `wasm-pack` build script.
 
-## Board GUI Engine
+## Phase 5: TypeScript Wrapper (`@reversi/bot-minimax`)
+- [x] Set up `@reversi/bot-minimax` package.
+- [x] Implement `createMinimaxBot` wrapper around the WASM module.
+- [x] Integrate Minimax bot into `apps/web` selection UI.
 
-- [x] Create `packages/board-ui`
-- [x] Implement board state model
-- [x] Implement DOM renderer for 8x8 board
-- [x] Implement fast redraw scheduling with `requestAnimationFrame`
-- [x] Implement pointer interaction for legal moves
-- [ ] Implement disc placement and flip animation hooks
-- [x] Add browser integration tests for board interactions
-
-## Web App
-
-- [x] Create `apps/web`
-- [x] Wire `core` and `board-ui` together
-- [x] Render playable local 8x8 Reversi game
-- [x] Show current player, score, legal moves, and game status
-- [x] Add basic responsive layout
-
-## Testing
-
-- [x] Configure `bun test` for logic packages
-- [x] Configure `vitest` browser mode with Playwright provider
-- [x] Configure Playwright end-to-end tests
-- [x] Install browser binaries through Playwright
-
-## Verification
-
-- [x] Run unit tests
-- [x] Run browser integration tests
-- [x] Run end-to-end smoke tests
-- [x] Update this TODO after each completed milestone
+## Phase 6: Analysis Mode
+- [x] Add `Analyze` button in the sidebar.
+- [x] Implement UI overlay for move scores and hints.
+- [x] Show ranked move list in the sidebar.

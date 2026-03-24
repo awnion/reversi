@@ -1,0 +1,15 @@
+{
+  "name": "@reversi/bot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "bunx tsc -b",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@reversi/core": "workspace:*"
+  }
+}
