@@ -41,7 +41,7 @@ from .replay_spool import ReplayShardWriter, ingest_replay_shards
 
 # --- hyper-parameters --------------------------------------------------------
 
-SIMULATIONS = 300
+SIMULATIONS = 3000
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
