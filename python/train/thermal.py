@@ -7,7 +7,7 @@ below its soft limit nothing is slowed down; once any sensor reaches its hard
 limit the throttle is raised step by step until the machine cools; in between
 it is held.
 
-The GPU is kept cool (75/80 °C). Laptop CPUs run hot under load, so the CPU
+The GPU is kept cool (70/74 °C). Laptop CPUs run hot under load, so the CPU
 limits are higher (85/90 °C); tournaments are not throttled at all and may push
 the CPU further for a short while.
 
@@ -34,7 +34,7 @@ def _limit(name: str, default: float) -> float:
 
 # sensor → (soft, hard)
 LIMITS: dict[str, tuple[float, float]] = {
-    "gpu": (_limit("REVERSI_GPU_TEMP_SOFT", 75), _limit("REVERSI_GPU_TEMP_HARD", 80)),
+    "gpu": (_limit("REVERSI_GPU_TEMP_SOFT", 70), _limit("REVERSI_GPU_TEMP_HARD", 74)),
     "cpu": (_limit("REVERSI_CPU_TEMP_SOFT", 85), _limit("REVERSI_CPU_TEMP_HARD", 90)),
 }
 POLL_SECONDS = 5.0
@@ -119,7 +119,7 @@ class ThermalGovernor:
         return "/".join(f"{k}{v:.0f}" for k, v in sorted(self.temperatures.items()))
 
     def describe_limits(self) -> str:
-        """Soft-hard limits per sensor, e.g. ``cpu85-90/gpu75-80``."""
+        """Soft-hard limits per sensor, e.g. ``cpu85-90/gpu70-74``."""
         return "/".join(
             f"{k}{soft:.0f}-{hard:.0f}"
             for k, (soft, hard) in sorted(self.limits.items())

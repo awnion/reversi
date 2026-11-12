@@ -29,9 +29,15 @@ pub const PLANES_LEN: usize = 4 * 64;
 /// Write the network input for `request` into `out` (`PLANES_LEN` floats):
 /// my discs, opponent discs, legal moves, phase (occupied / 64).
 pub fn write_planes(request: &EvalRequest, out: &mut [f32]) {
-    let board = request.board;
+    write_position_planes(request.board, request.is_black, request.legal, out);
+}
+
+/// Write the network input for a position into `out` (`PLANES_LEN` floats):
+/// the side to move's discs, the opponent's, `legal`, and the phase plane
+/// (occupied squares / 64). Same encoding as `python/train/planes.py`.
+pub fn write_position_planes(board: Board, is_black: bool, legal: u64, out: &mut [f32]) {
     let (mine, theirs) =
-        if request.is_black { (board.black, board.white) } else { (board.white, board.black) };
+        if is_black { (board.black, board.white) } else { (board.white, board.black) };
     let phase = (board.black | board.white).count_ones() as f32 / 64.0;
     let (my_plane, rest) = out[..PLANES_LEN].split_at_mut(64);
     let (opp_plane, rest) = rest.split_at_mut(64);
@@ -39,7 +45,7 @@ pub fn write_planes(request: &EvalRequest, out: &mut [f32]) {
     for i in 0..64 {
         my_plane[i] = ((mine >> i) & 1) as f32;
         opp_plane[i] = ((theirs >> i) & 1) as f32;
-        legal_plane[i] = ((request.legal >> i) & 1) as f32;
+        legal_plane[i] = ((legal >> i) & 1) as f32;
     }
     phase_plane.fill(phase);
 }

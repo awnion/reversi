@@ -8,6 +8,7 @@ pub mod search;
 pub use batch::PLANES_LEN;
 pub use batch::SelfPlayPool;
 pub use batch::write_planes;
+pub use batch::write_position_planes;
 pub use game::GameRecord;
 pub use game::PositionRecord;
 pub use game::play_game;

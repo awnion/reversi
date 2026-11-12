@@ -119,7 +119,7 @@ Training runs continuously and:
 - Logs the loss and its parts: `policy_kl` (the part of the policy loss that
   can still go down), `value` and `margin`
 - Self-play uses stochastic openings (root noise + sampling from visit counts in the early game)
-- Every 50 000 steps plays the current network against `champion.bin` (200 games);
+- Every 30 minutes (and at least 5 000 steps) plays the current network against `champion.bin` (200 games);
   it becomes the new champion with at least 55 % of the points
 - Keeps the last 5 champions with date and win-rate in `weights/<run>/champions/history.json`
 

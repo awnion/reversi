@@ -53,10 +53,12 @@ lint-fix:
     bunx tsc -b --pretty
 
 # Start training in background: just train <botname>
-train botname:
+train botname processes="":
     #!/usr/bin/env bash
     mkdir -p {{ _weights_base / botname }}
-    nohup uv run --directory python python -m train.loop --run-name {{ botname }} --selfplay-processes 1 \
+    # Self-play processes: 4 on CUDA, 1 on Apple Silicon unless given.
+    nohup uv run --directory python python -m train.loop --run-name {{ botname }} \
+        {{ if processes != "" { "--selfplay-processes " + processes } else { "" } }} \
         >> {{ _weights_base / botname / "train.log" }} 2>&1 &
     echo $! > {{ _weights_base / botname / "nohup.pid" }}
     echo -e "\033[32mTraining '{{ botname }}' started (pid $!)\033[0m"
@@ -75,6 +77,14 @@ kill botname:
         rm -f "$nohup_pid"
     fi
     pkill -9 -f "train.loop --run-name {{ botname }}" || true
+    # The Rust self-play process of this run only (REVERSI_SELFPLAY=rust).
+    rs_pid_file="{{ _weights_base / botname / "selfplay-rs.pid" }}"
+    rs_pid="$(cat "$rs_pid_file" 2>/dev/null)"
+    if [ -n "$rs_pid" ] && ps -p "$rs_pid" -o args= | grep -q reversi-selfplay; then
+        kill -9 "$rs_pid" 2>/dev/null || true
+    fi
+    rm -f "$rs_pid_file"
+    pkill -9 -f "reversi-selfplay selfplay --run-dir {{ _weights_base / botname }} " || true
 
 # Stop background training: just stop <botname>
 stop botname:
@@ -89,12 +99,44 @@ stop botname:
         rm -f "$nohup_pid"
     fi
     pkill -f "train.loop --run-name {{ botname }}" || true
-    # The learner saves its replay buffer on the way out; wait so that a
+    # The learner saves its replay buffer and stops its Rust self-play child
+    # (REVERSI_SELFPLAY=rust) on the way out; wait for that, so that a
     # following `just train` does not find it still running.
-    for _ in $(seq 60); do
+    rs_pattern="reversi-selfplay selfplay --run-dir {{ _weights_base / botname }} "
+    # Saving a full replay buffer can take more than a minute.
+    for _ in $(seq 300); do
         pgrep -f "train.loop --run-name {{ botname }}" >/dev/null || break
         sleep 1
     done
+    if pgrep -f "train.loop --run-name {{ botname }}" >/dev/null; then
+        echo "Learner still running after 300 s" >&2
+        exit 1
+    fi
+    # Only then an orphaned Rust process, with a single signal: a second
+    # SIGTERM makes it exit at once without flushing its last shard.
+    rs_pid="$(cat "{{ _weights_base / botname / "selfplay-rs.pid" }}" 2>/dev/null)"
+    if [ -n "$rs_pid" ] && ps -p "$rs_pid" -o args= | grep -q reversi-selfplay; then
+        kill "$rs_pid" 2>/dev/null || true
+    else
+        pkill -f "$rs_pattern" || true
+    fi
+    for _ in $(seq 10); do
+        pgrep -f "$rs_pattern" >/dev/null || break
+        sleep 1
+    done
+
+# Links the libtorch of python/.venv (CUDA machine; torch must match tch, see
+# rust/trainer/Cargo.toml). Niced and on 4 jobs, so that it can build next to a
+# running training.
+# Build the Rust self-play binary (REVERSI_SELFPLAY=rust): just build-selfplay
+build-selfplay:
+    cd python && LIBTORCH_USE_PYTORCH=1 nice -n 19 uv run --no-sync cargo build --release -j 4 \
+        --manifest-path ../rust/trainer/Cargo.toml --target-dir ../rust/trainer/target
+
+# Games are discarded; extra args go to the binary, e.g. --workers 8.
+# Rust self-play throughput: just bench-selfplay <weights.bin> [seconds] [args]
+bench-selfplay weights seconds="60" *args="":
+    rust/trainer/target/release/reversi-selfplay bench --weights {{ weights }} --seconds {{ seconds }} {{ args }}
 
 # Follow training logs: just logs <botname>
 logs botname:
@@ -125,6 +167,8 @@ sync-code host:
 # Install deps and build the Rust extension on the remote: just setup-remote <host>
 setup-remote host: (sync-code host)
     ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }}/python && uv sync && uv run maturin develop --release --features python'
+    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && just build-selfplay' \
+        || echo "reversi-selfplay not built; Python self-play still works"
 
 # Send a run's state (champion, checkpoints, replay buffer): just push-run <host> <botname>
 push-run host botname:

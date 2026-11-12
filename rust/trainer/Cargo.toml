@@ -3,9 +3,29 @@ name = "reversi_trainer"
 version = "0.1.0"
 edition = "2024"
 
-# Standalone on purpose: mlx-rs builds Apple's MLX from source (CMake + Metal),
-# so it stays out of the Bazel-resolved root workspace.
+# Standalone on purpose: tch links the libtorch of the Python environment
+# (`LIBTORCH_USE_PYTORCH=1`), so this crate stays out of the Bazel-resolved
+# root workspace. Build it with `just build-selfplay`.
 [workspace]
 
+[[bin]]
+name = "reversi-selfplay"
+path = "src/main.rs"
+
 [dependencies]
-mlx-rs = "0.34"
+crossbeam-channel = "0.5"
+libc = "0.2"
+ndarray = "0.17"
+ndarray-npy = { version = "0.10", default-features = false, features = ["compressed_npz"] }
+reversi_mcts = { path = "../mcts" }
+reversi_minimax = { path = "../minimax" }
+reversi_nn = { path = "../nn" }
+signal-hook = "0.3"
+# tch 0.27 expects libtorch 2.15 (torch 2.15.0 in python/.venv on the CUDA box).
+tch = "=0.27.0"
+# Direct dependency only for its build metadata (the libtorch lib directory,
+# see build.rs); the version must match tch's.
+torch-sys = "=0.27.0"
+
+[profile.release]
+debug = "line-tables-only"

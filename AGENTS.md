@@ -110,6 +110,19 @@ just train <bot> / just logs <bot> / just stop <bot> / just tournament <bot>
   touching a backend or the format.
 - **Remote machine:** `just setup-remote <host>`, `just push-run <host> <bot>`,
   `just train-remote <host> <bot>`, `just pull-run <host> <bot>`.
+- **Rust self-play (CUDA only, opt-in).** `rust/trainer` builds
+  `reversi-selfplay`, which replaces the Python self-play processes with one
+  process: search threads over `rust/mcts` pools and one GPU thread running
+  the network on libtorch (tch, BatchNorm folded, half precision). It writes
+  the same replay shards and follows the same weights, cooldown and thermal
+  rules. It is outside Bazel and the Cargo workspace and links the venv's
+  torch (`just build-selfplay`; tch is pinned to that torch version). Enable
+  with `REVERSI_SELFPLAY=rust` (default `python`; the Mac always uses Python);
+  the learner runs `reversi-selfplay check` first, restarts the process if it
+  dies and falls back to Python self-play. Extra flags:
+  `REVERSI_SELFPLAY_RUST_ARGS`. Tests: `cargo test` in `rust/trainer` and
+  `uv run python -m train.test_selfplay_rs` (parity, shards, shutdown, game
+  statistics); throughput: `just bench-selfplay <weights.bin>`.
 
 Training writes to `weights/<bot>/`. Do not delete or rewrite files there
 (checkpoints, replay buffers, `champion.bin`) unless asked; a training run may

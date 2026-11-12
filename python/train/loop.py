@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import math
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -72,7 +74,12 @@ SELFPLAY_GAMES = 1024
 # Self-play always uses the newest weights; the champion (what the browser
 # plays, what `just snapshot` fetches) changes only after a long match shows
 # the current network is stronger. 18 games a minute were mostly noise.
-TOURNAMENT_EVERY = 50_000  # training steps between matches (a couple of hours)
+# A match every TOURNAMENT_EVERY_SECONDS of training, once the network has
+# had at least TOURNAMENT_MIN_STEPS steps since the last one. By the clock
+# rather than by steps, because the step rate follows the self-play speed
+# and the thermal throttling.
+TOURNAMENT_EVERY_SECONDS = 30 * 60
+TOURNAMENT_MIN_STEPS = 5_000
 TOURNAMENT_POOL_CHECKPOINTS = 0  # current vs champion only
 # Games in the match. Every random opening is played twice with colours
 # swapped, so keep this even.
@@ -116,12 +123,39 @@ def _apply_run_name(name: str) -> None:
     LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
 
 
-# One process already fills the GPU with large batches; more processes only
-# split it into smaller, less efficient ones.
-DEFAULT_SELFPLAY_PROCESSES = 1
+# A self-play process alternates between the search trees (one CPU core) and
+# the network (GPU), so one process leaves the GPU idle most of the time.
+# Several processes, each with its own full batch, keep it busy. On Apple
+# Silicon the CPU and GPU share one chip and one process is enough.
+DEFAULT_SELFPLAY_PROCESSES = 1 if backend_name() == "mlx" else 4
 DEFAULT_SHARD_POSITIONS = 4_096
 WEIGHT_REFRESH_SECONDS = 5.0  # self-play: poll for new weights
 SELFPLAY_LOG_SECONDS = 30.0
+
+# Self-play implementation, from REVERSI_SELFPLAY:
+# - "python" (default): the self-play processes below;
+# - "rust": one `reversi-selfplay` process (rust/trainer, `just build-selfplay`),
+#   libtorch on CUDA with all CPU cores searching. Falls back to Python when
+#   its `check` fails or it keeps crashing;
+# - "auto": the same as "rust" (a separate name for scripts that opt in).
+# Extra arguments for the binary: REVERSI_SELFPLAY_RUST_ARGS, e.g.
+# "--workers 8 --batch-target 8192".
+SELFPLAY_IMPLEMENTATIONS = ("python", "rust", "auto")
+RUST_SELFPLAY_BIN = Path(
+    os.environ.get(
+        "REVERSI_SELFPLAY_BIN",
+        Path(__file__).resolve().parent.parent.parent
+        / "rust"
+        / "trainer"
+        / "target"
+        / "release"
+        / "reversi-selfplay",
+    )
+)
+# Restarts after unexpected exits before falling back to Python self-play; a
+# process that ran this long resets the count.
+RUST_SELFPLAY_RESTARTS = 3
+RUST_SELFPLAY_STABLE_SECONDS = 600.0
 
 
 def log_event(component: str, message: str, **fields) -> None:
@@ -216,7 +250,8 @@ async def train_loop(
     model.set_learning_rate(learning_rate)
     log_event("train", "lr", step=step, origin=lr_origin, lr=f"{learning_rate:.2e}")
     # Matches are counted from here, not from step 0.
-    next_tournament_step[0] = step + TOURNAMENT_EVERY
+    next_tournament_step[0] = step + TOURNAMENT_MIN_STEPS
+    next_tournament_at = time.monotonic() + TOURNAMENT_EVERY_SECONDS
     replay_at_last_step = replay.total_added
     _publish_selfplay_weights(model.weights())
 
@@ -345,8 +380,13 @@ async def train_loop(
         # Trigger tournament when step crosses the next scheduled boundary.
         # A tournament can outlast the interval; never run two at once.
         tournament_idle = tournament_task is None
-        if step >= next_tournament_step[0] and tournament_idle:
-            next_tournament_step[0] = step + TOURNAMENT_EVERY
+        if (
+            tournament_idle
+            and step >= next_tournament_step[0]
+            and time.monotonic() >= next_tournament_at
+        ):
+            next_tournament_step[0] = step + TOURNAMENT_MIN_STEPS
+            next_tournament_at = time.monotonic() + TOURNAMENT_EVERY_SECONDS
             tournament_task = asyncio.create_task(
                 _run_mini_tournament(model, lock, best_loss, step)
             )
@@ -598,10 +638,11 @@ def _record_champion(
 
 
 def _load_best_checkpoint(model: Model) -> tuple[int, float]:
-    """Load the strongest known checkpoint for continued training.
-    Prefer champion.bin because promotion is strength-based; fall back to the
-    latest .npz checkpoint only when no deployed champion exists.
-    Returns (step, loss).
+    """Load the weights to continue training from; returns (step, loss).
+
+    The newest checkpoint, if it is newer than the champion: the champion
+    changes only after a long match, and resuming from it would throw away
+    the training since. Otherwise the champion, then any checkpoint.
     """
 
     def _loss(p: Path) -> float:
@@ -610,28 +651,28 @@ def _load_best_checkpoint(model: Model) -> tuple[int, float]:
         except ValueError:
             return float("inf")
 
-    if CHAMPION_BIN.exists():
+    def _step(p: Path) -> int:
+        try:
+            return int(p.stem.split("_")[1])
+        except (IndexError, ValueError):
+            return -1
+
+    checkpoints = sorted(WEIGHTS_DIR.glob("iter_*.npz"), key=_step)
+    latest = checkpoints[-1] if checkpoints else None
+    champion_step = int(_champion_meta().get("step") or 0)
+
+    if CHAMPION_BIN.exists() and (latest is None or _step(latest) <= champion_step):
         try:
             model.load_weights(weights_io.load(CHAMPION_BIN))
-            step = int(_champion_meta().get("step") or 0)
-            log_event("train", "resume", source="champion.bin", step=step)
-            return step, float("inf")
+            log_event("train", "resume", source="champion.bin", step=champion_step)
+            return champion_step, float("inf")
         except Exception as e:
             log_event("train", "resume-failed", source="champion.bin", error=repr(e))
 
-    checkpoints = sorted(
-        WEIGHTS_DIR.glob("iter_*.npz"),
-        key=lambda p: int(p.stem.split("_")[1]) if "_" in p.stem else 0,
-    )
-    if checkpoints:
-        latest = checkpoints[-1]
+    if latest is not None:
         weights = weights_io.load(latest)
         applied = model.load_weights(weights)
-        try:
-            step = int(latest.stem.split("_")[1])
-            loss = _loss(latest)
-        except (IndexError, ValueError):
-            step, loss = 0, float("inf")
+        step, loss = max(_step(latest), 0), _loss(latest)
         log_event(
             "train",
             "resume",
@@ -740,6 +781,130 @@ def _spawn_selfplay_processes(
             workers=workers_per_process,
         )
     return children
+
+
+def _selfplay_implementation() -> str:
+    name = os.environ.get("REVERSI_SELFPLAY", "python")
+    if name not in SELFPLAY_IMPLEMENTATIONS:
+        raise ValueError(
+            f"REVERSI_SELFPLAY must be one of {SELFPLAY_IMPLEMENTATIONS}, got {name!r}"
+        )
+    return name
+
+
+def _rust_selfplay_env() -> dict[str, str]:
+    """The environment for `reversi-selfplay`: libtorch from this venv's torch
+    on the library path (found without importing torch)."""
+    env = dict(os.environ)
+    spec = importlib.util.find_spec("torch")
+    if spec is not None and spec.submodule_search_locations:
+        lib = Path(next(iter(spec.submodule_search_locations))) / "lib"
+        if lib.is_dir():
+            paths = [str(lib), env.get("LD_LIBRARY_PATH", "")]
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(p for p in paths if p)
+    return env
+
+
+def _rust_selfplay_works(env: dict[str, str]) -> bool:
+    """`reversi-selfplay check`: libtorch loads and CUDA works."""
+    if not RUST_SELFPLAY_BIN.exists():
+        log_event(
+            "system",
+            "selfplay-rust-unavailable",
+            reason="binary-missing",
+            path=RUST_SELFPLAY_BIN,
+        )
+        return False
+    try:
+        result = subprocess.run(
+            [str(RUST_SELFPLAY_BIN), "check"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log_event("system", "selfplay-rust-unavailable", reason=repr(e))
+        return False
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        log_event(
+            "system",
+            "selfplay-rust-unavailable",
+            reason=f"check-exit-{result.returncode}",
+            detail=repr(detail[-1] if detail else ""),
+        )
+        return False
+    log_event("system", "selfplay-rust-check", result=repr(result.stdout.strip()))
+    return True
+
+
+def _spawn_rust_selfplay(
+    positions_per_shard: int, env: dict[str, str]
+) -> subprocess.Popen:
+    cmd = [
+        str(RUST_SELFPLAY_BIN),
+        "selfplay",
+        "--run-dir",
+        str(WEIGHTS_DIR.resolve()),
+        "--simulations",
+        str(SIMULATIONS),
+        "--positions-per-shard",
+        str(positions_per_shard),
+        "--parent-pid",
+        str(os.getpid()),
+        *shlex.split(os.environ.get("REVERSI_SELFPLAY_RUST_ARGS", "")),
+    ]
+    child = subprocess.Popen(cmd, env=env)
+    log_event("system", "spawn-selfplay-rust", pid=child.pid, args=repr(cmd[2:]))
+    return child
+
+
+async def _supervise_rust_selfplay(
+    children: list[subprocess.Popen],
+    child: subprocess.Popen,
+    spawn_rust,
+    spawn_python,
+    stop_event: asyncio.Event,
+) -> None:
+    """Restart the Rust self-play process when it exits on its own; after
+    RUST_SELFPLAY_RESTARTS quick failures, switch to Python self-play."""
+    restarts = 0
+    started = time.monotonic()
+    while not stop_event.is_set():
+        await asyncio.sleep(2.0)
+        code = child.poll()
+        if code is None or stop_event.is_set():
+            continue
+        ran = time.monotonic() - started
+        log_event(
+            "system",
+            "selfplay-rust-exited",
+            pid=child.pid,
+            code=code,
+            seconds=f"{ran:.0f}",
+        )
+        children.remove(child)
+        if ran >= RUST_SELFPLAY_STABLE_SECONDS:
+            restarts = 0
+        if restarts >= RUST_SELFPLAY_RESTARTS:
+            log_event("system", "selfplay-rust-fallback", restarts=restarts)
+            children.extend(spawn_python())
+            return
+        restarts += 1
+        await asyncio.sleep(5.0 * restarts)
+        if stop_event.is_set():
+            return
+        try:
+            child = spawn_rust()
+        except Exception as e:
+            # Without a fallback here the learner would wait for data forever.
+            log_event("system", "selfplay-rust-fallback", error=repr(e))
+            children.extend(spawn_python())
+            return
+        children.append(child)
+        started = time.monotonic()
+        log_event("system", "selfplay-rust-restarted", restarts=restarts)
 
 
 def _stop_child_processes(children: list[subprocess.Popen]) -> None:
@@ -893,17 +1058,19 @@ async def _run_learner(
     # Restore replay buffer from previous run if available
     replay.load(REPLAY_PATH)
 
+    selfplay = _selfplay_implementation()
     log_event(
         "system",
         "startup",
         backend=backend_name(),
+        selfplay=selfplay,
         selfplay_processes=selfplay_processes,
         simulations=SIMULATIONS,
         min_replay=MIN_REPLAY,
         train_ratio=TRAIN_RATIO,
-        tournament_every=TOURNAMENT_EVERY,
+        tournament_every=f"{TOURNAMENT_EVERY_SECONDS}s",
     )
-    next_tournament_step = [TOURNAMENT_EVERY]
+    next_tournament_step = [TOURNAMENT_MIN_STEPS]
 
     def _shutdown(signum, frame):
         """SIGTERM handler: save state and stop gracefully."""
@@ -915,10 +1082,28 @@ async def _run_learner(
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    if selfplay_processes > 0:
-        children = _spawn_selfplay_processes(
+    def spawn_python() -> list[subprocess.Popen]:
+        return _spawn_selfplay_processes(
             selfplay_processes, selfplay_workers, positions_per_shard, run_name
         )
+
+    supervisor: asyncio.Task | None = None
+    if selfplay_processes > 0:
+        rust_env = _rust_selfplay_env()
+        if selfplay != "python" and _rust_selfplay_works(rust_env):
+            child = _spawn_rust_selfplay(positions_per_shard, rust_env)
+            children.append(child)
+            supervisor = asyncio.create_task(
+                _supervise_rust_selfplay(
+                    children,
+                    child,
+                    lambda: _spawn_rust_selfplay(positions_per_shard, rust_env),
+                    spawn_python,
+                    stop_event,
+                )
+            )
+        else:
+            children.extend(spawn_python())
 
     try:
         await train_loop(model, replay, stop_event, lock, next_tournament_step)
@@ -927,6 +1112,8 @@ async def _run_learner(
         replay.save(REPLAY_PATH)
     finally:
         stop_event.set()
+        if supervisor is not None:
+            supervisor.cancel()
         ingest_replay_shards(replay, REPLAY_SPOOL_DIR, limit=10_000)
         replay.save(REPLAY_PATH)
         _stop_child_processes(children)
@@ -936,8 +1123,9 @@ async def _run_learner(
 
 
 def _default_selfplay_workers(processes: int) -> int:
-    """Concurrent games per self-play process."""
-    return max(1, SELFPLAY_GAMES // max(1, processes))
+    """Concurrent games per self-play process: a full batch each, so that
+    more processes add GPU work instead of splitting it into small batches."""
+    return SELFPLAY_GAMES
 
 
 def _parse_args() -> argparse.Namespace:
