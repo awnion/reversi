@@ -7,9 +7,11 @@ import type {
   NetworkBotMeta,
   PositionAnalysis,
 } from '@reversi/core';
+import type { WorkerBotId } from './workerBot';
 
 let minimax: BotPlayer;
 let alphazero: BotPlayer & { meta: NetworkBotMeta };
+let gladiator0: BotPlayer & { meta: NetworkBotMeta };
 let zerorev: BotPlayer & { meta: NetworkBotMeta };
 
 // The page says how many threads this worker's searches may use.
@@ -17,9 +19,11 @@ const threads = Number(self.name) || 1;
 
 void (async () => {
   try {
-    [minimax, alphazero, zerorev] = await Promise.all([
+    [minimax, alphazero, gladiator0, zerorev] = await Promise.all([
       createMinimaxBot('Minimax', { threads }),
       createAlphaZeroBot(undefined, { threads }),
+      // Same engine as ZeroRev, other weights; the two share its threads.
+      createZeroRevBot(undefined, { threads, network: 'gladiator0' }),
       createZeroRevBot(undefined, { threads }),
     ]);
   } catch (err) {
@@ -30,13 +34,14 @@ void (async () => {
   self.postMessage({
     type: 'ready',
     alphazero: alphazero.meta,
+    gladiator0: gladiator0.meta,
     zerorev: zerorev.meta,
   });
 })();
 
 export type WorkerRequest = {
   id: number;
-  bot: 'minimax' | 'alphazero' | 'zerorev';
+  bot: WorkerBotId;
   action: 'chooseMove' | 'analyzePosition';
   state: GameState;
   thinkMs: number;
@@ -44,8 +49,7 @@ export type WorkerRequest = {
 
 self.addEventListener('message', async (e: MessageEvent<WorkerRequest>) => {
   const { id, bot, action, state, thinkMs } = e.data;
-  const player =
-    bot === 'minimax' ? minimax : bot === 'alphazero' ? alphazero : zerorev;
+  const player = { minimax, alphazero, gladiator0, zerorev }[bot];
   try {
     if (action === 'chooseMove') {
       const position = await player.chooseMove(state, thinkMs);

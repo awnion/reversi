@@ -8,7 +8,14 @@ import type {
 import botWorkerUrl from './botWorker.ts?worker&url';
 
 /** Sent by the worker once the WASM bots are loaded. */
-export type BotsReady = { alphazero: NetworkBotMeta; zerorev: NetworkBotMeta };
+export type BotsReady = {
+  alphazero: NetworkBotMeta;
+  gladiator0: NetworkBotMeta;
+  zerorev: NetworkBotMeta;
+};
+
+/** The bots the worker runs. */
+export type WorkerBotId = 'minimax' | 'alphazero' | 'gladiator0' | 'zerorev';
 
 type PendingEntry = {
   resolve: (value: unknown) => void;
@@ -40,6 +47,7 @@ export class BotWorkerPool {
       if (e.data.type === 'ready') {
         resolveReady({
           alphazero: e.data.alphazero as NetworkBotMeta,
+          gladiator0: e.data.gladiator0 as NetworkBotMeta,
           zerorev: e.data.zerorev as NetworkBotMeta,
         });
         return;
@@ -60,7 +68,7 @@ export class BotWorkerPool {
   }
 
   request(
-    bot: 'minimax' | 'alphazero' | 'zerorev',
+    bot: WorkerBotId,
     action: 'chooseMove' | 'analyzePosition',
     state: GameState,
     thinkMs: number,
@@ -82,7 +90,7 @@ export class BotWorkerPool {
 
 export function createWorkerBot(
   pool: BotWorkerPool,
-  botType: 'minimax' | 'alphazero' | 'zerorev',
+  botType: WorkerBotId,
   name: string,
 ): BotPlayer {
   return {

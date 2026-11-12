@@ -42,17 +42,27 @@ function toBitboards(state: GameState) {
   };
 }
 
+/** The networks embedded in the engine. */
+export type ZeroRevNetwork = 'champion' | 'gladiator0';
+
 export interface ZeroRevOptions {
   /** Threads to search on, where the page allows it. Default: one. */
   threads?: number;
+  /** Which embedded network plays. Default: the current champion. */
+  network?: ZeroRevNetwork;
 }
+
+const DEFAULT_NAMES: Record<ZeroRevNetwork, string> = {
+  champion: 'ZeroRev',
+  gladiator0: 'Gladiator0',
+};
 
 /**
  * Load the WASM engine. A cross-origin isolated page may share memory between
  * workers, so there the search runs on a pool of threads working on one tree;
  * everywhere else the single-threaded build is used.
  */
-async function loadEngine(threads: number) {
+async function initEngine(threads: number) {
   if (threads > 1 && globalThis.crossOriginIsolated) {
     const engine = await import('../wasm-threads/reversi_zerorev.js');
     await engine.default();
@@ -64,14 +74,32 @@ async function loadEngine(threads: number) {
   return engine;
 }
 
+/**
+ * The engine, loaded once per thread count: every bot made in this worker
+ * shares it (and its thread pool, which can only be started once).
+ */
+const engines = new Map<number, ReturnType<typeof initEngine>>();
+
+function loadEngine(threads: number) {
+  let engine = engines.get(threads);
+  if (!engine) {
+    engine = initEngine(threads);
+    // A failed load may be retried.
+    engine.catch(() => engines.delete(threads));
+    engines.set(threads, engine);
+  }
+  return engine;
+}
+
 export async function createZeroRevBot(
   name?: string,
   options: ZeroRevOptions = {},
 ): Promise<BotPlayer & { meta: NetworkBotMeta }> {
+  const network = options.network ?? 'champion';
   const engine = await loadEngine(Math.max(1, options.threads ?? 1));
-  const wasm = new engine.ZeroRevBot();
-  const m: WasmMeta = JSON.parse(engine.meta());
-  const displayName = name ?? `ZeroRev (${m.build_date})`;
+  const wasm = new engine.ZeroRevBot(network);
+  const m: WasmMeta = JSON.parse(engine.meta(network));
+  const displayName = name ?? `${DEFAULT_NAMES[network]} (${m.build_date})`;
 
   return {
     name: displayName,
@@ -95,7 +123,7 @@ export async function createZeroRevBot(
         timeLimitMs,
       );
       if (moveIdx === -1) {
-        throw new Error('ZeroRev bot could not find a valid move');
+        throw new Error(`${displayName} could not find a valid move`);
       }
       return { row: Math.floor(moveIdx / 8), col: moveIdx % 8 };
     },

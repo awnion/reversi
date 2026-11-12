@@ -10,7 +10,7 @@ import {
   serializeState,
 } from '@reversi/core';
 import { GameController, type PlayerConfig } from './gameController';
-import { BotWorkerPool, createWorkerBot } from './workerBot';
+import { BotWorkerPool, createWorkerBot, type WorkerBotId } from './workerBot';
 
 import './styles.css';
 
@@ -30,12 +30,13 @@ const ANALYSIS_THREADS = Math.max(1, Math.floor(BOT_THREADS / 2));
 const THREADED_BOTS: ReadonlySet<string> = new Set([
   'minimax',
   'alphazero',
+  'gladiator0',
   'zerorev',
 ]);
 
 const pool = new BotWorkerPool(BOT_THREADS);
 
-type BotId = 'greedy' | 'minimax' | 'alphazero' | 'zerorev';
+type BotId = 'greedy' | 'minimax' | 'alphazero' | 'gladiator0' | 'zerorev';
 
 /**
  * The bots a side can be handed to. A side without a bot is played by hand.
@@ -71,6 +72,13 @@ const BOTS: {
     detail: '',
     timed: true,
     player: createWorkerBot(pool, 'alphazero', 'AlphaZero'),
+  },
+  {
+    id: 'gladiator0',
+    name: 'Gladiator0',
+    detail: '',
+    timed: true,
+    player: createWorkerBot(pool, 'gladiator0', 'Gladiator0'),
   },
   {
     id: 'zerorev',
@@ -842,11 +850,7 @@ function restartAnalysis(): void {
   const engine = analysisEngine;
   const name = BOTS.find((bot) => bot.id === engine)?.name ?? engine;
   analysisPool ??= new BotWorkerPool(ANALYSIS_THREADS);
-  const player = createWorkerBot(
-    analysisPool,
-    engine as 'minimax' | 'alphazero' | 'zerorev',
-    name,
-  );
+  const player = createWorkerBot(analysisPool, engine as WorkerBotId, name);
   // Show at once what this engine has found here before.
   const found = analysisFound.get(engine);
   if (found?.state === state) {

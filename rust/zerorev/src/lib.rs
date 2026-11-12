@@ -11,11 +11,28 @@ static CHAMPION_WEIGHTS: &[u8] = include_bytes!("../../../weights/zerorev/champi
 /// `champion.bin` (run, date, loss, tournament win rate).
 static CHAMPION_META: &str = include_str!("../../../weights/zerorev/champion.json");
 
-/// JSON describing this build: `{"build_date": "...", "champion": {...}}`.
+/// Gladiator0: a selected earlier champion of the same architecture, kept as
+/// an opponent of its own.
+static GLADIATOR0_WEIGHTS: &[u8] =
+    include_bytes!("../../../weights/zerorev/champions/gladiator0.bin");
+static GLADIATOR0_META: &str = include_str!("../../../weights/zerorev/champions/gladiator0.json");
+
+/// The embedded network called `network`: `"gladiator0"`, or the champion for
+/// any other name. Returns its weights and the facts about them.
+fn network(network: &str) -> (&'static [u8], &'static str) {
+    match network {
+        "gladiator0" => (GLADIATOR0_WEIGHTS, GLADIATOR0_META),
+        _ => (CHAMPION_WEIGHTS, CHAMPION_META),
+    }
+}
+
+/// JSON describing this build and the network called `network` (see
+/// `ZeroRevBot::new`): `{"build_date": "...", "champion": {...}}`.
 #[wasm_bindgen]
-pub fn meta() -> String {
+pub fn meta(network: &str) -> String {
     let build_date = option_env!("BUILD_DATE").unwrap_or("dev");
-    format!(r#"{{"build_date":"{build_date}","champion":{}}}"#, CHAMPION_META.trim())
+    let (_, meta) = self::network(network);
+    format!(r#"{{"build_date":"{build_date}","champion":{}}}"#, meta.trim())
 }
 
 struct NnEval {
@@ -44,12 +61,12 @@ impl EvalFn for NnEval {
     }
 }
 
-fn make_eval() -> Box<dyn EvalFn + Sync> {
+fn make_eval(weights: &[u8]) -> Box<dyn EvalFn + Sync> {
     // The weights are embedded at build time, so a load failure is a build
     // defect. Fail loudly: silently falling back to another evaluator once hid
     // a format mismatch and the bot never used its network.
-    let net = AlphaZeroNet::load(CHAMPION_WEIGHTS)
-        .unwrap_or_else(|err| panic!("embedded champion weights failed to load: {err}"));
+    let net = AlphaZeroNet::load(weights)
+        .unwrap_or_else(|err| panic!("embedded network weights failed to load: {err}"));
     Box::new(NnEval { net })
 }
 
@@ -123,10 +140,13 @@ pub struct ZeroRevBot {
 
 #[wasm_bindgen]
 impl ZeroRevBot {
+    /// A bot playing with the embedded network called `network`:
+    /// `"gladiator0"`, or the champion for any other name.
     #[wasm_bindgen(constructor)]
-    pub fn new() -> ZeroRevBot {
+    pub fn new(network: &str) -> ZeroRevBot {
+        let (weights, _) = self::network(network);
         ZeroRevBot {
-            eval: make_eval(),
+            eval: make_eval(weights),
             last_simulations: std::cell::Cell::new(0),
             last_value: std::cell::Cell::new(0.0),
             analysis: std::cell::RefCell::new(None),
@@ -228,6 +248,6 @@ impl ZeroRevBot {
 
 impl Default for ZeroRevBot {
     fn default() -> Self {
-        Self::new()
+        Self::new("champion")
     }
 }

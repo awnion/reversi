@@ -1,8 +1,12 @@
-# Champion weights (and the facts about them) are embedded into the WASM bots.
+# Champion weights (and the facts about them) are embedded into the WASM bots,
+# as is Gladiator0, a selected earlier ZeroRev champion.
 exports_files(
     glob([
         "*/champion.bin",
         "*/champion.json",
-    ]),
+    ]) + [
+        "zerorev/champions/gladiator0.bin",
+        "zerorev/champions/gladiator0.json",
+    ],
     visibility = ["//rust:__subpackages__"],
 )

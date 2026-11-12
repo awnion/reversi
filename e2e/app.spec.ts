@@ -156,6 +156,24 @@ test('network bots say when they were trained and their loss', async ({
   ).toContainText(/\d{4}, loss \d\.\d\d/);
 });
 
+test('Gladiator0 is offered between AlphaZero and ZeroRev', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const bots = page.locator('#player-black .option[data-bot]');
+  const ids = await bots.evaluateAll((options) =>
+    options.map((option) => option.getAttribute('data-bot')),
+  );
+  expect(ids.indexOf('gladiator0')).toBe(ids.indexOf('alphazero') + 1);
+  expect(ids.indexOf('zerorev')).toBe(ids.indexOf('gladiator0') + 1);
+  await expect(
+    page.locator('#player-black .option[data-bot="gladiator0"]'),
+  ).toContainText('Gladiator0');
+  await expect(
+    page.locator('#player-black .option-detail[data-bot="gladiator0"]'),
+  ).toContainText(/\d{4}, loss \d\.\d\d/);
+});
+
 test('time per move: presets or a custom value, all in seconds', async ({
   page,
 }) => {
