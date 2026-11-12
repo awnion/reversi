@@ -83,12 +83,14 @@ class LeafEvalServer:
             planes_list, futures = zip(*items, strict=False)
             batch = mx.array(np.stack(planes_list))  # (N, 4, 8, 8)
             policy_logits, values = self.model(batch)
-            mx.eval(policy_logits, values)
+            # MCTS priors are probabilities, as in the Rust inference path.
+            policies = mx.softmax(policy_logits, axis=-1)
+            mx.eval(policies, values)
 
             # Distribute results back
-            for fut, p_log, v in zip(futures, policy_logits, values, strict=False):
+            for fut, probs, v in zip(futures, policies, values, strict=False):
                 if not fut.done():
-                    fut.set_result((p_log, v))
+                    fut.set_result((probs, v))
 
     def stop(self):
         self._running = False
@@ -174,10 +176,12 @@ class SyncBatchEval:
             with self.lock:
                 self.model.eval()
                 policy_logits, values = self.model(x)
-                mx.eval(policy_logits, values)
+                # MCTS priors are probabilities, as in the Rust inference path.
+                policies = mx.softmax(policy_logits, axis=-1)
+                mx.eval(policies, values)
                 self.model.train()
 
-            policies_np = np.array(policy_logits)
+            policies_np = np.array(policies)
             values_np = np.array(values)
 
             for i, (_, event, result_box) in enumerate(items):

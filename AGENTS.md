@@ -74,7 +74,7 @@ just lint / just fmt                   # biome, tsc, ruff, rustfmt, taplo
 Runs through uv, outside Bazel:
 
 ```sh
-cd python && uv sync && uv run maturin develop --features python
+cd python && uv sync && uv run maturin develop --release --features python
 just train <bot> / just logs <bot> / just stop <bot> / just tournament <bot>
 ```
 

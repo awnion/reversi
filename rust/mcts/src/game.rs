@@ -1,8 +1,11 @@
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use reversi_minimax::board::Board;
 
+use crate::batch::SelfPlayPool;
 use crate::search::EvalFn;
 use crate::search::MctsSearch;
 
@@ -74,113 +77,18 @@ pub fn play_match(eval_black: &dyn EvalFn, eval_white: &dyn EvalFn, simulations:
 ///
 /// `simulations` — number of MCTS simulations per move.
 pub fn play_game(eval: &dyn EvalFn, simulations: u32) -> GameRecord {
-    const SELF_PLAY_TEMPERATURE_MOVES: usize = 12;
-    const ROOT_NOISE_EPSILON: f32 = 0.25;
-
-    // Standard Reversi start: black on d5(35) and e4(28), white on d4(27) and e5(36).
-    let mut board = Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36));
-    let mut is_black = true;
-    let mut pass_count = 0;
-    let mut ply = 0usize;
-    let mut rng = SimpleRng::new();
-
-    // Collect raw samples before we know the final outcome.
-    let mut raw: Vec<(Board, bool, u64, [f32; 64], f32, f32)> = Vec::new();
-
+    let mut pool = SelfPlayPool::new(1, simulations);
     loop {
-        let legal = board.legal_moves(is_black);
-
-        if legal == 0 {
-            pass_count += 1;
-            if pass_count >= 2 {
-                // Both sides have no moves — game over.
-                break;
-            }
-            // Forced pass.
-            is_black = !is_black;
-            continue;
+        let request = pool.collect()[0];
+        if let Some(record) = pool.take_finished().pop() {
+            return record;
         }
-        pass_count = 0;
-
-        // Run MCTS.
-        let mut mcts = MctsSearch::new(board, is_black);
-        if simulations > 0 {
-            mcts.simulate(eval);
-            add_root_noise(&mut mcts, legal, &mut rng, ROOT_NOISE_EPSILON);
-            for _ in 1..simulations {
-                mcts.simulate(eval);
-            }
-        }
-
-        let policy = mcts.policy_target();
-        raw.push((board, is_black, legal, policy, 1.0, 1.0));
-        if (board.black | board.white).count_ones() == 63 {
-            raw.push((board, is_black, legal, policy, 0.0, 2.0));
-        }
-
-        // Sample from visit counts in the opening to keep self-play diverse.
-        let selected = if ply < SELF_PLAY_TEMPERATURE_MOVES {
-            sample_move_from_policy(policy, legal, &mut rng).or_else(|| mcts.best_move())
-        } else {
-            mcts.best_move()
-        };
-        if let Some(m) = selected {
-            board = board.apply_move(is_black, m);
-        }
-
-        is_black = !is_black;
-        ply += 1;
+        let (policy, value) = eval.evaluate(request.board, request.is_black, request.legal);
+        pool.apply(&policy, &[value]);
     }
-
-    // Determine final outcome.
-    let black_discs = board.black.count_ones();
-    let white_discs = board.white.count_ones();
-    let black_outcome: f32 = match black_discs.cmp(&white_discs) {
-        std::cmp::Ordering::Greater => 1.0,
-        std::cmp::Ordering::Less => -1.0,
-        std::cmp::Ordering::Equal => 0.0,
-    };
-
-    let positions = raw
-        .into_iter()
-        .map(|(b, ib, legal, policy, policy_weight, value_weight)| {
-            let outcome = if ib { black_outcome } else { -black_outcome };
-            PositionRecord {
-                board: b,
-                is_black: ib,
-                legal,
-                mcts_policy: policy,
-                outcome,
-                policy_weight,
-                value_weight,
-            }
-        })
-        .chain([
-            PositionRecord {
-                board,
-                is_black: true,
-                legal: 0,
-                mcts_policy: [0.0; 64],
-                outcome: black_outcome,
-                policy_weight: 0.0,
-                value_weight: 2.0,
-            },
-            PositionRecord {
-                board,
-                is_black: false,
-                legal: 0,
-                mcts_policy: [0.0; 64],
-                outcome: -black_outcome,
-                policy_weight: 0.0,
-                value_weight: 2.0,
-            },
-        ])
-        .collect();
-
-    GameRecord { positions, black_discs, white_discs }
 }
 
-fn add_root_noise(mcts: &mut MctsSearch, legal: u64, rng: &mut SimpleRng, epsilon: f32) {
+pub(crate) fn add_root_noise(mcts: &mut MctsSearch, legal: u64, rng: &mut SimpleRng, epsilon: f32) {
     let child_count = legal.count_ones() as usize;
     if child_count == 0 {
         return;
@@ -204,7 +112,11 @@ fn add_root_noise(mcts: &mut MctsSearch, legal: u64, rng: &mut SimpleRng, epsilo
     mcts.add_root_noise(&noise, epsilon);
 }
 
-fn sample_move_from_policy(policy: [f32; 64], legal: u64, rng: &mut SimpleRng) -> Option<u64> {
+pub(crate) fn sample_move_from_policy(
+    policy: [f32; 64],
+    legal: u64,
+    rng: &mut SimpleRng,
+) -> Option<u64> {
     let mut moves = Vec::new();
     let mut weights = Vec::new();
     for (i, &weight) in policy.iter().enumerate() {
@@ -230,15 +142,23 @@ fn sample_move_from_policy(policy: [f32; 64], legal: u64, rng: &mut SimpleRng) -
     moves.last().copied()
 }
 
-struct SimpleRng(u64);
+pub(crate) struct SimpleRng(u64);
 
 impl SimpleRng {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
+        // The clock alone is too coarse: a pool creates hundreds of games in
+        // the same tick, and equal seeds would make them play identical games.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15);
-        SimpleRng(nanos ^ 0xA0761D6478BD642F)
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15);
+        // SplitMix64 finaliser, so that nearby seeds give unrelated streams.
+        let mut z = (nanos ^ 0xA0761D6478BD642F).wrapping_add(unique);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        SimpleRng((z ^ (z >> 31)) | 1)
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -250,7 +170,7 @@ impl SimpleRng {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
-    fn next_f32(&mut self) -> f32 {
+    pub(crate) fn next_f32(&mut self) -> f32 {
         let v = self.next_u64() >> 40;
         (v as f32) / ((1u32 << 24) as f32)
     }

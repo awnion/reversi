@@ -1,4 +1,4 @@
-msrv = "1.86"
+msrv = "1.88"
 
 allow-unwrap-in-tests = true
 type-complexity-threshold = 2000

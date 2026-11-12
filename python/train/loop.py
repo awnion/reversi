@@ -48,6 +48,8 @@ BATCH_SIZE = 512
 MIN_REPLAY = 30_000
 # Only do 1 gradient step per TRAIN_RATIO new positions added.
 TRAIN_RATIO = 10
+# Cap on training steps owed to already-ingested positions.
+MAX_PENDING_STEPS = 1_000
 CHECKPOINT_EVERY = 500
 KEEP_CHECKPOINTS = 20
 LOG_EVERY = 100
@@ -60,11 +62,12 @@ _WEIGHTS_BASE = Path(__file__).parent.parent.parent / "weights"
 WEIGHTS_DIR = _WEIGHTS_BASE / "alphazero"  # replaced by _apply_run_name() before use
 CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 
-# Workers block on threading.Event.wait() (GIL released) most of the time,
-# so we can run many more than CPU cores.
-N_WORKERS = (os.cpu_count() or 4) * 4
+# Concurrent self-play games. They advance in lockstep inside Rust and their
+# leaf positions are evaluated as one batch per round, so this is also the
+# inference batch size. The GPU saturates at roughly 1000-2000.
+SELFPLAY_GAMES = 1024
 
-# Larger batches = better GPU utilisation.
+# Batch size for the threaded evaluator (inline workers and tournaments).
 EVAL_BATCH_SIZE = 96
 
 # Tournament settings
@@ -95,9 +98,13 @@ def _apply_run_name(name: str) -> None:
     SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
 
 
-DEFAULT_SELFPLAY_PROCESSES = max(1, os.cpu_count() // 2)
+# One process already fills the GPU with large batches; more processes only
+# split it into smaller, less efficient ones.
+DEFAULT_SELFPLAY_PROCESSES = 1
 DEFAULT_SHARD_POSITIONS = 4_096
-WEIGHT_REFRESH_GAMES = 5
+WEIGHT_REFRESH_GAMES = 5  # inline workers: reload weights every N games
+WEIGHT_REFRESH_SECONDS = 5.0  # batched self-play: poll for new weights
+SELFPLAY_LOG_SECONDS = 30.0
 
 
 def log_event(component: str, message: str, **fields) -> None:
@@ -190,12 +197,19 @@ async def train_loop(
             await asyncio.sleep(0.1)
             continue
 
-        # Rate-limit: don't train faster than data comes in
+        # Rate-limit: one step per TRAIN_RATIO new positions. Data arrives in
+        # shards of thousands of positions, so spend the allowance one step at
+        # a time instead of once per shard.
         new_positions = replay.total_added - replay_at_last_step
         if new_positions < TRAIN_RATIO:
             await asyncio.sleep(0.005)
             continue
-        replay_at_last_step = replay.total_added
+        replay_at_last_step += TRAIN_RATIO
+        # If self-play outruns the learner, drop the excess allowance rather
+        # than letting it grow without bound.
+        max_backlog = TRAIN_RATIO * MAX_PENDING_STEPS
+        if replay.total_added - replay_at_last_step > max_backlog:
+            replay_at_last_step = replay.total_added - max_backlog
 
         (
             planes_np,
@@ -349,12 +363,15 @@ def _make_eval_fn(model: AlphaZeroNet, lock: threading.Lock | None = None):
         if lock is not None:
             with lock:
                 model.eval()
-                p, v = model(x)
+                logits, v = model(x)
+                # MCTS priors are probabilities, as in the Rust inference path.
+                p = mx.softmax(logits, axis=-1)
                 mx.eval(p, v)
                 model.train()
         else:
             with mx.stream(mx.cpu):
-                p, v = model(x)
+                logits, v = model(x)
+                p = mx.softmax(logits, axis=-1)
                 mx.eval(p, v)
         return p[0].tolist(), float(v[0])
 
@@ -829,16 +846,25 @@ def _stop_child_processes(children: list[subprocess.Popen]) -> None:
 
 async def _run_selfplay_process(
     process_index: int,
-    selfplay_workers: int,
+    selfplay_games: int,
     positions_per_shard: int,
 ) -> None:
+    """Self-play producer: one batched search loop feeding the replay spool.
+
+    `selfplay_games` games advance in lockstep inside Rust. Each round collects
+    one pending leaf position per game, evaluates them in a single network
+    call and hands the results back; finished games go to the shard writer.
+    """
+    import reversi_mcts
+
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     REPLAY_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     model = AlphaZeroNet()
-    lock = threading.Lock()
+    weights_mtime_ns = None
     source = _resolve_selfplay_source()
     if source is not None:
-        _load_weights_into_model(model, source, lock)
+        _load_weights_into_model(model, source)
+        weights_mtime_ns = source.stat().st_mtime_ns
         log_event(
             "selfplay",
             "weights-loaded",
@@ -847,80 +873,73 @@ async def _run_selfplay_process(
         )
     else:
         log_event("selfplay", "weights-random-init", process=process_index)
+    model.eval()
 
-    batch_eval = SyncBatchEval(model, batch_size=EVAL_BATCH_SIZE, lock=lock)
     shard_writer = ReplayShardWriter(
         REPLAY_SPOOL_DIR,
         producer_id=f"sp{process_index}_pid{os.getpid()}",
         positions_per_shard=positions_per_shard,
     )
-    stop_event = asyncio.Event()
+    pool = reversi_mcts.BatchedSelfPlay(selfplay_games, SIMULATIONS)
     stop_flag = [False]
-    event_loop = asyncio.get_event_loop()
-    executor = ThreadPoolExecutor(max_workers=selfplay_workers)
-    games_counters = [[0] for _ in range(selfplay_workers)]
-    weight_state = {"mtime_ns": None}
-    refresh_lock = threading.Lock()
-
-    def refresh_weights() -> None:
-        source = _resolve_selfplay_source()
-        if source is None:
-            return
-        stat = source.stat()
-        mtime_ns = stat.st_mtime_ns
-        if weight_state["mtime_ns"] == mtime_ns:
-            return
-        if not refresh_lock.acquire(blocking=False):
-            return
-        try:
-            if weight_state["mtime_ns"] == mtime_ns:
-                return
-            _load_weights_into_model(model, source, lock)
-            weight_state["mtime_ns"] = mtime_ns
-            log_event(
-                "selfplay",
-                "weights-reloaded",
-                process=process_index,
-                source=source.name,
-            )
-        finally:
-            refresh_lock.release()
-
-    if source is not None:
-        weight_state["mtime_ns"] = source.stat().st_mtime_ns
 
     def _shutdown(signum, frame):
         log_event("selfplay", "signal", process=process_index, signum=signum)
         stop_flag[0] = True
-        stop_event.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    worker_futures = [
-        event_loop.run_in_executor(
-            executor,
-            _self_play_worker,
-            i,
-            batch_eval,
-            shard_writer,
-            games_counters[i],
-            stop_flag,
-            refresh_weights,
-        )
-        for i in range(selfplay_workers)
-    ]
-
+    games = positions = evals = 0
+    evals_at_log = 0
+    last_refresh = last_log = time.monotonic()
     try:
-        while not stop_event.is_set():
-            await asyncio.sleep(1.0)
+        while not stop_flag[0]:
+            planes = np.frombuffer(pool.collect(), dtype=np.float32)
+            x = mx.array(planes.reshape(-1, 4, 8, 8))
+            policy_logits, values = model(x)
+            # MCTS priors are probabilities, as in the Rust inference path.
+            policies = mx.softmax(policy_logits, axis=-1)
+            mx.eval(policies, values)
+            pool.apply(np.array(policies).tobytes(), np.array(values).tobytes())
+            batch = x.shape[0]
+            evals += batch
+
+            for record in pool.take_finished():
+                positions += shard_writer.add_record(record)
+                games += 1
+
+            now = time.monotonic()
+            if now - last_refresh >= WEIGHT_REFRESH_SECONDS:
+                last_refresh = now
+                source = _resolve_selfplay_source()
+                if source is not None:
+                    mtime_ns = source.stat().st_mtime_ns
+                    if mtime_ns != weights_mtime_ns:
+                        _load_weights_into_model(model, source)
+                        model.eval()
+                        weights_mtime_ns = mtime_ns
+                        log_event(
+                            "selfplay",
+                            "weights-reloaded",
+                            process=process_index,
+                            source=source.name,
+                        )
+            if now - last_log >= SELFPLAY_LOG_SECONDS:
+                rate = (evals - evals_at_log) / (now - last_log)
+                log_event(
+                    "selfplay",
+                    "progress",
+                    process=process_index,
+                    games=games,
+                    positions=positions,
+                    batch=batch,
+                    evals_per_s=f"{rate:.0f}",
+                )
+                last_log = now
+                evals_at_log = evals
     finally:
-        stop_flag[0] = True
         shard_writer.flush()
-        batch_eval.stop()
-        executor.shutdown(wait=False)
-        for future in worker_futures:
-            future.cancel()
 
 
 async def _run_learner(
@@ -985,8 +1004,9 @@ async def _run_learner(
 
     def _shutdown(signum, frame):
         """SIGTERM handler: save state and stop gracefully."""
+        # Only flag the stop here: saving from the handler raced with itself
+        # when two signals arrived, and the `finally` below saves anyway.
         log_event("system", "signal", signum=signum, action="save-and-stop")
-        replay.save(REPLAY_PATH)
         stop_event.set()
         if inline_workers > 0:
             stop_flag[0] = True
@@ -1018,8 +1038,8 @@ async def _run_learner(
 
 
 def _default_selfplay_workers(processes: int) -> int:
-    total_workers = N_WORKERS
-    return max(1, total_workers // max(1, processes))
+    """Concurrent games per self-play process."""
+    return max(1, SELFPLAY_GAMES // max(1, processes))
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1034,7 +1054,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SELFPLAY_PROCESSES,
     )
-    parser.add_argument("--selfplay-workers", type=int, default=None)
+    parser.add_argument(
+        "--selfplay-workers",
+        type=int,
+        default=None,
+        help="Concurrent games (= inference batch size) per self-play process",
+    )
     parser.add_argument("--inline-workers", type=int, default=0)
     parser.add_argument(
         "--positions-per-shard",
@@ -1060,7 +1085,7 @@ async def main() -> None:
     if args.role == "selfplay":
         await _run_selfplay_process(
             process_index=args.process_index,
-            selfplay_workers=workers,
+            selfplay_games=workers,
             positions_per_shard=args.positions_per_shard,
         )
         return

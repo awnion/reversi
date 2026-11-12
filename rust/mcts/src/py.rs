@@ -1,8 +1,14 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use pyo3::types::PyDict;
 use pyo3::types::PyList;
 use reversi_minimax::board::Board;
 
+use crate::batch::PLANES_LEN;
+use crate::batch::SelfPlayPool;
+use crate::batch::write_planes;
+use crate::game::GameRecord;
 use crate::game::play_game;
 use crate::game::play_match;
 use crate::search::EvalFn;
@@ -94,20 +100,105 @@ impl MctsWorker {
             None => py.allow_threads(|| play_game(&StaticEval, self.simulations)),
         };
 
-        let list = PyList::empty(py);
-        for pos in &record.positions {
-            let d = PyDict::new(py);
-            d.set_item("board_black", pos.board.black)?;
-            d.set_item("board_white", pos.board.white)?;
-            d.set_item("is_black", pos.is_black)?;
-            d.set_item("legal", pos.legal)?;
-            d.set_item("mcts_policy", pos.mcts_policy.to_vec())?;
-            d.set_item("outcome", pos.outcome)?;
-            d.set_item("policy_weight", pos.policy_weight)?;
-            d.set_item("value_weight", pos.value_weight)?;
-            list.append(d)?;
+        record_to_py(py, &record)
+    }
+}
+
+/// One game as a list of per-position dicts (see [`MctsWorker::run_game`]).
+fn record_to_py<'py>(py: Python<'py>, record: &GameRecord) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for pos in &record.positions {
+        let d = PyDict::new(py);
+        d.set_item("board_black", pos.board.black)?;
+        d.set_item("board_white", pos.board.white)?;
+        d.set_item("is_black", pos.is_black)?;
+        d.set_item("legal", pos.legal)?;
+        d.set_item("mcts_policy", pos.mcts_policy.to_vec())?;
+        d.set_item("outcome", pos.outcome)?;
+        d.set_item("policy_weight", pos.policy_weight)?;
+        d.set_item("value_weight", pos.value_weight)?;
+        list.append(d)?;
+    }
+    Ok(list)
+}
+
+// ── BatchedSelfPlay ───────────────────────────────────────────────────────
+
+/// Many self-play games advanced in lockstep, with one network call per round.
+///
+/// ```python
+/// pool = BatchedSelfPlay(games=512, simulations=200)
+/// while True:
+///     planes = np.frombuffer(pool.collect(), np.float32).reshape(-1, 4, 8, 8)
+///     policy, value = model(planes)          # policy: probabilities, (N, 64)
+///     pool.apply(policy.tobytes(), value.tobytes())
+///     for game in pool.take_finished(): ...
+/// ```
+#[pyclass]
+pub struct BatchedSelfPlay {
+    pool: SelfPlayPool,
+    planes: Vec<f32>,
+    policies: Vec<f32>,
+    values: Vec<f32>,
+}
+
+/// Reinterpret native-endian `f32` bytes, reusing `out`'s allocation.
+fn read_f32s(bytes: &[u8], out: &mut Vec<f32>) -> PyResult<()> {
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(PyValueError::new_err("buffer length is not a multiple of 4"));
+    }
+    out.clear();
+    out.extend(chunks.iter().map(|c| f32::from_ne_bytes(*c)));
+    Ok(())
+}
+
+#[pymethods]
+impl BatchedSelfPlay {
+    /// `stagger` spreads the game starts over about one game length so that
+    /// games finish at a steady rate (batches are smaller during that ramp-up).
+    #[new]
+    #[pyo3(signature = (games, simulations, stagger=true))]
+    pub fn new(games: usize, simulations: u32, stagger: bool) -> Self {
+        let pool = if stagger {
+            SelfPlayPool::staggered(games, simulations)
+        } else {
+            SelfPlayPool::new(games, simulations)
+        };
+        BatchedSelfPlay { pool, planes: Vec::new(), policies: Vec::new(), values: Vec::new() }
+    }
+
+    /// Advance every game to its next evaluation. Returns the network input
+    /// as native-endian float32 bytes, shape `(n, 4, 8, 8)` with `n <= games`.
+    pub fn collect<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let requests = self.pool.collect();
+        self.planes.resize(requests.len() * PLANES_LEN, 0.0);
+        for (request, out) in requests.iter().zip(self.planes.chunks_exact_mut(PLANES_LEN)) {
+            write_planes(request, out);
         }
-        Ok(list)
+        let bytes: Vec<u8> = self.planes.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        PyBytes::new(py, &bytes)
+    }
+
+    /// Apply the evaluations for the last `collect()`: float32 bytes of shape
+    /// `(n, 64)` (move probabilities) and `(n,)` (values).
+    pub fn apply(&mut self, policies: &[u8], values: &[u8]) -> PyResult<()> {
+        read_f32s(policies, &mut self.policies)?;
+        read_f32s(values, &mut self.values)?;
+        if self.policies.len() != self.values.len() * 64 {
+            return Err(PyValueError::new_err("expected 64 policy entries per value"));
+        }
+        self.pool.apply(&self.policies, &self.values);
+        Ok(())
+    }
+
+    /// Games finished since the last call, each as a list of position dicts.
+    pub fn take_finished<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let games = PyList::empty(py);
+        for record in self.pool.take_finished() {
+            games.append(record_to_py(py, &record)?)?;
+        }
+        Ok(games)
     }
 }
 
@@ -128,6 +219,7 @@ pub fn run_match(
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MctsWorker>()?;
+    m.add_class::<BatchedSelfPlay>()?;
     m.add_function(wrap_pyfunction!(run_match, m)?)?;
     Ok(())
 }

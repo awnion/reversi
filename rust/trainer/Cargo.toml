@@ -1,0 +1,11 @@
+[package]
+name = "reversi_trainer"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone on purpose: mlx-rs builds Apple's MLX from source (CMake + Metal),
+# so it stays out of the Bazel-resolved root workspace.
+[workspace]
+
+[dependencies]
+mlx-rs = "0.34"

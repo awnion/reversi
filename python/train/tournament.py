@@ -77,8 +77,10 @@ def make_eval_fn(model: AlphaZeroNet):
         x = mx.array(planes[None])
         with mx.stream(mx.cpu):
             policy_logits, value = model(x)
-            mx.eval(policy_logits, value)
-        return policy_logits[0].tolist(), float(value[0])
+            # MCTS priors are probabilities, as in the Rust inference path.
+            policy = mx.softmax(policy_logits, axis=-1)
+            mx.eval(policy, value)
+        return policy[0].tolist(), float(value[0])
 
     return evaluate
 

@@ -78,7 +78,7 @@ cd python
 ```sh
 # Install Python deps + build Rust extension
 uv sync
-uv run maturin develop --features python
+uv run maturin develop --release --features python
 ```
 
 ### Run training
