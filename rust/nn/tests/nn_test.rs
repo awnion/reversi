@@ -183,3 +183,22 @@ fn net_forward_random_weights() {
     // Invariant 3: value is in [-1, 1]
     assert!((-1.0..=1.0).contains(&value), "value = {value} is outside [-1, 1]");
 }
+
+// ── Exported champion files ──────────────────────────────────────────────────
+
+/// The files written by `python/train/export.py` must load: the browser bots
+/// embed exactly these bytes.
+#[test]
+fn exported_champions_load() {
+    let champions: [(&str, &[u8]); 2] = [
+        ("alphazero", include_bytes!("../../../weights/alphazero/champion.bin")),
+        ("zerorev", include_bytes!("../../../weights/zerorev/champion.bin")),
+    ];
+    for (name, bytes) in champions {
+        let net = AlphaZeroNet::load(bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
+        let (policy, value) = net.forward(&[0.0; 4 * 8 * 8]);
+        let sum: f32 = policy.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "{name}: policy sum = {sum}");
+        assert!((-1.0..=1.0).contains(&value), "{name}: value = {value}");
+    }
+}

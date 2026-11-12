@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-/// Magic bytes "REVS" as a little-endian u32.
-const MAGIC: u32 = 0x5356_4552;
+/// File signature, written as a little-endian u32 (bytes `53 56 45 52` on
+/// disk). Must match `MAGIC` in `python/train/export.py`.
+const MAGIC: u32 = 0x5245_5653;
 const VERSION: u16 = 1;
 
 /// Stores named f32 tensors loaded from the binary weight format.

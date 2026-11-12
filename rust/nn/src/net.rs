@@ -61,6 +61,96 @@ fn load_linear(
     Ok(Linear::new(w.to_vec(), b.to_vec(), in_f, out_f))
 }
 
+// ── MLX export layout ────────────────────────────────────────────────────────
+//
+// `python/train/export.py` writes the MLX parameter tree as is: MLX names,
+// channel-last convolution weights and a policy head flattened as (H, W, C).
+// The loaders below convert that to this crate's channel-first layout.
+
+/// Tensor that identifies a file exported from the MLX model.
+const MLX_MARKER: &str = "stem.layers.0.weight";
+
+fn expect_shape(name: &str, shape: &[usize], expected: &[usize]) -> Result<(), String> {
+    if shape == expected {
+        Ok(())
+    } else {
+        Err(format!("tensor '{name}' has shape {shape:?}, expected {expected:?}"))
+    }
+}
+
+/// MLX conv weight `[out, kH, kW, in]` → `[out, in, kH, kW]`.
+fn load_mlx_conv(
+    store: &WeightStore,
+    prefix: &str,
+    in_ch: usize,
+    out_ch: usize,
+    ksize: usize,
+    pad: usize,
+) -> Result<Conv2d, String> {
+    let name = format!("{prefix}.weight");
+    let (w, shape) = require!(store, &name);
+    expect_shape(&name, shape, &[out_ch, ksize, ksize, in_ch])?;
+
+    let mut weight = vec![0.0f32; w.len()];
+    for o in 0..out_ch {
+        for kh in 0..ksize {
+            for kw in 0..ksize {
+                for i in 0..in_ch {
+                    let src = ((o * ksize + kh) * ksize + kw) * in_ch + i;
+                    let dst = ((o * in_ch + i) * ksize + kh) * ksize + kw;
+                    weight[dst] = w[src];
+                }
+            }
+        }
+    }
+    let bias = store.get(&format!("{prefix}.bias")).map(|(b, _)| b.to_vec());
+    Ok(Conv2d::new(weight, bias, in_ch, out_ch, ksize, pad))
+}
+
+/// MLX BatchNorm: `weight`, `bias`, `running_mean`, `running_var`.
+fn load_mlx_bn(store: &WeightStore, prefix: &str, channels: usize) -> Result<BatchNorm2d, String> {
+    let mut fields = Vec::with_capacity(4);
+    for field in ["weight", "bias", "running_mean", "running_var"] {
+        let name = format!("{prefix}.{field}");
+        let (data, shape) = require!(store, &name);
+        expect_shape(&name, shape, &[channels])?;
+        fields.push(data.to_vec());
+    }
+    let var = fields.pop().expect("four fields");
+    let mean = fields.pop().expect("four fields");
+    let beta = fields.pop().expect("four fields");
+    let gamma = fields.pop().expect("four fields");
+    Ok(BatchNorm2d::new(gamma, beta, mean, var, BN_EPS))
+}
+
+/// MLX Linear `[out, in]`. `channels > 1` means the input was flattened from
+/// `(H, W, C)`; reorder its columns to this crate's `(C, H, W)` flattening.
+fn load_mlx_linear(
+    store: &WeightStore,
+    prefix: &str,
+    in_f: usize,
+    out_f: usize,
+    channels: usize,
+) -> Result<Linear, String> {
+    let name = format!("{prefix}.weight");
+    let (w, shape) = require!(store, &name);
+    expect_shape(&name, shape, &[out_f, in_f])?;
+    let bias_name = format!("{prefix}.bias");
+    let (b, bias_shape) = require!(store, &bias_name);
+    expect_shape(&bias_name, bias_shape, &[out_f])?;
+
+    let squares = in_f / channels;
+    let mut weight = vec![0.0f32; w.len()];
+    for o in 0..out_f {
+        for sq in 0..squares {
+            for c in 0..channels {
+                weight[o * in_f + c * squares + sq] = w[o * in_f + sq * channels + c];
+            }
+        }
+    }
+    Ok(Linear::new(weight, b.to_vec(), in_f, out_f))
+}
+
 // ── ResBlock ─────────────────────────────────────────────────────────────────
 
 struct ResBlock {
@@ -77,6 +167,15 @@ impl ResBlock {
             bn1: load_bn(store, &format!("{prefix}.bn1"))?,
             conv2: load_conv(store, &format!("{prefix}.conv2"), 32, 32, 3, 1)?,
             bn2: load_bn(store, &format!("{prefix}.bn2"))?,
+        })
+    }
+
+    fn load_mlx(store: &WeightStore, prefix: &str) -> Result<Self, String> {
+        Ok(Self {
+            conv1: load_mlx_conv(store, &format!("{prefix}.conv1"), 32, 32, 3, 1)?,
+            bn1: load_mlx_bn(store, &format!("{prefix}.bn1"), 32)?,
+            conv2: load_mlx_conv(store, &format!("{prefix}.conv2"), 32, 32, 3, 1)?,
+            bn2: load_mlx_bn(store, &format!("{prefix}.bn2"), 32)?,
         })
     }
 
@@ -135,7 +234,14 @@ impl AlphaZeroNet {
     }
 
     /// Build the network from an already-parsed `WeightStore`.
+    ///
+    /// Accepts both layouts: files exported from the MLX training model and
+    /// this crate's own channel-first naming (used by the tests).
     pub fn from_store(store: &WeightStore) -> Result<Self, String> {
+        if store.get(MLX_MARKER).is_some() {
+            return Self::from_mlx_store(store);
+        }
+
         let stem_conv = load_conv(store, "stem.conv", 4, 32, 3, 1)?;
         let stem_bn = load_bn(store, "stem.bn")?;
 
@@ -166,6 +272,26 @@ impl AlphaZeroNet {
             val_bn,
             val_fc1,
             val_fc2,
+        })
+    }
+
+    /// Build the network from a file exported by `python/train/export.py`.
+    fn from_mlx_store(store: &WeightStore) -> Result<Self, String> {
+        let mut blocks = Vec::with_capacity(4);
+        for i in 0..4 {
+            blocks.push(ResBlock::load_mlx(store, &format!("blocks.{i}"))?);
+        }
+        Ok(Self {
+            stem_conv: load_mlx_conv(store, "stem.layers.0", 4, 32, 3, 1)?,
+            stem_bn: load_mlx_bn(store, "stem.layers.1", 32)?,
+            blocks,
+            pol_conv: load_mlx_conv(store, "policy_conv", 32, 2, 1, 0)?,
+            pol_bn: load_mlx_bn(store, "policy_bn", 2)?,
+            pol_fc: load_mlx_linear(store, "policy_fc", 2 * BOARD * BOARD, 64, 2)?,
+            val_conv: load_mlx_conv(store, "value_conv", 32, 1, 1, 0)?,
+            val_bn: load_mlx_bn(store, "value_bn", 1)?,
+            val_fc1: load_mlx_linear(store, "value_fc1", BOARD * BOARD, 64, 1)?,
+            val_fc2: load_mlx_linear(store, "value_fc2", 64, 1, 1)?,
         })
     }
 

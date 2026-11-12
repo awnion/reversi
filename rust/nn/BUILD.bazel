@@ -20,5 +20,9 @@ rust_library(
 rust_test(
     name = "nn_test",
     srcs = ["tests/nn_test.rs"],
+    compile_data = [
+        "//weights:alphazero/champion.bin",
+        "//weights:zerorev/champion.bin",
+    ],
     deps = [":nn_test_utils"],
 )

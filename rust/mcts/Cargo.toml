@@ -8,10 +8,11 @@ name = "reversi_mcts"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-python = ["pyo3/extension-module"]
+python = ["dep:reversi_nn", "pyo3/extension-module"]
 
 [dependencies]
 reversi_minimax = { path = "../minimax" }
+reversi_nn = { path = "../nn", optional = true }
 
 [dependencies.pyo3]
 features = ["abi3-py312"]

@@ -212,6 +212,7 @@ version = "0.1.0"
 dependencies = [
  "pyo3",
  "reversi_minimax",
+ "reversi_nn",
 ]
 
 [[package]]

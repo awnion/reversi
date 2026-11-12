@@ -1,6 +1,5 @@
 use reversi_mcts::EvalFn;
 use reversi_mcts::MctsSearch;
-use reversi_mcts::StaticEval;
 use reversi_minimax::board::Board;
 use reversi_nn::AlphaZeroNet;
 use wasm_bindgen::prelude::*;
@@ -44,10 +43,12 @@ impl EvalFn for NnEval {
 }
 
 fn make_eval() -> Box<dyn EvalFn> {
-    match AlphaZeroNet::load(CHAMPION_WEIGHTS) {
-        Ok(net) => Box::new(NnEval { net }),
-        Err(_) => Box::new(StaticEval),
-    }
+    // The weights are embedded at build time, so a load failure is a build
+    // defect. Fail loudly: silently falling back to another evaluator once hid
+    // a format mismatch and the bot never used its network.
+    let net = AlphaZeroNet::load(CHAMPION_WEIGHTS)
+        .unwrap_or_else(|err| panic!("embedded champion weights failed to load: {err}"));
+    Box::new(NnEval { net })
 }
 
 fn run_mcts_timed(mcts: &mut MctsSearch, eval: &dyn EvalFn, time_ms: f64) {

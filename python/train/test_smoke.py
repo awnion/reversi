@@ -102,9 +102,48 @@ def test_compute_loss():
     print(f"✓ compute_loss (loss={loss_val:.4f})")
 
 
+def test_rust_inference_matches_mlx():
+    """The exported .bin must give the same outputs in Rust (browser bots)."""
+    import tempfile
+    from pathlib import Path
+
+    import reversi_mcts
+
+    from train.export import export_model
+
+    net = AlphaZeroNet()
+    # A few training-mode passes so the BatchNorm running stats are non-trivial.
+    for _ in range(3):
+        mx.eval(net(mx.random.normal((16, 4, 8, 8))))
+    mx.eval(net.parameters())
+    net.eval()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "model.bin"
+        export_model(net, path)
+        raw = path.read_bytes()
+
+    rng = np.random.default_rng(0)
+    for _ in range(10):
+        cells = rng.integers(0, 3, size=64)
+        black = sum(1 << i for i in range(64) if cells[i] == 1)
+        white = sum(1 << i for i in range(64) if cells[i] == 2)
+        legal = int(rng.integers(0, 2**63))
+        planes = board_to_planes(black, white, bool(rng.integers(0, 2)), legal)
+        logits, value = net(mx.array(planes[None]))
+        want_policy = np.array(mx.softmax(logits, axis=-1))[0]
+        got_policy, got_value = reversi_mcts.nn_forward(
+            raw, planes.reshape(-1).tolist()
+        )
+        assert np.allclose(got_policy, want_policy, atol=1e-4), "policy mismatch"
+        assert abs(got_value - float(value[0])) < 1e-4, "value mismatch"
+    print("✓ rust inference matches mlx")
+
+
 if __name__ == "__main__":
     test_board_planes()
     test_replay_buffer()
     test_model_forward()
     test_compute_loss()
+    test_rust_inference_matches_mlx()
     print("All smoke tests passed!")

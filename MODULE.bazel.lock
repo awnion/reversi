@@ -482,10 +482,10 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
-          "FILE:@@//Cargo.lock f971cf79ada3ec393646974907ca84d2593a4e125352c285c97088db34713afb",
+          "FILE:@@//Cargo.lock 218503759e1e3ba5726435e589545f89ba561e523a3096b6251fc20a602cc255",
           "FILE:@@//Cargo.toml ac9c26ed32468d3690fd28d6000d01c048fc706074536553a79e9189edf51a73",
           "FILE:@@//rust/alphazero/Cargo.toml 6859abc147b13aa6c7ff016cee23290ba52f651d47f8c67c7da7a1aabc27e7bc",
-          "FILE:@@//rust/mcts/Cargo.toml d032d9d22d2814b69a383362e1d0214966bafd146c9dbe5ca009980562a27dd6",
+          "FILE:@@//rust/mcts/Cargo.toml aa4cc373db67324e61d57c4ec17258e39789ef5bbd0570480b96cc48fe76b7af",
           "FILE:@@//rust/minimax/Cargo.toml 9dd52e7ea594472a45e82c77194475505774d71a552e9cf7828db54d6decd3cf",
           "FILE:@@//rust/nn/Cargo.toml cf740158d79c532fe6771934033c78f45d85b9da09c2e0da14dddc746d1c6cfd",
           "FILE:@@//rust/zerorev/Cargo.toml 9a123336d040452e88436d2e8ffeb8b8ce6eb992576e97492b37146aa5e25eb8"

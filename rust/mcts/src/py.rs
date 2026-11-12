@@ -217,9 +217,23 @@ pub fn run_match(
     Ok(py.allow_threads(|| play_match(&eb, &ew, simulations)))
 }
 
+/// Run the Rust inference path (the one the browser bots use) on weights in
+/// the exported `.bin` format. `planes` is one position, 4×8×8 channel-first.
+/// Returns `(policy, value)`; used to check parity with the MLX model.
+#[pyfunction]
+pub fn nn_forward(weights: &[u8], planes: Vec<f32>) -> PyResult<(Vec<f32>, f32)> {
+    if planes.len() != PLANES_LEN {
+        return Err(PyValueError::new_err("planes must hold 4*8*8 floats"));
+    }
+    let net = reversi_nn::AlphaZeroNet::load(weights).map_err(PyValueError::new_err)?;
+    let (policy, value) = net.forward(&planes);
+    Ok((policy.to_vec(), value))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MctsWorker>()?;
     m.add_class::<BatchedSelfPlay>()?;
     m.add_function(wrap_pyfunction!(run_match, m)?)?;
+    m.add_function(wrap_pyfunction!(nn_forward, m)?)?;
     Ok(())
 }
