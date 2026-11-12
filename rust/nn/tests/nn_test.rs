@@ -1,4 +1,5 @@
 use reversi_nn::AlphaZeroNet;
+use reversi_nn::ReferenceNet;
 use reversi_nn::WeightStore;
 
 // ── WeightStore roundtrip ─────────────────────────────────────────────────────
@@ -66,122 +67,115 @@ fn net_forward_zero_weights() {
     assert!((-1.0..=1.0).contains(&value), "value out of range: {value}");
 }
 
-/// Build a net from a real binary blob (round-trip through WeightStore::write),
-/// run a forward pass, and verify invariants.
-#[test]
-fn net_forward_random_weights() {
-    use std::collections::HashMap;
+// ── Random weights: optimised net vs reference ───────────────────────────────
 
-    // ---------- tiny LCG pseudo-random number generator ----------
-    struct Lcg(u64);
-    impl Lcg {
-        fn next_f32(&mut self) -> f32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            // Map to [-0.1, 0.1] — small values keep activations stable
-            ((self.0 >> 33) as f32 / u32::MAX as f32) * 0.2 - 0.1
-        }
+/// Tiny LCG pseudo-random number generator.
+struct Lcg(u64);
 
-        fn vec(&mut self, n: usize) -> Vec<f32> {
-            (0..n).map(|_| self.next_f32()).collect()
-        }
+impl Lcg {
+    /// Uniform in [-1, 1].
+    fn next_f32(&mut self) -> f32 {
+        self.0 =
+            self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((self.0 >> 33) as f32 / u32::MAX as f32) * 4.0 - 1.0
     }
-    let mut rng = Lcg(42);
 
-    // Helper to produce a non-negative variance vector (required for BatchNorm).
-    let pos_var = |rng: &mut Lcg, n: usize| -> Vec<f32> {
-        rng.vec(n).iter().map(|v| v.abs() + 0.1).collect()
-    };
+    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| self.next_f32() * scale).collect()
+    }
+}
 
-    const B: usize = 8;
+/// A full set of random weights in the MLX export layout, serialised to the
+/// binary format.
+fn random_mlx_weights(seed: u64) -> Vec<u8> {
     const CH: usize = 32;
+    let mut rng = Lcg(seed);
+    let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
 
-    // ── Assemble all tensors for one network ──────────────────────────────
-    let mut tensor_map: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
-    macro_rules! t {
-        ($name:expr, $shape:expr, $data:expr) => {
-            tensor_map.insert($name.to_string(), ($shape.to_vec(), $data));
-        };
-    }
-
-    // Stem
-    t!("stem.conv.weight", [CH, 3, 3, 4], rng.vec(CH * 3 * 3 * 4));
-    t!("stem.conv.bias", [CH], rng.vec(CH));
-    t!("stem.bn.gamma", [CH], rng.vec(CH));
-    t!("stem.bn.beta", [CH], rng.vec(CH));
-    t!("stem.bn.mean", [CH], rng.vec(CH));
-    t!("stem.bn.var", [CH], pos_var(&mut rng, CH));
-
-    // Residual blocks
+    let mut conv = |rng: &mut Lcg, name: &str, out: usize, k: usize, inp: usize| {
+        tensors.push((
+            format!("{name}.weight"),
+            vec![out, k, k, inp],
+            rng.vec(out * k * k * inp, 0.1),
+        ));
+        tensors.push((format!("{name}.bias"), vec![out], rng.vec(out, 0.1)));
+    };
+    conv(&mut rng, "stem.layers.0", CH, 3, 4);
     for i in 0..4 {
-        let pfx = format!("block{i}");
-        t!(format!("{pfx}.conv1.weight"), [CH, CH, 3, 3], rng.vec(CH * CH * 9));
-        t!(format!("{pfx}.conv1.bias"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn1.gamma"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn1.beta"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn1.mean"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn1.var"), [CH], pos_var(&mut rng, CH));
-        t!(format!("{pfx}.conv2.weight"), [CH, CH, 3, 3], rng.vec(CH * CH * 9));
-        t!(format!("{pfx}.conv2.bias"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn2.gamma"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn2.beta"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn2.mean"), [CH], rng.vec(CH));
-        t!(format!("{pfx}.bn2.var"), [CH], pos_var(&mut rng, CH));
+        conv(&mut rng, &format!("blocks.{i}.conv1"), CH, 3, CH);
+        conv(&mut rng, &format!("blocks.{i}.conv2"), CH, 3, CH);
     }
+    conv(&mut rng, "policy_conv", 2, 1, CH);
+    conv(&mut rng, "value_conv", 1, 1, CH);
 
-    // Policy head
-    t!("policy.conv.weight", [2, CH, 1, 1], rng.vec(2 * CH));
-    t!("policy.conv.bias", [2], rng.vec(2));
-    t!("policy.bn.gamma", [2], rng.vec(2));
-    t!("policy.bn.beta", [2], rng.vec(2));
-    t!("policy.bn.mean", [2], rng.vec(2));
-    t!("policy.bn.var", [2], pos_var(&mut rng, 2));
-    t!("policy.fc.weight", [64, 2 * B * B], rng.vec(64 * 2 * B * B));
-    t!("policy.fc.bias", [64], rng.vec(64));
+    let mut bn = |rng: &mut Lcg, name: &str, ch: usize| {
+        tensors.push((format!("{name}.weight"), vec![ch], rng.vec(ch, 1.0)));
+        tensors.push((format!("{name}.bias"), vec![ch], rng.vec(ch, 0.5)));
+        tensors.push((format!("{name}.running_mean"), vec![ch], rng.vec(ch, 0.5)));
+        // Variances must be positive.
+        let var = rng.vec(ch, 1.0).iter().map(|v| v.abs() + 0.1).collect();
+        tensors.push((format!("{name}.running_var"), vec![ch], var));
+    };
+    bn(&mut rng, "stem.layers.1", CH);
+    for i in 0..4 {
+        bn(&mut rng, &format!("blocks.{i}.bn1"), CH);
+        bn(&mut rng, &format!("blocks.{i}.bn2"), CH);
+    }
+    bn(&mut rng, "policy_bn", 2);
+    bn(&mut rng, "value_bn", 1);
 
-    // Value head
-    t!("value.conv.weight", [1, CH, 1, 1], rng.vec(CH));
-    t!("value.conv.bias", [1], rng.vec(1));
-    t!("value.bn.gamma", [1], rng.vec(1));
-    t!("value.bn.beta", [1], rng.vec(1));
-    t!("value.bn.mean", [1], rng.vec(1));
-    t!("value.bn.var", [1], pos_var(&mut rng, 1));
-    t!("value.fc1.weight", [64, B * B], rng.vec(64 * B * B));
-    t!("value.fc1.bias", [64], rng.vec(64));
-    t!("value.fc2.weight", [1, 64], rng.vec(64));
-    t!("value.fc2.bias", [1], rng.vec(1));
+    let mut dense = |rng: &mut Lcg, name: &str, out: usize, inp: usize| {
+        tensors.push((format!("{name}.weight"), vec![out, inp], rng.vec(out * inp, 0.1)));
+        tensors.push((format!("{name}.bias"), vec![out], rng.vec(out, 0.1)));
+    };
+    dense(&mut rng, "policy_fc", 64, 128);
+    dense(&mut rng, "value_fc1", 64, 64);
+    dense(&mut rng, "value_fc2", 1, 64);
 
-    // ── Serialise to binary blob ──────────────────────────────────────────
     let entries: Vec<(&str, &[usize], &[f32])> =
-        tensor_map.iter().map(|(k, (s, d))| (k.as_str(), s.as_slice(), d.as_slice())).collect();
+        tensors.iter().map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice())).collect();
+    WeightStore::write(&entries)
+}
 
-    let bytes = WeightStore::write(&entries);
-
-    // ── Load and run forward pass ─────────────────────────────────────────
-    let net = AlphaZeroNet::load(&bytes).expect("AlphaZeroNet::load failed");
-
-    let mut planes = vec![0.0f32; 4 * 8 * 8];
-    // Set a few bits to make the input non-trivial
-    planes[0] = 1.0;
-    planes[9] = 1.0;
-    planes[64] = 1.0;
-    planes[128] = 1.0;
-
-    let (policy, value) = net.forward(&planes);
-
-    // Invariant 1: policy sums to ~1
-    let sum: f32 = policy.iter().sum();
-    assert!((sum - 1.0).abs() < 1e-4, "policy sum = {sum}, expected ~1.0");
-
-    // Invariant 2: all policy values are non-negative
-    for (i, &p) in policy.iter().enumerate() {
-        assert!(p >= 0.0, "policy[{i}] = {p} is negative");
+/// Board-like inputs: sparse 0/1 planes plus a constant phase plane.
+fn random_planes(rng: &mut Lcg) -> Vec<f32> {
+    let mut planes = vec![0.0f32; 4 * 64];
+    for v in &mut planes[..3 * 64] {
+        *v = if rng.next_f32() > 0.3 { 1.0 } else { 0.0 };
     }
+    let phase = rng.next_f32().abs();
+    planes[3 * 64..].fill(phase);
+    planes
+}
 
-    // Invariant 3: value is in [-1, 1]
-    assert!((-1.0..=1.0).contains(&value), "value = {value} is outside [-1, 1]");
+/// The optimised network (folded BatchNorm, channel-last, zero skipping) must
+/// compute the same function as the layer-by-layer reference.
+#[test]
+fn optimised_net_matches_reference() {
+    for seed in [1, 42, 2026] {
+        let bytes = random_mlx_weights(seed);
+        let net = AlphaZeroNet::load(&bytes).expect("AlphaZeroNet::load failed");
+        let reference = ReferenceNet::load(&bytes).expect("ReferenceNet::load failed");
+
+        let mut rng = Lcg(seed ^ 0xABCD);
+        for _ in 0..20 {
+            let planes = random_planes(&mut rng);
+            let (policy, value) = net.forward(&planes);
+            let (want_policy, want_value) = reference.forward(&planes);
+
+            let sum: f32 = policy.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "policy sum = {sum}");
+            assert!((-1.0..=1.0).contains(&value), "value = {value} is outside [-1, 1]");
+
+            for (i, (&got, &want)) in policy.iter().zip(&want_policy).enumerate() {
+                assert!((got - want).abs() < 1e-4, "seed {seed}: policy[{i}] = {got}, want {want}");
+            }
+            assert!(
+                (value - want_value).abs() < 1e-4,
+                "seed {seed}: value = {value}, want {want_value}"
+            );
+        }
+    }
 }
 
 // ── Exported champion files ──────────────────────────────────────────────────

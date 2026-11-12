@@ -5,7 +5,10 @@ load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
 rust_shared_library(
     name = "alphazero_cdylib",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["//weights:alphazero/champion.bin"],
+    compile_data = [
+        "//weights:alphazero/champion.bin",
+        "//weights:alphazero/champion.json",
+    ],
     crate_name = "reversi_alphazero",
     rustc_env_files = ["//tools:build_env"],
     deps = [

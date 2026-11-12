@@ -89,6 +89,12 @@ stop botname:
         rm -f "$nohup_pid"
     fi
     pkill -f "train.loop --run-name {{ botname }}" || true
+    # The learner saves its replay buffer on the way out; wait so that a
+    # following `just train` does not find it still running.
+    for _ in $(seq 60); do
+        pgrep -f "train.loop --run-name {{ botname }}" >/dev/null || break
+        sleep 1
+    done
 
 # Follow training logs: just logs <botname>
 logs botname:
@@ -97,6 +103,75 @@ logs botname:
 # Run a tournament for a bot: just tournament <botname>
 tournament botname:
     uv run --directory python python -m train.tournament --run-name {{ botname }}
+
+# --- training on another machine -------------------------------------------
+# Runs are interchangeable between machines: checkpoints are framework-neutral
+# (MLX on Apple Silicon, PyTorch on Linux/CUDA).
+
+_remote_dir := "gh/awnion/reversi"
+_remote_path := "export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+# Copy the code (not the weights) to a remote checkout: just sync-code <host>
+sync-code host:
+    rsync -az --exclude .git --exclude node_modules --exclude 'bazel-*' \
+        --exclude .venv --exclude target --exclude __pycache__ --exclude .ruff_cache \
+        --exclude 'python/dist' --exclude 'packages/*/wasm' --exclude 'apps/web/dist' \
+        --exclude '*.tsbuildinfo' --exclude weights \
+        ./ {{ host }}:{{ _remote_dir }}/
+
+# Install deps and build the Rust extension on the remote: just setup-remote <host>
+setup-remote host: (sync-code host)
+    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }}/python && uv sync && uv run maturin develop --release --features python'
+
+# Send a run's state (champion, checkpoints, replay buffer): just push-run <host> <botname>
+push-run host botname:
+    rsync -az --exclude replay_spool --exclude '*.pid' --exclude train.log --exclude old_checkpoints \
+        {{ _weights_base / botname }}/ {{ host }}:{{ _remote_dir }}/weights/{{ botname }}/
+
+# Fetch a run's state back: just pull-run <host> <botname>
+pull-run host botname:
+    rsync -az --exclude replay_spool --exclude '*.pid' --exclude train.log --exclude old_checkpoints \
+        {{ host }}:{{ _remote_dir }}/weights/{{ botname }}/ {{ _weights_base / botname }}/
+
+# Start / stop / follow training on the remote: just train-remote <host> <botname>
+train-remote host botname: (sync-code host)
+    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && just train {{ botname }}'
+
+stop-remote host botname:
+    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && just stop {{ botname }}'
+
+logs-remote host botname:
+    ssh {{ host }} 'tail -f {{ _remote_dir }}/weights/{{ botname }}/train.log'
+
+# Download the newest champion from the training machine into a browser bot
+# and rebuild the WASM. With no arguments: zerorev-v2 from ku into ZeroRev.
+#   just snapshot [host] [run] [bot] [champion|latest]
+# "champion" is the last tournament winner, "latest" the newest trained weights.
+snapshot host="ku" run="zerorev-v2" bot="zerorev" which="champion":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    remote={{ host }}:{{ _remote_dir }}/weights/{{ run }}
+    local={{ _weights_base / run }}
+    target={{ _weights_base / bot }}
+    mkdir -p "$local"
+    if [ "{{ which }}" = "latest" ]; then
+        rsync -az "$remote/selfplay_latest.bin" "$local/selfplay_latest.bin"
+        cp "$local/selfplay_latest.bin" "$target/champion.bin"
+        # The newest weights have not been through a tournament yet.
+        printf '{\n  "run": "%s",\n  "date": "%s",\n  "loss": null,\n  "win_rate": null\n}\n' \
+            "{{ run }}" "$(date +%F)" > "$target/champion.json"
+    else
+        rsync -az "$remote/champion.bin" "$remote/champion.json" "$local/"
+        cp "$local/champion.bin" "$local/champion.json" "$target/"
+    fi
+    bun run build:wasm >/dev/null 2>&1
+    echo -e "\033[32m{{ bot }} now plays the {{ which }} weights of '{{ run }}' from {{ host }}:\033[0m"
+    tr -d '\n' < "$target/champion.json"; echo
+    echo "Reload the page to play it; \`just vs-minimax\` checks it against Minimax."
+
+# Play ZeroRev against Minimax with each colour: just vs-minimax [ms per move]
+vs-minimax ms="300":
+    bun apps/web/scripts/vs-minimax.ts {{ ms }}
 
 # --- per-bot shortcuts (for tab completion) ---
 train-alphazero:  (train "alphazero")

@@ -4,10 +4,12 @@ pub mod eval;
 pub mod utils;
 
 use board::Board;
+use engine::Deadline;
 use engine::MAX_SCORE;
 use engine::MIN_SCORE;
 use engine::evaluate_all_moves;
-use engine::search;
+use engine::evaluate_all_moves_until;
+use engine::search_until;
 use wasm_bindgen::prelude::*;
 
 /// Returns current time in milliseconds (WASM only; returns 0 on native).
@@ -63,19 +65,33 @@ impl MinimaxBot {
         let board =
             board_from_parts(board_black_low, board_black_high, board_white_low, board_white_high);
 
-        let deadline = now_ms() + time_ms;
+        let legal = board.legal_moves(is_black);
+        if legal == 0 {
+            return -1;
+        }
+        // Nothing to think about.
+        if legal.count_ones() == 1 {
+            return legal.trailing_zeros() as i32;
+        }
+
+        // Deepen until the time is up. A depth that is cut short is discarded
+        // and the move from the last finished depth is played.
+        let mut deadline = Deadline::at(now_ms, now_ms() + time_ms);
         let mut best_move: Option<u64> = None;
 
         for depth in 1u8..=20 {
-            let (m, _) = search(board, is_black, depth, MIN_SCORE, MAX_SCORE);
+            let Some((m, _)) =
+                search_until(board, is_black, depth, MIN_SCORE, MAX_SCORE, &mut deadline)
+            else {
+                break;
+            };
             if m.is_some() {
                 best_move = m;
             }
-            if now_ms() >= deadline {
-                break;
-            }
         }
 
+        // Not even depth 1 finished (a tiny budget): play any legal move.
+        let best_move = best_move.or(Some(1u64 << legal.trailing_zeros()));
         best_move.map(|m| m.trailing_zeros() as i32).unwrap_or(-1)
     }
 
@@ -98,17 +114,18 @@ impl MinimaxBot {
             return Box::new([]);
         }
 
-        let deadline = now_ms() + time_ms;
-        let mut best_evals: Vec<(u64, i32)> = Vec::new();
-        let mut best_depth = 0u8;
+        let mut deadline = Deadline::at(now_ms, now_ms() + time_ms);
+        // Depth 1 always completes, so there is always something to report.
+        let mut best_evals = evaluate_all_moves(board, is_black, 1);
+        let mut best_depth = 1u8;
 
-        for depth in 1u8..=20 {
-            let evals = evaluate_all_moves(board, is_black, depth);
+        for depth in 2u8..=20 {
+            let Some(evals) = evaluate_all_moves_until(board, is_black, depth, &mut deadline)
+            else {
+                break;
+            };
             best_evals = evals;
             best_depth = depth;
-            if now_ms() >= deadline {
-                break;
-            }
         }
 
         // Pack into [depth, idx0, score0, idx1, score1, ...]

@@ -18,3 +18,6 @@ selfplay_latest.bin
 replay_spool/
 replay_buffer.tmp
 *.bad
+
+# Cool-down marker written by the trainer
+cooldown

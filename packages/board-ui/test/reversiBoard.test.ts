@@ -158,3 +158,35 @@ describe('reversi board ui', () => {
     expect(root.classList.contains('rv-board')).toBe(false);
   });
 });
+
+describe('last move marker', () => {
+  const nextFrame = () =>
+    new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve)),
+    );
+
+  test('marks the disc placed by the most recent move', async () => {
+    const state = createInitialState();
+    const { root, board } = setup(state);
+    expect(root.querySelectorAll('[data-last="true"]')).toHaveLength(0);
+
+    const move = state.legalMoves[0];
+    board.setState(applyMove(state, move));
+    await nextFrame();
+
+    const marked = root.querySelectorAll<HTMLElement>('[data-last="true"]');
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toBe(squareAt(root, move.row, move.col));
+    expect(root.dataset.turn).toBe('white');
+  });
+
+  test('clears the marker when a new game starts', async () => {
+    const state = createInitialState();
+    const { root, board } = setup(state);
+    board.setState(applyMove(state, state.legalMoves[0]));
+    await nextFrame();
+    board.setState(createInitialState());
+    await nextFrame();
+    expect(root.querySelectorAll('[data-last="true"]')).toHaveLength(0);
+  });
+});

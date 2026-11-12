@@ -1,0 +1,8 @@
+{
+  "run": "zerorev-v2",
+  "date": "2026-11-12",
+  "loss": 2.0323,
+  "win_rate": 0.611,
+  "step": 62500,
+  "backend": "torch"
+}

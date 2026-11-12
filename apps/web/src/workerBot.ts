@@ -1,9 +1,13 @@
 import type {
   BotPlayer,
   GameState,
+  NetworkBotMeta,
   Position,
   PositionAnalysis,
 } from '@reversi/core';
+
+/** Sent by the worker once the WASM bots are loaded. */
+export type BotsReady = { alphazero: NetworkBotMeta; zerorev: NetworkBotMeta };
 
 type PendingEntry = {
   resolve: (value: unknown) => void;
@@ -14,25 +18,28 @@ export class BotWorkerPool {
   private worker: Worker;
   private pending = new Map<number, PendingEntry>();
   private idCounter = 0;
-  readonly ready: Promise<{ alphazeroName: string; zerorevName: string }>;
+  readonly ready: Promise<BotsReady>;
 
   constructor() {
     this.worker = new Worker(new URL('./botWorker.ts', import.meta.url), {
       type: 'module',
     });
-    let resolveReady!: (value: {
-      alphazeroName: string;
-      zerorevName: string;
-    }) => void;
-    this.ready = new Promise((res) => {
+    let resolveReady!: (value: BotsReady) => void;
+    let rejectReady!: (reason: Error) => void;
+    this.ready = new Promise((res, rej) => {
       resolveReady = res;
+      rejectReady = rej;
     });
     this.worker.addEventListener('message', (e: MessageEvent) => {
       if (e.data.type === 'ready') {
         resolveReady({
-          alphazeroName: e.data.alphazeroName as string,
-          zerorevName: e.data.zerorevName as string,
+          alphazero: e.data.alphazero as NetworkBotMeta,
+          zerorev: e.data.zerorev as NetworkBotMeta,
         });
+        return;
+      }
+      if (e.data.type === 'failed') {
+        rejectReady(new Error(e.data.error as string));
         return;
       }
       const entry = this.pending.get(e.data.id as number);

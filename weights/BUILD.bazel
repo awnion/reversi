@@ -1,5 +1,8 @@
-# Champion weights are embedded into the WASM bots with include_bytes!.
+# Champion weights (and the facts about them) are embedded into the WASM bots.
 exports_files(
-    glob(["*/champion.bin"]),
+    glob([
+        "*/champion.bin",
+        "*/champion.json",
+    ]),
     visibility = ["//rust:__subpackages__"],
 )

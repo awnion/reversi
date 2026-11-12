@@ -18,26 +18,22 @@ import json
 import math
 import os
 import signal
-import struct
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
 import numpy as np
 
-from .eval_server import SyncBatchEval, board_to_planes
-from .export import MAGIC, VERSION, export_model
-from .loss import compute_loss
-from .model import AlphaZeroNet
+from . import weights as weights_io
+from .backend import Model, backend_name, create_model
+from .backend.common import BASE_LEARNING_RATE
 from .replay import ReplayBuffer
 from .replay_spool import ReplayShardWriter, ingest_replay_shards
+from .thermal import ThermalGovernor
+from .weights import Weights
 
 # --- hyper-parameters --------------------------------------------------------
 
@@ -53,7 +49,6 @@ MAX_PENDING_STEPS = 1_000
 CHECKPOINT_EVERY = 500
 KEEP_CHECKPOINTS = 20
 LOG_EVERY = 100
-BASE_LR = 3e-4
 LR_DECAY_EVERY = 5_000  # multiply LR by LR_DECAY_FACTOR every N steps
 LR_DECAY_FACTOR = 0.5
 LR_MIN = 1e-5
@@ -67,14 +62,16 @@ CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 # inference batch size. The GPU saturates at roughly 1000-2000.
 SELFPLAY_GAMES = 1024
 
-# Batch size for the threaded evaluator (inline workers and tournaments).
-EVAL_BATCH_SIZE = 96
-
 # Tournament settings
 TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
 TOURNAMENT_POOL_CHECKPOINTS = 2  # recent checkpoints to include with champion/current
-TOURNAMENT_GAMES_PER_PAIR = 2  # games for each pairing inside the tournament pool
+# Games for each pairing. Every random opening is played twice with colours
+# swapped, so keep this even.
+TOURNAMENT_GAMES_PER_PAIR = 6
 TOURNAMENT_SIMS = 200  # MCTS simulations per move in tournament
+TOURNAMENT_OPENING_PLIES = 4  # random moves before the engines take over
+# Tournament games run on CPU threads; leave cores for self-play and training.
+TOURNAMENT_THREADS = max(1, (os.cpu_count() or 2) // 2)
 WIN_THRESHOLD = 0.55  # win rate required to crown a new champion
 CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 
@@ -84,26 +81,33 @@ REPLAY_SAVE_EVERY = 1_000  # save replay buffer every N training steps
 PID_FILE = WEIGHTS_DIR / "train.pid"
 REPLAY_SPOOL_DIR = WEIGHTS_DIR / "replay_spool"
 SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
+# Present while the learner lets the machine cool down after a tournament;
+# self-play processes pause for as long as it exists.
+COOLDOWN_FLAG = WEIGHTS_DIR / "cooldown"
+COOLDOWN_MAX_SECONDS = 300.0
+# Facts about champion.bin (run, date, loss, win rate, training step).
+CHAMPION_META = WEIGHTS_DIR / "champion.json"
 
 
 def _apply_run_name(name: str) -> None:
     """Point all path globals at weights/<name>/."""
     global WEIGHTS_DIR, CHAMPION_BIN, REPLAY_PATH, PID_FILE
-    global REPLAY_SPOOL_DIR, SELFPLAY_MODEL_BIN
+    global REPLAY_SPOOL_DIR, SELFPLAY_MODEL_BIN, COOLDOWN_FLAG, CHAMPION_META
     WEIGHTS_DIR = _WEIGHTS_BASE / name
     CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
     REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
     PID_FILE = WEIGHTS_DIR / "train.pid"
     REPLAY_SPOOL_DIR = WEIGHTS_DIR / "replay_spool"
     SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
+    COOLDOWN_FLAG = WEIGHTS_DIR / "cooldown"
+    CHAMPION_META = WEIGHTS_DIR / "champion.json"
 
 
 # One process already fills the GPU with large batches; more processes only
 # split it into smaller, less efficient ones.
 DEFAULT_SELFPLAY_PROCESSES = 1
 DEFAULT_SHARD_POSITIONS = 4_096
-WEIGHT_REFRESH_GAMES = 5  # inline workers: reload weights every N games
-WEIGHT_REFRESH_SECONDS = 5.0  # batched self-play: poll for new weights
+WEIGHT_REFRESH_SECONDS = 5.0  # self-play: poll for new weights
 SELFPLAY_LOG_SECONDS = 30.0
 
 
@@ -114,58 +118,84 @@ def log_event(component: str, message: str, **fields) -> None:
     print(f"{stamp} [{component}] {message}{suffix}", flush=True)
 
 
-# --- self-play worker --------------------------------------------------------
+def _learning_rate_at(step: int) -> float:
+    """Step-decayed learning rate for a given training step."""
+    decay = LR_DECAY_FACTOR ** (step // LR_DECAY_EVERY)
+    return max(BASE_LEARNING_RATE * decay, LR_MIN)
 
 
-def _self_play_worker(
-    worker_id: int,
-    batch_eval: SyncBatchEval,
-    sink,  # ReplayBuffer (inline) or ReplayShardWriter (subprocess)
-    games_counter: list,
-    stop_flag: list,
-    refresh_weights=None,
-) -> None:
-    """Runs in a ThreadPoolExecutor thread."""
-    import reversi_mcts
+def _champion_meta() -> dict:
+    try:
+        return json.loads(CHAMPION_META.read_text())
+    except (OSError, ValueError):
+        return {}
 
-    w = reversi_mcts.MctsWorker(SIMULATIONS)
-    while not stop_flag[0]:
-        record = w.run_game(batch_eval.evaluate)
-        if isinstance(sink, ReplayBuffer):
-            sink.add(record)
-            positions = len(record)
-        else:
-            positions = sink.add_record(record)
-        games_counter[0] += 1
-        if refresh_weights is not None and games_counter[0] % WEIGHT_REFRESH_GAMES == 0:
-            refresh_weights()
-        if games_counter[0] == 1 or games_counter[0] % 25 == 0:
-            log_event(
-                "selfplay",
-                "worker-progress",
-                worker=worker_id,
-                games=games_counter[0],
-                positions=positions,
-            )
+
+# --- temperature control -----------------------------------------------------
+
+
+def _log_throttle(component: str, governor: ThermalGovernor) -> None:
+    log_event(
+        component,
+        "thermal-throttle",
+        temp=governor.describe(),
+        limits=governor.describe_limits(),
+        slowdown=f"{governor.throttle:.0%}",
+    )
+
+
+async def _cool_down(governor: ThermalGovernor, stop_event: asyncio.Event) -> None:
+    """Pause training and self-play until every sensor is below its soft limit.
+
+    Tournaments may run hot; this is the rest afterwards.
+    """
+    if governor.cooled():
+        return
+    started = time.monotonic()
+    log_event("thermal", "cooldown-start", temp=governor.describe())
+    COOLDOWN_FLAG.touch()
+    try:
+        while not stop_event.is_set():
+            if time.monotonic() - started >= COOLDOWN_MAX_SECONDS:
+                break
+            await asyncio.sleep(2.0)
+            if governor.cooled():
+                break
+    finally:
+        COOLDOWN_FLAG.unlink(missing_ok=True)
+    log_event(
+        "thermal",
+        "cooldown-end",
+        temp=governor.describe(),
+        seconds=f"{time.monotonic() - started:.0f}",
+    )
 
 
 # --- training loop -----------------------------------------------------------
 
 
 async def train_loop(
-    model: AlphaZeroNet,
+    model: Model,
     replay: ReplayBuffer,
     stop_event: asyncio.Event,
     lock: threading.Lock,
     next_tournament_step: list,
 ) -> None:
-    opt = optim.AdamW(learning_rate=3e-4, weight_decay=1e-4)
-    loss_and_grad = nn.value_and_grad(model, compute_loss)
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     step, best_loss = _load_best_checkpoint(model)
+    # A resumed run continues its schedule instead of starting over.
+    model.set_learning_rate(_learning_rate_at(step))
     replay_at_last_step = replay.total_added
-    _publish_selfplay_weights(model)
+    _publish_selfplay_weights(model.weights())
 
+    tournament_task: asyncio.Task | None = None
+    governor = ThermalGovernor()
+    log_event(
+        "thermal",
+        "governor",
+        sensors=governor.describe() if governor.read() else "unavailable",
+        limits=governor.describe_limits(),
+    )
     warmup_log_t = time.monotonic()
     warmup_pos0 = len(replay)
     step_log_t = time.monotonic()
@@ -211,44 +241,17 @@ async def train_loop(
         if replay.total_added - replay_at_last_step > max_backlog:
             replay_at_last_step = replay.total_added - max_backlog
 
-        (
-            planes_np,
-            policies_np,
-            outcomes_np,
-            policy_weights_np,
-            value_weights_np,
-        ) = replay.sample(BATCH_SIZE)
-
-        # Convert numpy → MLX outside the lock to minimize lock hold time
-        x = mx.array(np.asarray(planes_np, dtype=np.float32))
-        phase = x[:, 3, 0, 0]
-        policy_targets = 0.97 * mx.array(policies_np) + 0.03 / 64.0
-        value_targets = mx.array(outcomes_np)
-        policy_weights_mx = mx.array(policy_weights_np)
-        value_weights_mx = mx.array(value_weights_np)
-
+        step_started = time.monotonic()
+        batch = replay.sample(BATCH_SIZE)
         with lock:
-            loss, grads = loss_and_grad(
-                model,
-                x,
-                policy_targets,
-                value_targets,
-                policy_weights_mx,
-                value_weights_mx,
-                phase,
-            )
-            grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
-            opt.update(model, grads)
-            mx.eval(model.parameters(), opt.state, loss)
-
+            loss_val = model.train_step(*batch)
         step += 1
-        loss_val = loss.item()
+        step_seconds = time.monotonic() - step_started
 
         # Step-based LR decay
         if step % LR_DECAY_EVERY == 0:
-            decay = LR_DECAY_FACTOR ** (step // LR_DECAY_EVERY)
-            new_lr = max(BASE_LR * decay, LR_MIN)
-            opt.learning_rate = mx.array(new_lr)
+            new_lr = _learning_rate_at(step)
+            model.set_learning_rate(new_lr)
             log_event("train", "lr-decay", step=step, lr=f"{new_lr:.2e}")
 
         if math.isnan(loss_val):
@@ -266,6 +269,7 @@ async def train_loop(
                 loss=f"{loss_val:.4f}",
                 replay=len(replay),
                 **({"sps": f"{sps:.1f}"} if sps is not None else {}),
+                **({"temp": governor.describe()} if governor.available else {}),
             )
             step_log_t = now
 
@@ -276,8 +280,9 @@ async def train_loop(
 
         if save:
             path = WEIGHTS_DIR / f"iter_{step:06d}_loss{loss_val:.4f}.npz"
-            _save_checkpoint(model, path)
-            _publish_selfplay_weights(model)
+            current = model.weights()
+            _save_checkpoint(current, path)
+            _publish_selfplay_weights(current)
             log_event("train", "checkpoint", step=step, path=path.name)
             _prune_checkpoints()
 
@@ -285,15 +290,31 @@ async def train_loop(
         if step % REPLAY_SAVE_EVERY == 0:
             replay.save(REPLAY_PATH)
 
-        # Trigger tournament when step crosses the next scheduled boundary
-        if step >= next_tournament_step[0]:
+        # A finished tournament may have heated the machine: rest before
+        # going on.
+        if tournament_task is not None and tournament_task.done():
+            tournament_task = None
+            await _cool_down(governor, stop_event)
+
+        # Slow down while the machine is too hot.
+        if governor.poll():
+            _log_throttle("train", governor)
+        pause = governor.pause_after(step_seconds)
+        if pause > 0:
+            await asyncio.sleep(pause)
+
+        # Trigger tournament when step crosses the next scheduled boundary.
+        # A tournament can outlast the interval; never run two at once.
+        tournament_idle = tournament_task is None
+        if step >= next_tournament_step[0] and tournament_idle:
             next_tournament_step[0] = step + TOURNAMENT_EVERY
-            task = asyncio.create_task(
-                _run_mini_tournament(model, lock, best_loss, None)
+            tournament_task = asyncio.create_task(
+                _run_mini_tournament(model, lock, best_loss, step)
             )
-            task.add_done_callback(
+            tournament_task.add_done_callback(
                 lambda t: (
-                    t.exception()
+                    not t.cancelled()
+                    and t.exception()
                     and log_event("tournament", "task-error", error=repr(t.exception()))
                 )
             )
@@ -304,112 +325,31 @@ async def train_loop(
 # --- tournament --------------------------------------------------------------
 
 
-def _load_model_from_bin(bin_path: Path) -> AlphaZeroNet:
-    weights = []
-    with open(bin_path, "rb") as f:
-        magic, version = struct.unpack("<IH", f.read(6))
-        if magic != MAGIC or version != VERSION:
-            raise ValueError(f"Unrecognised .bin format: {bin_path}")
-        (count,) = struct.unpack("<H", f.read(2))
-        for _ in range(count):
-            (name_len,) = struct.unpack("<B", f.read(1))
-            name = f.read(name_len).decode("utf-8")
-            (ndim,) = struct.unpack("<B", f.read(1))
-            shape = struct.unpack(f"<{ndim}I", f.read(ndim * 4))
-            n_elems = 1
-            for d in shape:
-                n_elems *= d
-            arr = np.frombuffer(f.read(n_elems * 4), dtype=np.float32).reshape(shape)
-            weights.append((name, mx.array(arr)))
-    m = AlphaZeroNet()
-    applied = _load_compatible_weights(m, weights)
-    mx.eval(m.parameters())
-    log_event(
-        "weights",
-        "loaded-compatible",
-        source=bin_path.name,
-        applied=applied,
-        total=len(weights),
-    )
-    m.eval()
-    return m
-
-
-def _load_model_from_checkpoint(checkpoint: Path) -> AlphaZeroNet:
-    data = np.load(str(checkpoint))
-    weights = [(k, mx.array(data[k])) for k in data.files]
-    model = AlphaZeroNet()
-    applied = _load_compatible_weights(model, weights)
-    mx.eval(model.parameters())
-    log_event(
-        "weights",
-        "loaded-compatible",
-        source=checkpoint.name,
-        applied=applied,
-        total=len(weights),
-    )
-    model.eval()
-    return model
-
-
-def _make_eval_fn(model: AlphaZeroNet, lock: threading.Lock | None = None):
-    """Return a thread-safe eval callback for MCTS."""
-
-    def evaluate(
-        board_black: int, board_white: int, is_black: bool, legal: int
-    ) -> tuple[list[float], float]:
-        planes = board_to_planes(board_black, board_white, is_black, legal)
-        x = mx.array(planes[None])
-        if lock is not None:
-            with lock:
-                model.eval()
-                logits, v = model(x)
-                # MCTS priors are probabilities, as in the Rust inference path.
-                p = mx.softmax(logits, axis=-1)
-                mx.eval(p, v)
-                model.train()
-        else:
-            with mx.stream(mx.cpu):
-                logits, v = model(x)
-                p = mx.softmax(logits, axis=-1)
-                mx.eval(p, v)
-        return p[0].tolist(), float(v[0])
-
-    return evaluate
-
-
 async def _run_mini_tournament(
-    current_model: AlphaZeroNet,
+    current_model: Model,
     lock: threading.Lock,
     current_loss: float = float("inf"),
-    batch_eval: SyncBatchEval | None = None,
+    current_step: int = 0,
 ) -> None:
     """Run a small round-robin over champion/current/recent checkpoints."""
     import traceback
 
     import reversi_mcts
 
-    # Take a snapshot of current model weights to avoid interference from
-    # training updates while the tournament games are running.
-    snapshot = AlphaZeroNet()
+    # Snapshot the current weights so that training can go on while the
+    # tournament games are running.
     with lock:
-        snapshot.load_weights(
-            [(k, mx.array(v)) for k, v in _iter_params(current_model)],
-            strict=False,
-        )
-        mx.eval(snapshot.parameters())
-    snapshot.eval()
+        snapshot = current_model.weights()
 
     if not CHAMPION_BIN.exists():
         log_event("tournament", "bootstrap-champion")
-        with lock:
-            export_model(snapshot, CHAMPION_BIN)
-            _record_champion(snapshot, win_rate=1.0, loss=current_loss)
+        weights_io.save_bin(snapshot, CHAMPION_BIN)
+        _record_champion(snapshot, win_rate=1.0, loss=current_loss, step=current_step)
         log_event("tournament", "promoted", path=CHAMPION_BIN.name, mode="bootstrap")
         return
 
     try:
-        champion_model = _load_model_from_bin(CHAMPION_BIN)
+        champion_weights = weights_io.load(CHAMPION_BIN)
     except Exception as e:
         log_event("tournament", "load-failed", error=repr(e))
         return
@@ -426,9 +366,11 @@ async def _run_mini_tournament(
         except (IndexError, ValueError):
             return -1
 
+    # "Recent" means recently written: step numbers alone could point at files
+    # left over from an earlier session.
     recent_paths = sorted(
         WEIGHTS_DIR.glob("iter_*.npz"),
-        key=_step_from_path,
+        key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:TOURNAMENT_POOL_CHECKPOINTS]
 
@@ -436,7 +378,8 @@ async def _run_mini_tournament(
         {
             "name": "champion.bin",
             "source": CHAMPION_BIN,
-            "model": champion_model,
+            "weights": champion_weights,
+            "step": _champion_meta().get("step"),
             "loss": float("inf"),
             "is_champion": True,
             "is_current": False,
@@ -444,7 +387,8 @@ async def _run_mini_tournament(
         {
             "name": "current",
             "source": None,
-            "model": snapshot,
+            "weights": snapshot,
+            "step": current_step,
             "loss": current_loss,
             "is_champion": False,
             "is_current": True,
@@ -456,7 +400,8 @@ async def _run_mini_tournament(
                 {
                     "name": path.name,
                     "source": path,
-                    "model": _load_model_from_checkpoint(path),
+                    "weights": weights_io.load(path),
+                    "step": _step_from_path(path),
                     "loss": _loss_from_path(path),
                     "is_champion": False,
                     "is_current": False,
@@ -473,62 +418,38 @@ async def _run_mini_tournament(
         sims=TOURNAMENT_SIMS,
     )
 
-    eval_fns = {
-        entrant["name"]: _make_eval_fn(entrant["model"]) for entrant in entrants
-    }
+    # The games run in Rust on CPU threads, with the same inference code as
+    # the browser bots: no GIL, and the GPU stays with training and self-play.
+    blobs = [weights_io.to_bytes(entrant["weights"]) for entrant in entrants]
+    pairings = len(entrants) * (len(entrants) - 1) // 2
+    total_games = pairings * TOURNAMENT_GAMES_PER_PAIR
 
     def run_games():
-        if batch_eval is not None:
-            batch_eval.pause()
-            log_event("tournament", "pause-selfplay")
         try:
-            scores = {entrant["name"]: 0.0 for entrant in entrants}
-            pairings = [
-                (entrants[i], entrants[j])
-                for i in range(len(entrants))
-                for j in range(i + 1, len(entrants))
-            ]
-            total_games = len(pairings) * TOURNAMENT_GAMES_PER_PAIR
-            done = 0
-            for left, right in pairings:
-                left_eval = eval_fns[left["name"]]
-                right_eval = eval_fns[right["name"]]
-                for i in range(TOURNAMENT_GAMES_PER_PAIR):
-                    black_eval, white_eval = (
-                        (left_eval, right_eval)
-                        if i % 2 == 0
-                        else (right_eval, left_eval)
-                    )
-                    outcome = reversi_mcts.run_match(
-                        black_eval, white_eval, TOURNAMENT_SIMS
-                    )
-                    if i % 2 == 0:
-                        black_name, white_name = left["name"], right["name"]
-                    else:
-                        black_name, white_name = right["name"], left["name"]
-                    if outcome > 0:
-                        scores[black_name] += 1.0
-                    elif outcome < 0:
-                        scores[white_name] += 1.0
-                    else:
-                        scores[black_name] += 0.5
-                        scores[white_name] += 0.5
-                    done += 1
-                if done % max(1, total_games // 4) == 0 or done == total_games:
-                    log_event(
-                        "tournament",
-                        "progress",
-                        games=f"{done}/{total_games}",
-                    )
-            ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            started = time.monotonic()
+            scores = reversi_mcts.run_tournament(
+                blobs,
+                TOURNAMENT_GAMES_PER_PAIR,
+                TOURNAMENT_SIMS,
+                opening_plies=TOURNAMENT_OPENING_PLIES,
+                seed=time.time_ns() & 0xFFFF_FFFF,
+                threads=TOURNAMENT_THREADS,
+            )
+            log_event(
+                "tournament",
+                "played",
+                games=total_games,
+                seconds=f"{time.monotonic() - started:.0f}",
+            )
+            ranking = sorted(
+                zip((entrant["name"] for entrant in entrants), scores, strict=True),
+                key=lambda item: item[1],
+                reverse=True,
+            )
             return ranking, total_games
         except Exception:
             log_event("tournament", "run-error", error=traceback.format_exc().strip())
             return None, 0
-        finally:
-            if batch_eval is not None:
-                batch_eval.resume()
-                log_event("tournament", "resume-selfplay")
 
     loop = asyncio.get_running_loop()
     ranking, total_games = await loop.run_in_executor(None, run_games)
@@ -550,51 +471,20 @@ async def _run_mini_tournament(
 
     if not winner["is_champion"] and win_rate >= WIN_THRESHOLD:
         log_event("tournament", "promote", threshold=f"{WIN_THRESHOLD:.0%}")
-        with lock:
-            export_model(winner["model"], CHAMPION_BIN)
-            _record_champion(winner["model"], win_rate, winner["loss"])
+        weights_io.save_bin(winner["weights"], CHAMPION_BIN)
+        _record_champion(
+            winner["weights"], win_rate, winner["loss"], step=winner["step"]
+        )
         log_event("tournament", "promoted", path=CHAMPION_BIN.name, winner=winner_name)
     else:
         log_event("tournament", "retain-champion")
 
 
-def _iter_params(model: AlphaZeroNet):
-    """Yield (flat_key, array) pairs from a model."""
-    arrays: dict = {}
-    _collect_params(model.parameters(), "", arrays)
-    yield from arrays.items()
-
-
-def _iter_param_shapes(model: AlphaZeroNet):
-    """Yield (flat_key, shape) pairs without materializing arrays."""
-    shapes: dict = {}
-    _collect_param_shapes(model.parameters(), "", shapes)
-    yield from shapes.items()
-
-
-def _load_compatible_weights(
-    model: AlphaZeroNet,
-    weights: list[tuple[str, mx.array]],
-) -> int:
-    """Load only tensors whose names and shapes match the current model."""
-    current_shapes = dict(_iter_param_shapes(model))
-    compatible: list[tuple[str, mx.array]] = []
-    for name, arr in weights:
-        target_shape = current_shapes.get(name)
-        if target_shape is None:
-            continue
-        if tuple(arr.shape) != tuple(target_shape):
-            continue
-        compatible.append((name, arr))
-    if compatible:
-        model.load_weights(compatible, strict=False)
-    return len(compatible)
-
-
 def _record_champion(
-    model: AlphaZeroNet,
+    weights: Weights,
     win_rate: float,
     loss: float = float("inf"),
+    step: int | None = None,
 ) -> None:
     """Save a snapshot of the new champion and update champions/history.json."""
     champions_dir = WEIGHTS_DIR / "champions"
@@ -615,7 +505,7 @@ def _record_champion(
     stamp = now.strftime("%Y%m%d_%H%M%S")
     loss_tag = f"{loss:.4f}" if loss != float("inf") else "unknown"
     snap_path = champions_dir / f"champion_{stamp}_loss{loss_tag}.npz"
-    _save_checkpoint(model, snap_path)
+    _save_checkpoint(weights, snap_path)
 
     entry = {
         "date": now.isoformat(),
@@ -646,11 +536,29 @@ def _record_champion(
         json.dump(history, f, indent=2)
         f.write("\n")
 
+    # Facts about the champion that travel with champion.bin: the browser bots
+    # embed this file and show it next to the strategy name.
+    with CHAMPION_META.open("w") as f:
+        json.dump(
+            {
+                "run": WEIGHTS_DIR.name,
+                "date": now.date().isoformat(),
+                "loss": entry["loss"],
+                "win_rate": entry["win_rate"],
+                # Training resumes from the champion and continues from here.
+                "step": step,
+                "backend": backend_name(),
+            },
+            f,
+            indent=2,
+        )
+        f.write("\n")
+
 
 # --- checkpoint helpers ------------------------------------------------------
 
 
-def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
+def _load_best_checkpoint(model: Model) -> tuple[int, float]:
     """Load the strongest known checkpoint for continued training.
     Prefer champion.bin because promotion is strength-based; fall back to the
     latest .npz checkpoint only when no deployed champion exists.
@@ -665,13 +573,10 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
 
     if CHAMPION_BIN.exists():
         try:
-            loaded = _load_model_from_bin(CHAMPION_BIN)
-            _load_compatible_weights(
-                model, [(k, mx.array(v)) for k, v in _iter_params(loaded)]
-            )
-            mx.eval(model.parameters())
-            log_event("train", "resume", source="champion.bin", step=0)
-            return 0, float("inf")
+            model.load_weights(weights_io.load(CHAMPION_BIN))
+            step = int(_champion_meta().get("step") or 0)
+            log_event("train", "resume", source="champion.bin", step=step)
+            return step, float("inf")
         except Exception as e:
             log_event("train", "resume-failed", source="champion.bin", error=repr(e))
 
@@ -681,10 +586,8 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
     )
     if checkpoints:
         latest = checkpoints[-1]
-        data = np.load(str(latest))
-        weights = [(k, mx.array(data[k])) for k in data.files]
-        applied = _load_compatible_weights(model, weights)
-        mx.eval(model.parameters())
+        weights = weights_io.load(latest)
+        applied = model.load_weights(weights)
         try:
             step = int(latest.stem.split("_")[1])
             loss = _loss(latest)
@@ -703,38 +606,14 @@ def _load_best_checkpoint(model: AlphaZeroNet) -> tuple[int, float]:
     return 0, float("inf")
 
 
-def _collect_params(obj, prefix: str, arrays: dict) -> None:
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            _collect_params(v, f"{prefix}.{k}" if prefix else k, arrays)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            _collect_params(v, f"{prefix}.{i}" if prefix else str(i), arrays)
-    elif hasattr(obj, "shape"):
-        arrays[prefix] = np.array(obj)
+def _save_checkpoint(weights: Weights, path: Path) -> None:
+    weights_io.save_npz(weights, path)
+    log_event("weights", "saved-checkpoint", tensors=len(weights), path=path.name)
 
 
-def _collect_param_shapes(obj, prefix: str, shapes: dict) -> None:
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            _collect_param_shapes(v, f"{prefix}.{k}" if prefix else k, shapes)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            _collect_param_shapes(v, f"{prefix}.{i}" if prefix else str(i), shapes)
-    elif hasattr(obj, "shape"):
-        shapes[prefix] = tuple(obj.shape)
-
-
-def _save_checkpoint(model: AlphaZeroNet, path: Path) -> None:
-    arrays: dict = {}
-    _collect_params(model.parameters(), "", arrays)
-    np.savez(str(path), **arrays)
-    log_event("weights", "saved-checkpoint", tensors=len(arrays), path=path.name)
-
-
-def _publish_selfplay_weights(model: AlphaZeroNet) -> None:
+def _publish_selfplay_weights(weights: Weights) -> None:
     tmp = SELFPLAY_MODEL_BIN.with_suffix(".bin.tmp")
-    export_model(model, tmp)
+    weights_io.save_bin(weights, tmp)
     tmp.replace(SELFPLAY_MODEL_BIN)
     log_event("weights", "published-selfplay", path=SELFPLAY_MODEL_BIN.name)
 
@@ -777,24 +656,16 @@ def _resolve_selfplay_source() -> Path | None:
     return checkpoints[-1] if checkpoints else None
 
 
-def _load_weights_into_model(
-    model: AlphaZeroNet,
-    path: Path,
-    lock: threading.Lock | None = None,
-) -> None:
-    loaded = (
-        _load_model_from_bin(path)
-        if path.suffix == ".bin"
-        else _load_model_from_checkpoint(path)
+def _load_weights_into_model(model: Model, path: Path) -> None:
+    weights = weights_io.load(path)
+    applied = model.load_weights(weights)
+    log_event(
+        "weights",
+        "loaded-compatible",
+        source=path.name,
+        applied=applied,
+        total=len(weights),
     )
-    weights = [(k, mx.array(v)) for k, v in _iter_params(loaded)]
-    if lock is None:
-        _load_compatible_weights(model, weights)
-        mx.eval(model.parameters())
-    else:
-        with lock:
-            _load_compatible_weights(model, weights)
-            mx.eval(model.parameters())
 
 
 def _spawn_selfplay_processes(
@@ -859,7 +730,7 @@ async def _run_selfplay_process(
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     REPLAY_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
-    model = AlphaZeroNet()
+    model = create_model()
     weights_mtime_ns = None
     source = _resolve_selfplay_source()
     if source is not None:
@@ -873,7 +744,6 @@ async def _run_selfplay_process(
         )
     else:
         log_event("selfplay", "weights-random-init", process=process_index)
-    model.eval()
 
     shard_writer = ReplayShardWriter(
         REPLAY_SPOOL_DIR,
@@ -893,16 +763,19 @@ async def _run_selfplay_process(
     games = positions = evals = 0
     evals_at_log = 0
     last_refresh = last_log = time.monotonic()
+    governor = ThermalGovernor()
     try:
         while not stop_flag[0]:
+            round_started = time.monotonic()
             planes = np.frombuffer(pool.collect(), dtype=np.float32)
-            x = mx.array(planes.reshape(-1, 4, 8, 8))
-            policy_logits, values = model(x)
+            planes = planes.reshape(-1, 4, 8, 8)
             # MCTS priors are probabilities, as in the Rust inference path.
-            policies = mx.softmax(policy_logits, axis=-1)
-            mx.eval(policies, values)
-            pool.apply(np.array(policies).tobytes(), np.array(values).tobytes())
-            batch = x.shape[0]
+            policies, values = model.infer(planes)
+            pool.apply(
+                np.ascontiguousarray(policies, dtype=np.float32).tobytes(),
+                np.ascontiguousarray(values, dtype=np.float32).tobytes(),
+            )
+            batch = planes.shape[0]
             evals += batch
 
             for record in pool.take_finished():
@@ -910,14 +783,24 @@ async def _run_selfplay_process(
                 games += 1
 
             now = time.monotonic()
+
+            # Slow down while the machine is too hot.
+            if governor.poll():
+                _log_throttle("selfplay", governor)
+            pause = governor.pause_after(now - round_started)
+            if pause > 0:
+                time.sleep(pause)
+
             if now - last_refresh >= WEIGHT_REFRESH_SECONDS:
                 last_refresh = now
+                # The learner asks everyone to rest after a tournament.
+                while COOLDOWN_FLAG.exists() and not stop_flag[0]:
+                    time.sleep(0.5)
                 source = _resolve_selfplay_source()
                 if source is not None:
                     mtime_ns = source.stat().st_mtime_ns
                     if mtime_ns != weights_mtime_ns:
                         _load_weights_into_model(model, source)
-                        model.eval()
                         weights_mtime_ns = mtime_ns
                         log_event(
                             "selfplay",
@@ -935,6 +818,7 @@ async def _run_selfplay_process(
                     positions=positions,
                     batch=batch,
                     evals_per_s=f"{rate:.0f}",
+                    **({"temp": governor.describe()} if governor.available else {}),
                 )
                 last_log = now
                 evals_at_log = evals
@@ -947,7 +831,6 @@ async def _run_learner(
     selfplay_workers: int,
     positions_per_shard: int,
     run_name: str,
-    inline_workers: int = 0,
 ) -> None:
     # Guard against duplicate instances
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -960,8 +843,9 @@ async def _run_learner(
         except ProcessLookupError:
             pass  # stale pid file, proceed
     PID_FILE.write_text(str(os.getpid()))
+    COOLDOWN_FLAG.unlink(missing_ok=True)
 
-    model = AlphaZeroNet()
+    model = create_model()
     replay = ReplayBuffer(max_size=500_000)
     stop_event = asyncio.Event()
     lock = threading.Lock()
@@ -973,34 +857,14 @@ async def _run_learner(
     log_event(
         "system",
         "startup",
+        backend=backend_name(),
         selfplay_processes=selfplay_processes,
-        inline_workers=inline_workers,
         simulations=SIMULATIONS,
-        eval_batch=EVAL_BATCH_SIZE,
         min_replay=MIN_REPLAY,
         train_ratio=TRAIN_RATIO,
         tournament_every=TOURNAMENT_EVERY,
     )
     next_tournament_step = [TOURNAMENT_EVERY]
-
-    inline_executor = None
-    inline_batch_eval = None
-    if inline_workers > 0:
-        inline_batch_eval = SyncBatchEval(model, batch_size=EVAL_BATCH_SIZE, lock=lock)
-        stop_flag = [False]
-        games_counters = [[0] for _ in range(inline_workers)]
-        inline_executor = ThreadPoolExecutor(max_workers=inline_workers)
-        event_loop = asyncio.get_event_loop()
-        for i in range(inline_workers):
-            event_loop.run_in_executor(
-                inline_executor,
-                _self_play_worker,
-                i,
-                inline_batch_eval,
-                replay,
-                games_counters[i],
-                stop_flag,
-            )
 
     def _shutdown(signum, frame):
         """SIGTERM handler: save state and stop gracefully."""
@@ -1008,8 +872,6 @@ async def _run_learner(
         # when two signals arrived, and the `finally` below saves anyway.
         log_event("system", "signal", signum=signum, action="save-and-stop")
         stop_event.set()
-        if inline_workers > 0:
-            stop_flag[0] = True
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -1026,13 +888,10 @@ async def _run_learner(
         replay.save(REPLAY_PATH)
     finally:
         stop_event.set()
-        if inline_workers > 0:
-            stop_flag[0] = True
-            inline_batch_eval.stop()
-            inline_executor.shutdown(wait=False)
         ingest_replay_shards(replay, REPLAY_SPOOL_DIR, limit=10_000)
         replay.save(REPLAY_PATH)
         _stop_child_processes(children)
+        COOLDOWN_FLAG.unlink(missing_ok=True)
         if PID_FILE.exists():
             PID_FILE.unlink(missing_ok=True)
 
@@ -1060,7 +919,6 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Concurrent games (= inference batch size) per self-play process",
     )
-    parser.add_argument("--inline-workers", type=int, default=0)
     parser.add_argument(
         "--positions-per-shard",
         type=int,
@@ -1094,7 +952,6 @@ async def main() -> None:
         selfplay_workers=workers,
         positions_per_shard=args.positions_per_shard,
         run_name=args.run_name,
-        inline_workers=args.inline_workers,
     )
 
 

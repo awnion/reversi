@@ -10,6 +10,8 @@ pub use batch::write_planes;
 pub use game::GameRecord;
 pub use game::PositionRecord;
 pub use game::play_game;
+pub use game::play_match_from;
+pub use game::random_opening;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 pub use search::EvalFn;

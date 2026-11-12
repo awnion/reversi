@@ -1,3 +1,6 @@
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -11,6 +14,8 @@ use crate::batch::write_planes;
 use crate::game::GameRecord;
 use crate::game::play_game;
 use crate::game::play_match;
+use crate::game::play_match_from;
+use crate::game::random_opening;
 use crate::search::EvalFn;
 use crate::search::StaticEval;
 
@@ -173,7 +178,7 @@ impl BatchedSelfPlay {
     pub fn collect<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let requests = self.pool.collect();
         self.planes.resize(requests.len() * PLANES_LEN, 0.0);
-        for (request, out) in requests.iter().zip(self.planes.chunks_exact_mut(PLANES_LEN)) {
+        for (request, out) in requests.iter().zip(self.planes.as_chunks_mut::<PLANES_LEN>().0) {
             write_planes(request, out);
         }
         let bytes: Vec<u8> = self.planes.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -230,10 +235,107 @@ pub fn nn_forward(weights: &[u8], planes: Vec<f32>) -> PyResult<(Vec<f32>, f32)>
     Ok((policy.to_vec(), value))
 }
 
+// ── Tournament ────────────────────────────────────────────────────────────
+
+/// [`EvalFn`] backed by the CPU inference path that the browser bots use.
+struct NetEval<'a>(&'a reversi_nn::AlphaZeroNet);
+
+impl EvalFn for NetEval<'_> {
+    fn evaluate(&self, board: Board, is_black: bool, legal: u64) -> ([f32; 64], f32) {
+        let (mine, theirs) =
+            if is_black { (board.black, board.white) } else { (board.white, board.black) };
+        let mut planes = [0.0f32; PLANES_LEN];
+        for i in 0..64 {
+            planes[i] = ((mine >> i) & 1) as f32;
+            planes[64 + i] = ((theirs >> i) & 1) as f32;
+            planes[128 + i] = ((legal >> i) & 1) as f32;
+        }
+        planes[192..].fill((board.black | board.white).count_ones() as f32 / 64.0);
+        self.0.forward(&planes)
+    }
+}
+
+/// Round-robin between networks given as exported `.bin` blobs.
+///
+/// Every pairing plays `games_per_pair` games: each random opening
+/// (`opening_plies` random moves, derived from `seed`) is played twice with
+/// colours swapped. Games run on `threads` CPU threads with the Rust inference
+/// path and without the GIL, so training keeps the GPU.
+///
+/// Returns the points per entrant (win 1, draw 0.5), in input order.
+#[pyfunction]
+#[pyo3(signature = (weights, games_per_pair, simulations, opening_plies=4, seed=0, threads=1))]
+pub fn run_tournament(
+    py: Python,
+    weights: Vec<Vec<u8>>,
+    games_per_pair: u32,
+    simulations: u32,
+    opening_plies: u32,
+    seed: u64,
+    threads: usize,
+) -> PyResult<Vec<f32>> {
+    let nets = weights
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            reversi_nn::AlphaZeroNet::load(bytes)
+                .map_err(|err| PyValueError::new_err(format!("entrant {i}: {err}")))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    // (black, white, opening seed)
+    let mut games = Vec::new();
+    for a in 0..nets.len() {
+        for b in a + 1..nets.len() {
+            for g in 0..games_per_pair {
+                let opening = seed
+                    .wrapping_add((a * nets.len() + b) as u64 * 1_000_003)
+                    .wrapping_add(u64::from(g / 2));
+                games.push(if g % 2 == 0 { (a, b, opening) } else { (b, a, opening) });
+            }
+        }
+    }
+
+    let next = AtomicUsize::new(0);
+    let scores = py.allow_threads(|| {
+        let play = || {
+            let mut scores = vec![0.0f32; nets.len()];
+            while let Some(&(black, white, opening)) =
+                games.get(next.fetch_add(1, Ordering::Relaxed))
+            {
+                let (board, black_to_move) = random_opening(opening_plies, opening);
+                let outcome = play_match_from(
+                    board,
+                    black_to_move,
+                    &NetEval(&nets[black]),
+                    &NetEval(&nets[white]),
+                    simulations,
+                );
+                scores[black] += (1.0 + outcome) / 2.0;
+                scores[white] += (1.0 - outcome) / 2.0;
+            }
+            scores
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads.max(1)).map(|_| scope.spawn(play)).collect();
+            let mut total = vec![0.0f32; nets.len()];
+            for worker in workers {
+                let scores = worker.join().expect("tournament worker panicked");
+                for (t, s) in total.iter_mut().zip(scores) {
+                    *t += s;
+                }
+            }
+            total
+        })
+    });
+    Ok(scores)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MctsWorker>()?;
     m.add_class::<BatchedSelfPlay>()?;
     m.add_function(wrap_pyfunction!(run_match, m)?)?;
     m.add_function(wrap_pyfunction!(nn_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(run_tournament, m)?)?;
     Ok(())
 }

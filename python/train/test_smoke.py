@@ -1,23 +1,33 @@
-"""Smoke tests — run with: uv run python -m train.test_smoke"""
+"""Smoke tests — run with: uv run python -m train.test_smoke
 
-import mlx.core as mx
+They exercise whichever backend this machine uses (see `train/backend`).
+"""
+
 import numpy as np
 
-from train.eval_server import board_to_planes
-from train.model import AlphaZeroNet
+from train import weights as weights_io
+from train.backend import backend_name, create_model
+from train.planes import board_to_planes
 from train.replay import ReplayBuffer
 
 
-def test_model_forward():
-    net = AlphaZeroNet()
-    x = mx.random.normal((4, 4, 8, 8))
-    policy, value = net(x)
-    mx.eval(policy, value)
-    assert policy.shape == (4, 64), f"bad policy shape: {policy.shape}"
-    assert value.shape == (4,), f"bad value shape: {value.shape}"
-    vals = np.array(value)
-    assert np.all(vals >= -1) and np.all(vals <= 1), "value out of [-1,1]"
-    print("✓ model forward pass")
+def _random_planes(rng: np.random.Generator, n: int) -> np.ndarray:
+    planes = []
+    for _ in range(n):
+        cells = rng.integers(0, 3, size=64)
+        black = sum(1 << i for i in range(64) if cells[i] == 1)
+        white = sum(1 << i for i in range(64) if cells[i] == 2)
+        legal = int(rng.integers(0, 2**63))
+        planes.append(board_to_planes(black, white, bool(rng.integers(0, 2)), legal))
+    return np.stack(planes)
+
+
+def _train_batch(rng: np.random.Generator, n: int):
+    policies = rng.random((n, 64), dtype=np.float32)
+    policies /= policies.sum(axis=1, keepdims=True)
+    outcomes = rng.choice(np.array([-1.0, 0.0, 1.0], dtype=np.float32), size=n)
+    ones = np.ones(n, dtype=np.float32)
+    return _random_planes(rng, n), policies, outcomes, ones, ones
 
 
 def test_board_planes():
@@ -54,96 +64,89 @@ def test_replay_buffer():
     print("✓ replay buffer")
 
 
-def test_compute_loss():
-    from train.loss import compute_loss
-
-    net = AlphaZeroNet()
-    B = 4  # noqa: N806
-    boards_black = np.array([1, 2, 3, 4], dtype=np.uint64)
-    boards_white = np.array([8, 16, 32, 64], dtype=np.uint64)
-    is_black_arr = np.array([True, False, True, False])
-    legal_arr = np.array([4, 8, 16, 32], dtype=np.uint64)
-    policies = np.ones((B, 64), dtype=np.float32) / 64
-    outcomes = np.array([1.0, -1.0, 0.0, 1.0], dtype=np.float32)
-    policy_weights = np.ones(B, dtype=np.float32)
-    value_weights = np.ones(B, dtype=np.float32)
-    # Precompute planes (phase is inside planes[:,3])
-    all_planes = np.stack(
-        [
-            board_to_planes(
-                int(boards_black[i]),
-                int(boards_white[i]),
-                bool(is_black_arr[i]),
-                int(legal_arr[i]),
-            )
-            for i in range(B)
-        ]
-    )
-    # Convert to MLX (as loop does outside the lock)
-    x = mx.array(all_planes)
-    phase = x[:, 3, 0, 0]
-    policy_targets = 0.97 * mx.array(policies) + 0.03 / 64.0
-    value_targets = mx.array(outcomes)
-    policy_weights_mx = mx.array(policy_weights)
-    value_weights_mx = mx.array(value_weights)
-    loss = compute_loss(
-        net,
-        x,
-        policy_targets,
-        value_targets,
-        policy_weights_mx,
-        value_weights_mx,
-        phase,
-    )
-    mx.eval(loss)
-    loss_val = float(loss.item())
-    assert np.isfinite(loss_val), f"loss is not finite: {loss_val}"
-    assert loss_val > 0, f"loss should be positive: {loss_val}"
-    print(f"✓ compute_loss (loss={loss_val:.4f})")
+def test_model_infer():
+    model = create_model()
+    policies, values = model.infer(_random_planes(np.random.default_rng(0), 4))
+    assert policies.shape == (4, 64), f"bad policy shape: {policies.shape}"
+    assert values.shape == (4,), f"bad value shape: {values.shape}"
+    assert np.allclose(policies.sum(axis=1), 1.0, atol=1e-3), "policies must sum to 1"
+    assert np.all(values >= -1) and np.all(values <= 1), "value out of [-1,1]"
+    print("✓ model inference")
 
 
-def test_rust_inference_matches_mlx():
-    """The exported .bin must give the same outputs in Rust (browser bots)."""
+def test_train_step():
+    model = create_model()
+    rng = np.random.default_rng(1)
+    batch = _train_batch(rng, 64)
+    losses = [model.train_step(*batch) for _ in range(30)]
+    assert all(np.isfinite(loss) for loss in losses), f"non-finite loss: {losses}"
+    assert losses[-1] < losses[0], f"loss did not go down on a fixed batch: {losses}"
+    print(f"✓ train step (loss {losses[0]:.3f} -> {losses[-1]:.3f})")
+
+
+def test_weights_roundtrip():
+    """Weights survive the canonical layout and both file formats."""
     import tempfile
     from pathlib import Path
 
-    import reversi_mcts
-
-    from train.export import export_model
-
-    net = AlphaZeroNet()
-    # A few training-mode passes so the BatchNorm running stats are non-trivial.
+    rng = np.random.default_rng(2)
+    source = create_model()
+    # A few training steps so the BatchNorm running stats are non-trivial.
     for _ in range(3):
-        mx.eval(net(mx.random.normal((16, 4, 8, 8))))
-    mx.eval(net.parameters())
-    net.eval()
+        source.train_step(*_train_batch(rng, 32))
+    weights = source.weights()
+    assert weights["stem.layers.0.weight"].shape == (32, 3, 3, 4), (
+        "canonical conv layout"
+    )
+    assert weights["policy_fc.weight"].shape == (64, 128)
+
+    planes = _random_planes(rng, 8)
+    want_policy, want_value = source.infer(planes)
 
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "model.bin"
-        export_model(net, path)
-        raw = path.read_bytes()
+        for name, save in (
+            ("w.npz", weights_io.save_npz),
+            ("w.bin", weights_io.save_bin),
+        ):
+            path = Path(tmp) / name
+            save(weights, path)
+            target = create_model()
+            applied = target.load_weights(weights_io.load(path))
+            assert applied == len(weights), f"{name}: loaded {applied}/{len(weights)}"
+            got_policy, got_value = target.infer(planes)
+            assert np.allclose(got_policy, want_policy, atol=2e-3), f"{name}: policy"
+            assert np.allclose(got_value, want_value, atol=2e-3), f"{name}: value"
+    print("✓ weights roundtrip (.npz and .bin)")
 
-    rng = np.random.default_rng(0)
-    for _ in range(10):
-        cells = rng.integers(0, 3, size=64)
-        black = sum(1 << i for i in range(64) if cells[i] == 1)
-        white = sum(1 << i for i in range(64) if cells[i] == 2)
-        legal = int(rng.integers(0, 2**63))
-        planes = board_to_planes(black, white, bool(rng.integers(0, 2)), legal)
-        logits, value = net(mx.array(planes[None]))
-        want_policy = np.array(mx.softmax(logits, axis=-1))[0]
+
+def test_rust_inference_matches_backend():
+    """The exported .bin must give the same outputs in Rust (browser bots)."""
+    import reversi_mcts
+
+    rng = np.random.default_rng(3)
+    model = create_model()
+    for _ in range(3):
+        model.train_step(*_train_batch(rng, 32))
+    raw = weights_io.to_bytes(model.weights())
+
+    planes = _random_planes(rng, 10)
+    want_policy, want_value = model.infer(planes)
+    for i in range(len(planes)):
         got_policy, got_value = reversi_mcts.nn_forward(
-            raw, planes.reshape(-1).tolist()
+            raw, planes[i].reshape(-1).tolist()
         )
-        assert np.allclose(got_policy, want_policy, atol=1e-4), "policy mismatch"
-        assert abs(got_value - float(value[0])) < 1e-4, "value mismatch"
-    print("✓ rust inference matches mlx")
+        # Loose enough for half-precision inference on CUDA.
+        assert np.allclose(got_policy, want_policy[i], atol=2e-3), "policy mismatch"
+        assert abs(got_value - float(want_value[i])) < 5e-3, "value mismatch"
+    print("✓ rust inference matches the backend")
 
 
 if __name__ == "__main__":
+    print(f"backend: {backend_name()}")
     test_board_planes()
     test_replay_buffer()
-    test_model_forward()
-    test_compute_loss()
-    test_rust_inference_matches_mlx()
+    test_model_infer()
+    test_train_step()
+    test_weights_roundtrip()
+    test_rust_inference_matches_backend()
     print("All smoke tests passed!")

@@ -2,17 +2,22 @@ import type {
   BotPlayer,
   GameState,
   MoveEval,
+  NetworkBotMeta,
   Position,
   PositionAnalysis,
 } from '@reversi/core';
 import init, { meta, ZeroRevBot as WasmBot } from '../wasm/reversi_zerorev.js';
 
-export interface ZeroRevMeta {
+/** Raw shape of the JSON returned by the WASM `meta()`. */
+interface WasmMeta {
   build_date: string;
-  tournament_score: string;
-  loss: string;
-  input_shape: string;
-  input_features: string[];
+  champion: {
+    run: string;
+    date: string;
+    loss: number | null;
+    win_rate: number | null;
+    backend?: string;
+  };
 }
 
 function toBitboards(state: GameState) {
@@ -38,14 +43,23 @@ function toBitboards(state: GameState) {
   };
 }
 
-export async function createZeroRevBot(name?: string): Promise<BotPlayer> {
+export async function createZeroRevBot(
+  name?: string,
+): Promise<BotPlayer & { meta: NetworkBotMeta }> {
   await init();
   const wasm = new WasmBot();
-  const m: ZeroRevMeta = JSON.parse(meta());
+  const m: WasmMeta = JSON.parse(meta());
   const displayName = name ?? `ZeroRev (${m.build_date})`;
 
   return {
     name: displayName,
+    meta: {
+      buildDate: m.build_date,
+      run: m.champion.run,
+      trainedOn: m.champion.date,
+      loss: m.champion.loss,
+      winRate: m.champion.win_rate,
+    },
 
     async chooseMove(state: GameState, timeLimitMs: number): Promise<Position> {
       const { blackLow, blackHigh, whiteLow, whiteHigh } = toBitboards(state);

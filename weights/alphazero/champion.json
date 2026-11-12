@@ -1,0 +1,7 @@
+{
+  "run": "alphazero",
+  "date": "2026-03-25",
+  "loss": 1.9034,
+  "win_rate": 0.812,
+  "backend": "mlx"
+}

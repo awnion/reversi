@@ -1,9 +1,17 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
+# The network is evaluated once per MCTS simulation in the browser; SIMD128 is
+# supported by every current browser and lets the inner loops vectorise.
+WASM_SIMD = select({
+    "@platforms//cpu:wasm32": ["-Ctarget-feature=+simd128"],
+    "//conditions:default": [],
+})
+
 rust_library(
     name = "nn",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "reversi_nn",
+    rustc_flags = WASM_SIMD,
     visibility = ["//visibility:public"],
 )
 

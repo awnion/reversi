@@ -5,6 +5,8 @@ use reversi_mcts::PLANES_LEN;
 use reversi_mcts::SelfPlayPool;
 use reversi_mcts::StaticEval;
 use reversi_mcts::play_game;
+use reversi_mcts::play_match_from;
+use reversi_mcts::random_opening;
 use reversi_mcts::write_planes;
 use reversi_minimax::board::Board;
 
@@ -210,4 +212,33 @@ fn staggered_pool_ramps_up_and_spreads_finishes() {
     assert_eq!(first_batch, Some(1), "only the first game starts in round 0");
     assert_eq!(max_batch, games, "all games are running after the ramp-up");
     assert!(finish_rounds.len() > games, "games finish in many separate rounds");
+}
+
+// ── matches from random openings ──────────────────────────────────────────
+
+#[test]
+fn random_openings_are_reproducible_and_varied() {
+    let (board, black_to_move) = random_opening(4, 7);
+    assert_eq!((board.black, board.white, black_to_move), {
+        let (b, t) = random_opening(4, 7);
+        (b.black, b.white, t)
+    });
+    assert_eq!((board.black | board.white).count_ones(), 8, "four moves were played");
+    assert!(black_to_move, "black is to move again after four plies");
+
+    let distinct: std::collections::HashSet<(u64, u64)> = (0..32)
+        .map(|seed| {
+            let (b, _) = random_opening(4, seed);
+            (b.black, b.white)
+        })
+        .collect();
+    assert!(distinct.len() > 8, "only {} distinct openings from 32 seeds", distinct.len());
+}
+
+#[test]
+fn match_from_opening_completes() {
+    let eval = StaticEval;
+    let (board, black_to_move) = random_opening(4, 3);
+    let outcome = play_match_from(board, black_to_move, &eval, &eval, 20);
+    assert!([-1.0, 0.0, 1.0].contains(&outcome));
 }

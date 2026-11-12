@@ -17,7 +17,7 @@ def log_event(component: str, message: str, **fields) -> None:
 
 def materialize_record(record) -> tuple[np.ndarray, ...]:
     """Convert a raw self-play record into replay tensor batches."""
-    from .eval_server import board_to_planes
+    from .planes import board_to_planes
 
     planes = []
     policies = []

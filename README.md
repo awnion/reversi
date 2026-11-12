@@ -13,7 +13,7 @@ pipeline by uv:
 - `packages/board-ui` — DOM-based board renderer
 - `packages/bot`, `packages/bot-*` — bot players (the `bot-*` ones wrap the WASM crates)
 - `apps/web` — playable web app (Vite)
-- `python/train` — self-play training (MLX, Apple Silicon)
+- `python/train` — self-play training (MLX on Apple Silicon, PyTorch on Linux/CUDA)
 - `weights/<bot>/` — checkpoints and `champion.bin` per bot
 
 ## Prerequisites
@@ -66,7 +66,8 @@ Rust dependencies: edit `Cargo.toml`, then `cargo update` — Bazel reads
 
 ## AlphaZero training
 
-The AlphaZero bot is trained via self-play using Rust MCTS + Python/MLX neural network.
+The AlphaZero bot is trained via self-play: Rust MCTS plus a neural network in Python (MLX on
+Apple Silicon, PyTorch on Linux/CUDA; checkpoints are interchangeable).
 All training commands run from `python/`:
 
 ```sh

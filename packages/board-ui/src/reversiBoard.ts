@@ -13,6 +13,23 @@ export interface BoardApi {
 interface BoardInternalState {
   state: GameState;
   selected?: Position;
+  /** Index of the disc placed by the most recent move, if any. */
+  lastMove?: number | undefined;
+}
+
+/** The square that was empty in `previous` and holds a disc in `next`. */
+function placedIndex(previous: GameState, next: GameState): number | undefined {
+  let placed: number | undefined;
+  for (let i = 0; i < next.board.length; i += 1) {
+    if (previous.board[i] === null && next.board[i] !== null) {
+      // More than one new disc is not a single move (e.g. a loaded position).
+      if (placed !== undefined) return undefined;
+      placed = i;
+    } else if (previous.board[i] !== null && next.board[i] === null) {
+      return undefined; // discs disappeared: a new game
+    }
+  }
+  return placed;
 }
 
 export function createReversiBoard(
@@ -38,6 +55,11 @@ export function createReversiBoard(
 
   return {
     setState(state) {
+      // A pass keeps the board as is; keep the marker on the last disc placed.
+      const changed = state.board.some(
+        (cell, i) => cell !== internal.state.board[i],
+      );
+      if (changed) internal.lastMove = placedIndex(internal.state, state);
       internal.state = state;
       redraw();
     },
@@ -45,6 +67,7 @@ export function createReversiBoard(
       if (frame) cancelAnimationFrame(frame);
       element.replaceChildren();
       element.classList.remove('rv-board');
+      delete element.dataset.turn;
     },
   };
 }
@@ -55,6 +78,7 @@ function render(
   config: BoardConfig,
 ): void {
   element.replaceChildren();
+  element.dataset.turn = internal.state.currentPlayer;
 
   const fragment = document.createDocumentFragment();
   const legalLookup = new Set(
@@ -73,6 +97,7 @@ function render(
       square.dataset.col = String(col);
       square.setAttribute('aria-label', `row ${row + 1} column ${col + 1}`);
       if (legalLookup.has(keyOf(row, col))) square.dataset.legal = 'true';
+      if (internal.lastMove === row * 8 + col) square.dataset.last = 'true';
       square.addEventListener('click', () => {
         if (legalLookup.has(keyOf(row, col))) config.onMove?.({ row, col });
       });

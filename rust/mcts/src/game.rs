@@ -34,11 +34,55 @@ pub struct GameRecord {
 
 // ── play_game ──────────────────────────────────────────────────────────────
 
+/// The standard Reversi starting position (black to move).
+fn starting_board() -> Board {
+    // Black on d5(35) and e4(28), white on d4(27) and e5(36).
+    Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36))
+}
+
 /// Play one game between two different evaluators.
 /// Returns +1 if black wins, -1 if white wins, 0 if draw.
 pub fn play_match(eval_black: &dyn EvalFn, eval_white: &dyn EvalFn, simulations: u32) -> f32 {
-    let mut board = Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36));
+    play_match_from(starting_board(), true, eval_black, eval_white, simulations)
+}
+
+/// A position reached by `plies` uniformly random legal moves from the start,
+/// as `(board, black_to_move)`. The same `seed` always gives the same
+/// position, so both colour assignments of a pairing can share an opening.
+pub fn random_opening(plies: u32, seed: u64) -> (Board, bool) {
+    let mut rng = SimpleRng::from_seed(seed);
+    let mut board = starting_board();
     let mut is_black = true;
+    for _ in 0..plies {
+        let mut legal = board.legal_moves(is_black);
+        if legal == 0 {
+            is_black = !is_black;
+            legal = board.legal_moves(is_black);
+            if legal == 0 {
+                break;
+            }
+        }
+        // Pick the n-th set bit of `legal`.
+        let n = (rng.next_f32() * legal.count_ones() as f32) as u32;
+        for _ in 0..n.min(legal.count_ones() - 1) {
+            legal &= legal - 1;
+        }
+        board = board.apply_move(is_black, 1u64 << legal.trailing_zeros());
+        is_black = !is_black;
+    }
+    (board, is_black)
+}
+
+/// Play a game from an arbitrary position, deterministically (no noise, the
+/// most visited move is always played).
+/// Returns +1 if black wins, -1 if white wins, 0 if draw.
+pub fn play_match_from(
+    mut board: Board,
+    mut is_black: bool,
+    eval_black: &dyn EvalFn,
+    eval_white: &dyn EvalFn,
+    simulations: u32,
+) -> f32 {
     let mut pass_count = 0;
 
     loop {
@@ -145,6 +189,15 @@ pub(crate) fn sample_move_from_policy(
 pub(crate) struct SimpleRng(u64);
 
 impl SimpleRng {
+    /// A generator with a fixed stream for the given seed.
+    pub(crate) fn from_seed(seed: u64) -> Self {
+        // SplitMix64 finaliser, so that nearby seeds give unrelated streams.
+        let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        SimpleRng((z ^ (z >> 31)) | 1)
+    }
+
     pub(crate) fn new() -> Self {
         // The clock alone is too coarse: a pool creates hundreds of games in
         // the same tick, and equal seeds would make them play identical games.

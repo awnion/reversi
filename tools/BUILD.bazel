@@ -1,15 +1,11 @@
 # Env file consumed by the bot crates via `rustc_env_files`: embeds the build
-# date (and optional tournament score) from tools/workspace_status.sh.
+# date from tools/workspace_status.sh.
 genrule(
     name = "build_env",
     outs = ["build.env"],
     cmd = """
 date=$$(sed -n 's/^STABLE_BUILD_DATE //p' bazel-out/stable-status.txt)
-score=$$(sed -n 's/^STABLE_TOURNAMENT_SCORE //p' bazel-out/stable-status.txt)
-{
-  echo "BUILD_DATE=$${date:-dev}"
-  if [ -n "$$score" ]; then echo "TOURNAMENT_SCORE=$$score"; fi
-} > $@
+echo "BUILD_DATE=$${date:-dev}" > $@
 """,
     stamp = 1,
     visibility = ["//rust:__subpackages__"],

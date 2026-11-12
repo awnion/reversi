@@ -6,14 +6,15 @@ use wasm_bindgen::prelude::*;
 
 static CHAMPION_WEIGHTS: &[u8] = include_bytes!("../../../weights/zerorev/champion.bin");
 
-/// Returns JSON metadata about this compiled champion.
+/// Facts about the embedded champion, written by the trainer next to
+/// `champion.bin` (run, date, loss, tournament win rate).
+static CHAMPION_META: &str = include_str!("../../../weights/zerorev/champion.json");
+
+/// JSON describing this build: `{"build_date": "...", "champion": {...}}`.
 #[wasm_bindgen]
 pub fn meta() -> String {
     let build_date = option_env!("BUILD_DATE").unwrap_or("dev");
-    let tournament_score = option_env!("TOURNAMENT_SCORE").unwrap_or("");
-    format!(
-        r#"{{"build_date":"{build_date}","tournament_score":"{tournament_score}","loss":"policy:CE+LS(0.1)+value:MSE+phase","input_shape":"4x8x8","input_features":["my_pieces","opp_pieces","legal_moves","phase_occupied_64"]}}"#
-    )
+    format!(r#"{{"build_date":"{build_date}","champion":{}}}"#, CHAMPION_META.trim())
 }
 
 struct NnEval {
@@ -93,6 +94,10 @@ impl ZeroRevBot {
         let legal = board.legal_moves(is_black);
         if legal == 0 {
             return -1;
+        }
+        // Nothing to think about.
+        if legal.count_ones() == 1 {
+            return legal.trailing_zeros() as i32;
         }
 
         let mut mcts = MctsSearch::new(board, is_black);
