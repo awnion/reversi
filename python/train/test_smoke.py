@@ -26,8 +26,10 @@ def _train_batch(rng: np.random.Generator, n: int):
     policies = rng.random((n, 64), dtype=np.float32)
     policies /= policies.sum(axis=1, keepdims=True)
     outcomes = rng.choice(np.array([-1.0, 0.0, 1.0], dtype=np.float32), size=n)
+    margins = outcomes * rng.random(n, dtype=np.float32)
+    margins[::4] = np.nan  # older records have no margin
     ones = np.ones(n, dtype=np.float32)
-    return _random_planes(rng, n), policies, outcomes, ones, ones
+    return _random_planes(rng, n), policies, outcomes, margins, ones, ones
 
 
 def test_board_planes():
@@ -53,6 +55,7 @@ def test_replay_buffer():
             "legal": 4,
             "mcts_policy": np.ones(64) / 64,
             "outcome": 1.0,
+            "margin": 0.25,
             "policy_weight": 1.0,
             "value_weight": 1.0,
         }
@@ -60,8 +63,35 @@ def test_replay_buffer():
     buf.add(fake_record)
     assert len(buf) == 1
     sample = buf.sample(1)
-    assert len(sample) == 5
+    assert len(sample) == 6
+    assert sample[3][0] == np.float32(0.25)
     print("✓ replay buffer")
+
+
+def test_symmetries():
+    """A turned position keeps its policy on the same squares."""
+    from train.replay import random_symmetries
+
+    rng = np.random.default_rng(5)
+    planes = _random_planes(rng, 64)
+    # Policy = the legal plane, so it must turn exactly like the planes.
+    policies = planes[:, 2].reshape(64, 64).copy()
+    turned, turned_policies = random_symmetries(planes, policies, rng)
+    assert np.array_equal(turned[:, 2].reshape(64, 64), turned_policies)
+    assert np.array_equal(turned[:, 3], planes[:, 3]), "phase plane is invariant"
+    for i in range(64):
+        assert turned[i, 0].sum() == planes[i, 0].sum()
+    # All 8 symmetries of an asymmetric board are distinct.
+    one = np.zeros((1, 4, 8, 8), dtype=np.float32)
+    one[0, 0, 0, 1] = 1
+    seen = {
+        random_symmetries(one, one[:, 0].reshape(1, 64), np.random.default_rng(s))[
+            0
+        ].tobytes()
+        for s in range(200)
+    }
+    assert len(seen) == 8, f"expected 8 symmetries, saw {len(seen)}"
+    print("✓ board symmetries")
 
 
 def test_model_infer():
@@ -78,7 +108,7 @@ def test_train_step():
     model = create_model()
     rng = np.random.default_rng(1)
     batch = _train_batch(rng, 64)
-    losses = [model.train_step(*batch) for _ in range(30)]
+    losses = [model.train_step(*batch)["loss"] for _ in range(30)]
     assert all(np.isfinite(loss) for loss in losses), f"non-finite loss: {losses}"
     assert losses[-1] < losses[0], f"loss did not go down on a fixed batch: {losses}"
     print(f"✓ train step (loss {losses[0]:.3f} -> {losses[-1]:.3f})")
@@ -145,6 +175,7 @@ if __name__ == "__main__":
     print(f"backend: {backend_name()}")
     test_board_planes()
     test_replay_buffer()
+    test_symmetries()
     test_model_infer()
     test_train_step()
     test_weights_roundtrip()

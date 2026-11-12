@@ -159,6 +159,7 @@ impl Game {
         let board = self.board;
         let black_discs = board.black.count_ones();
         let white_discs = board.white.count_ones();
+        let black_margin = (black_discs as f32 - white_discs as f32) / 64.0;
         let black_outcome: f32 = match black_discs.cmp(&white_discs) {
             std::cmp::Ordering::Greater => 1.0,
             std::cmp::Ordering::Less => -1.0,
@@ -172,6 +173,7 @@ impl Game {
             legal: 0,
             mcts_policy: [0.0; 64],
             outcome: if is_black { black_outcome } else { -black_outcome },
+            margin: if is_black { black_margin } else { -black_margin },
             policy_weight: 0.0,
             value_weight: 2.0,
         };
@@ -183,6 +185,7 @@ impl Game {
                 legal: s.legal,
                 mcts_policy: s.policy,
                 outcome: if s.is_black { black_outcome } else { -black_outcome },
+                margin: if s.is_black { black_margin } else { -black_margin },
                 policy_weight: s.policy_weight,
                 value_weight: s.value_weight,
             })

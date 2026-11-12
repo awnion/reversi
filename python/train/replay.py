@@ -22,6 +22,7 @@ def materialize_record(record) -> tuple[np.ndarray, ...]:
     planes = []
     policies = []
     outcomes = []
+    margins = []
     policy_weights = []
     value_weights = []
     for pos in record:
@@ -35,15 +36,47 @@ def materialize_record(record) -> tuple[np.ndarray, ...]:
         )
         policies.append(pos["mcts_policy"])
         outcomes.append(pos["outcome"])
+        # Records from before the margin was recorded have none: NaN, and the
+        # margin loss skips them.
+        margins.append(pos.get("margin", np.nan))
         policy_weights.append(pos.get("policy_weight", 1.0))
         value_weights.append(pos.get("value_weight", 1.0))
     return (
         np.asarray(planes, dtype=np.float32),
         np.asarray(policies, dtype=np.float32),
         np.asarray(outcomes, dtype=np.float32),
+        np.asarray(margins, dtype=np.float32),
         np.asarray(policy_weights, dtype=np.float32),
         np.asarray(value_weights, dtype=np.float32),
     )
+
+
+def random_symmetries(
+    planes: np.ndarray, policies: np.ndarray, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each position in one of the 8 symmetries of the board, chosen at random.
+
+    The rules do not change under rotations and reflections of the board, so
+    a position and its policy can be turned together; the value and the
+    margin stay the same. Square ``i`` is row ``i // 8``, column ``i % 8`` in
+    both the planes and the policy.
+    """
+    n = len(planes)
+    grid = policies.reshape(n, 8, 8)
+    out_planes = np.empty_like(planes)
+    out_grid = np.empty_like(grid)
+    kinds = rng.integers(0, 8, size=n)
+    for kind in range(8):
+        rows = np.flatnonzero(kinds == kind)
+        if rows.size == 0:
+            continue
+        p, g = planes[rows], grid[rows]
+        if kind & 4:  # reflect in the main diagonal
+            p, g = p.swapaxes(2, 3), g.swapaxes(1, 2)
+        turns = kind & 3
+        out_planes[rows] = np.rot90(p, turns, axes=(2, 3))
+        out_grid[rows] = np.rot90(g, turns, axes=(1, 2))
+    return out_planes, out_grid.reshape(n, 64)
 
 
 class ReplayBuffer:
@@ -51,6 +84,7 @@ class ReplayBuffer:
         self.max_size = max_size
         self._policies = np.zeros((max_size, 64), dtype=np.float32)
         self._outcomes = np.zeros(max_size, dtype=np.float32)
+        self._margins = np.full(max_size, np.nan, dtype=np.float32)
         self._policy_weights = np.ones(max_size, dtype=np.float32)
         self._value_weights = np.ones(max_size, dtype=np.float32)
         # Precomputed input planes: (4, 8, 8) float32 per entry
@@ -59,6 +93,7 @@ class ReplayBuffer:
         self._ptr = 0
         self._size = 0
         self._total_added = 0
+        self._rng = np.random.default_rng()
 
     def add(self, record) -> None:
         """Add all positions from a GameRecord (list of dicts from MctsWorker)."""
@@ -69,6 +104,7 @@ class ReplayBuffer:
         planes: np.ndarray,
         policies: np.ndarray,
         outcomes: np.ndarray,
+        margins: np.ndarray,
         policy_weights: np.ndarray,
         value_weights: np.ndarray,
     ) -> None:
@@ -80,6 +116,7 @@ class ReplayBuffer:
         self._planes[idx] = planes
         self._policies[idx] = policies
         self._outcomes[idx] = outcomes
+        self._margins[idx] = margins
         self._policy_weights[idx] = policy_weights
         self._value_weights[idx] = value_weights
         self._ptr = int((self._ptr + n) % self.max_size)
@@ -101,10 +138,16 @@ class ReplayBuffer:
                 raise ValueError(f"Replay shard missing fields: {path}")
             planes = np.asarray(data["planes"], dtype=np.float32)
             count = int(len(planes))
+            margins = (
+                np.asarray(data["margins"], dtype=np.float32)
+                if "margins" in data.files
+                else np.full(count, np.nan, dtype=np.float32)
+            )
             self.add_samples(
                 planes,
                 np.asarray(data["policies"], dtype=np.float32),
                 np.asarray(data["outcomes"], dtype=np.float32),
+                margins,
                 np.asarray(data["policy_weights"], dtype=np.float32),
                 np.asarray(data["value_weights"], dtype=np.float32),
             )
@@ -112,12 +155,18 @@ class ReplayBuffer:
             path.unlink(missing_ok=True)
         return count
 
-    def sample(self, batch_size: int):
-        idx = np.random.choice(self._size, batch_size, replace=False)
+    def sample(self, batch_size: int, *, symmetries: bool = True):
+        """A random batch: planes, policies, outcomes, margins and the two
+        sample weights; each position turned to a random symmetry."""
+        idx = self._rng.choice(self._size, batch_size, replace=False)
+        planes, policies = self._planes[idx], self._policies[idx]
+        if symmetries:
+            planes, policies = random_symmetries(planes, policies, self._rng)
         return (
-            self._planes[idx],
-            self._policies[idx],
+            planes,
+            policies,
             self._outcomes[idx],
+            self._margins[idx],
             self._policy_weights[idx],
             self._value_weights[idx],
         )
@@ -132,6 +181,7 @@ class ReplayBuffer:
                 f,
                 policies=self._policies[: self._size],
                 outcomes=self._outcomes[: self._size],
+                margins=self._margins[: self._size],
                 policy_weights=self._policy_weights[: self._size],
                 value_weights=self._value_weights[: self._size],
                 planes=self._planes[: self._size],
@@ -179,6 +229,8 @@ class ReplayBuffer:
                     return
                 self._policies[:n] = data["policies"][:n]
                 self._outcomes[:n] = data["outcomes"][:n]
+                if "margins" in data:
+                    self._margins[:n] = data["margins"][:n]
                 self._policy_weights[:n] = data["policy_weights"][:n]
                 self._value_weights[:n] = data["value_weights"][:n]
                 self._size = n

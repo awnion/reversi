@@ -107,22 +107,21 @@ tail -f /tmp/reversi_train.log
 Training runs continuously and:
 
 - Waits until 30 000 positions are collected before starting gradient updates
-- Uses 80 MCTS simulations per move during self-play
-- Rate-limits training to 1 gradient step per 10 new positions (prevents overfitting)
-- Uses AdamW (`lr=3e-4`, `weight_decay=1e-4`) with step-decay ×0.1 every 5 000 steps
-- Policy targets use label smoothing (ε=0.1) to prevent memorisation of peaked MCTS distributions;
-  loss floor with smoothing is ~0.69, healthy training range is 0.70–0.80
-- Auto-resumes from `weights/champion.bin` on restart; falls back to the latest checkpoint in `weights/`
-- Stores the legal-move bitmask in replay so training sees the same spatial planes as self-play/eval
-- Adds a phase feature (`occupied_count / 64`) so the net can distinguish opening from endgame
-- Adds value-only endgame samples for forced last moves and terminal boards
+- Uses 200 MCTS simulations per move during self-play, always with the newest weights
+- Does 1 gradient step (batch 512) per 100 new positions, so each position is
+  trained on about 5 times
+- Turns every training position to a random one of the 8 symmetries of the board
+- Learns the move policy, the game result and the final disc margin
+  (an auxiliary head, not used by the bots)
+- Uses AdamW with a learning-rate schedule of a short warmup and three long
+  constant stages (`LR_STAGES` in `train/loop.py`); the schedule's start is
+  kept in `weights/<run>/lr_schedule.json`, so restarts continue it
+- Logs the loss and its parts: `policy_kl` (the part of the policy loss that
+  can still go down), `value` and `margin`
 - Self-play uses stochastic openings (root noise + sampling from visit counts in the early game)
-- Saves checkpoints to `weights/iter_<step>_loss<value>.npz`
-- Runs a **mini-tournament** every 3 000 steps: `champion.bin`, the current model,
-  and 2 recent checkpoints play a small round-robin (8 games per pairing)
-- If the winner is not the current champion and scores at least 55 % of the maximum points,
-  it becomes the new champion automatically
-- Keeps the last 5 champions with date and win-rate in `weights/champions/history.json`
+- Every 50 000 steps plays the current network against `champion.bin` (200 games);
+  it becomes the new champion with at least 55 % of the points
+- Keeps the last 5 champions with date and win-rate in `weights/<run>/champions/history.json`
 
 ### Run tournament (manual)
 

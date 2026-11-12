@@ -1,7 +1,12 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from .backend.common import MARGIN_LOSS_WEIGHT
 from .model import AlphaZeroNet
+
+
+def _mean(per_sample, weights):
+    return mx.sum(per_sample * weights) / mx.maximum(mx.sum(weights), mx.array(1.0))
 
 
 def compute_loss(
@@ -9,6 +14,7 @@ def compute_loss(
     x,
     policy_targets,
     value_targets,
+    margin_targets,
     policy_weights,
     value_weights,
     phase,
@@ -18,23 +24,26 @@ def compute_loss(
     x: (batch_size, 4, 8, 8) — input planes
     policy_targets: (batch_size, 64) — smoothed MCTS targets
     value_targets: (batch_size,) — game outcomes
+    margin_targets: (batch_size,) — final disc margin / 64, NaN when unknown
     policy_weights, value_weights: (batch_size,) — per-sample weights
     phase: (batch_size,) — game progress 0..1
 
-    Returns scalar loss.
+    Returns the total loss, then the policy, value and margin losses.
     """
-    policy_logits, values = model(x)  # (batch_size, 64), (batch_size,)
+    policy_logits, values, margins = model(x)
 
     # Policy loss: cross-entropy with label smoothing
     log_probs = nn.log_softmax(policy_logits, axis=-1)
-    policy_loss_per = -mx.sum(policy_targets * log_probs, axis=-1)
-    policy_norm = mx.maximum(mx.sum(policy_weights), mx.array(1.0))
-    policy_loss = mx.sum(policy_loss_per * policy_weights) / policy_norm
+    policy_loss = _mean(-mx.sum(policy_targets * log_probs, axis=-1), policy_weights)
 
     # Value loss: MSE with phase-weighted samples
     value_weights = value_weights * (0.5 + 1.5 * phase)
-    value_loss_per = (values - value_targets) ** 2
-    value_norm = mx.maximum(mx.sum(value_weights), mx.array(1.0))
-    value_loss = mx.sum(value_loss_per * value_weights) / value_norm
+    value_loss = _mean((values - value_targets) ** 2, value_weights)
 
-    return policy_loss + value_loss
+    # Margin loss, on the samples whose margin is known
+    known = mx.logical_not(mx.isnan(margin_targets))
+    margin_targets = mx.where(known, margin_targets, 0.0)
+    margin_loss = _mean((margins - margin_targets) ** 2, value_weights * known)
+
+    total = policy_loss + value_loss + MARGIN_LOSS_WEIGHT * margin_loss
+    return total, policy_loss, value_loss, margin_loss

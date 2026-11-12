@@ -42,16 +42,22 @@ BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
 MIN_REPLAY = 30_000
-# Only do 1 gradient step per TRAIN_RATIO new positions added.
-TRAIN_RATIO = 10
+# Only do 1 gradient step per TRAIN_RATIO new positions added. With batches
+# of BATCH_SIZE this is the sample reuse: each position is trained on about
+# BATCH_SIZE / TRAIN_RATIO times (512 / 100 ≈ 5). Far more, and the network
+# memorises the latest games instead of learning from them.
+TRAIN_RATIO = 100
 # Cap on training steps owed to already-ingested positions.
 MAX_PENDING_STEPS = 1_000
 CHECKPOINT_EVERY = 500
 KEEP_CHECKPOINTS = 20
 LOG_EVERY = 100
-LR_DECAY_EVERY = 5_000  # multiply LR by LR_DECAY_FACTOR every N steps
-LR_DECAY_FACTOR = 0.5
-LR_MIN = 1e-5
+# Learning-rate schedule: a short warmup, then a few long constant stages,
+# counted from the step at which this schedule started for the run (kept in
+# LR_ORIGIN_FILE, so restarts continue it). The old step decay halved the
+# rate every 5k steps and sat at its floor for almost the whole run.
+LR_WARMUP_STEPS = 1_000
+LR_STAGES = ((0, BASE_LEARNING_RATE), (300_000, 1e-4), (800_000, 3e-5))
 _WEIGHTS_BASE = Path(__file__).parent.parent.parent / "weights"
 
 WEIGHTS_DIR = _WEIGHTS_BASE / "alphazero"  # replaced by _apply_run_name() before use
@@ -63,11 +69,14 @@ CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 SELFPLAY_GAMES = 1024
 
 # Tournament settings
-TOURNAMENT_EVERY = 3_000  # run a mini-tournament every N training steps
-TOURNAMENT_POOL_CHECKPOINTS = 2  # recent checkpoints to include with champion/current
-# Games for each pairing. Every random opening is played twice with colours
+# Self-play always uses the newest weights; the champion (what the browser
+# plays, what `just snapshot` fetches) changes only after a long match shows
+# the current network is stronger. 18 games a minute were mostly noise.
+TOURNAMENT_EVERY = 50_000  # training steps between matches (a couple of hours)
+TOURNAMENT_POOL_CHECKPOINTS = 0  # current vs champion only
+# Games in the match. Every random opening is played twice with colours
 # swapped, so keep this even.
-TOURNAMENT_GAMES_PER_PAIR = 6
+TOURNAMENT_GAMES_PER_PAIR = 200
 TOURNAMENT_SIMS = 200  # MCTS simulations per move in tournament
 TOURNAMENT_OPENING_PLIES = 4  # random moves before the engines take over
 # Tournament games run on CPU threads; leave cores for self-play and training.
@@ -85,6 +94,8 @@ SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
 # self-play processes pause for as long as it exists.
 COOLDOWN_FLAG = WEIGHTS_DIR / "cooldown"
 COOLDOWN_MAX_SECONDS = 300.0
+# The step at which the learning-rate schedule started (see LR_STAGES).
+LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
 # Facts about champion.bin (run, date, loss, win rate, training step).
 CHAMPION_META = WEIGHTS_DIR / "champion.json"
 
@@ -93,6 +104,7 @@ def _apply_run_name(name: str) -> None:
     """Point all path globals at weights/<name>/."""
     global WEIGHTS_DIR, CHAMPION_BIN, REPLAY_PATH, PID_FILE
     global REPLAY_SPOOL_DIR, SELFPLAY_MODEL_BIN, COOLDOWN_FLAG, CHAMPION_META
+    global LR_ORIGIN_FILE
     WEIGHTS_DIR = _WEIGHTS_BASE / name
     CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
     REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
@@ -101,6 +113,7 @@ def _apply_run_name(name: str) -> None:
     SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
     COOLDOWN_FLAG = WEIGHTS_DIR / "cooldown"
     CHAMPION_META = WEIGHTS_DIR / "champion.json"
+    LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
 
 
 # One process already fills the GPU with large batches; more processes only
@@ -118,10 +131,24 @@ def log_event(component: str, message: str, **fields) -> None:
     print(f"{stamp} [{component}] {message}{suffix}", flush=True)
 
 
-def _learning_rate_at(step: int) -> float:
-    """Step-decayed learning rate for a given training step."""
-    decay = LR_DECAY_FACTOR ** (step // LR_DECAY_EVERY)
-    return max(BASE_LEARNING_RATE * decay, LR_MIN)
+def _learning_rate_at(steps: int) -> float:
+    """Learning rate after `steps` steps of the current schedule."""
+    rate = LR_STAGES[0][1]
+    for start, stage_rate in LR_STAGES:
+        if steps >= start:
+            rate = stage_rate
+    if steps < LR_WARMUP_STEPS:
+        rate *= 0.1 + 0.9 * steps / LR_WARMUP_STEPS
+    return rate
+
+
+def _lr_origin(step: int) -> int:
+    """The step this run's schedule started at; recorded on first use."""
+    try:
+        return int(json.loads(LR_ORIGIN_FILE.read_text())["origin"])
+    except (OSError, ValueError, KeyError, TypeError):
+        LR_ORIGIN_FILE.write_text(json.dumps({"origin": step}) + "\n")
+        return step
 
 
 def _champion_meta() -> dict:
@@ -184,7 +211,12 @@ async def train_loop(
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     step, best_loss = _load_best_checkpoint(model)
     # A resumed run continues its schedule instead of starting over.
-    model.set_learning_rate(_learning_rate_at(step))
+    lr_origin = _lr_origin(step)
+    learning_rate = _learning_rate_at(step - lr_origin)
+    model.set_learning_rate(learning_rate)
+    log_event("train", "lr", step=step, origin=lr_origin, lr=f"{learning_rate:.2e}")
+    # Matches are counted from here, not from step 0.
+    next_tournament_step[0] = step + TOURNAMENT_EVERY
     replay_at_last_step = replay.total_added
     _publish_selfplay_weights(model.weights())
 
@@ -244,15 +276,17 @@ async def train_loop(
         step_started = time.monotonic()
         batch = replay.sample(BATCH_SIZE)
         with lock:
-            loss_val = model.train_step(*batch)
+            metrics = model.train_step(*batch)
+        loss_val = metrics["loss"]
         step += 1
         step_seconds = time.monotonic() - step_started
 
-        # Step-based LR decay
-        if step % LR_DECAY_EVERY == 0:
-            new_lr = _learning_rate_at(step)
-            model.set_learning_rate(new_lr)
-            log_event("train", "lr-decay", step=step, lr=f"{new_lr:.2e}")
+        new_lr = _learning_rate_at(step - lr_origin)
+        if new_lr != learning_rate:
+            learning_rate = new_lr
+            model.set_learning_rate(learning_rate)
+            if step - lr_origin >= LR_WARMUP_STEPS:
+                log_event("train", "lr", step=step, lr=f"{learning_rate:.2e}")
 
         if math.isnan(loss_val):
             log_event("train", "nan-loss", step=step)
@@ -267,6 +301,11 @@ async def train_loop(
                 "step",
                 step=step,
                 loss=f"{loss_val:.4f}",
+                # The part of the policy loss that can still go down.
+                policy_kl=f"{metrics['policy_kl']:.4f}",
+                value=f"{metrics['value']:.4f}",
+                margin=f"{metrics['margin']:.4f}",
+                lr=f"{learning_rate:.1e}",
                 replay=len(replay),
                 **({"sps": f"{sps:.1f}"} if sps is not None else {}),
                 **({"temp": governor.describe()} if governor.available else {}),

@@ -8,7 +8,13 @@ import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
 from ..weights import Weights
-from .common import BASE_LEARNING_RATE, GRAD_CLIP_NORM, LABEL_SMOOTHING, WEIGHT_DECAY
+from .common import (
+    BASE_LEARNING_RATE,
+    GRAD_CLIP_NORM,
+    LABEL_SMOOTHING,
+    MARGIN_LOSS_WEIGHT,
+    WEIGHT_DECAY,
+)
 
 
 class _ResBlock(nn.Module):
@@ -42,6 +48,9 @@ class _Net(nn.Module):
         self.value_bn = nn.BatchNorm2d(1)
         self.value_fc1 = nn.Linear(64, 64)
         self.value_fc2 = nn.Linear(64, 1)
+        # Auxiliary head: the final disc margin. Training only; the Rust
+        # inference ignores it.
+        self.margin_fc = nn.Linear(64, 1)
 
     def forward(self, x):
         x = self.stem(x)
@@ -51,8 +60,10 @@ class _Net(nn.Module):
         # Flatten as (H, W, C): the canonical layout of `policy_fc`.
         p = self.policy_fc(p.permute(0, 2, 3, 1).flatten(1))
         v = F.relu(self.value_bn(self.value_conv(x))).flatten(1)
-        v = torch.tanh(self.value_fc2(F.relu(self.value_fc1(v))))
-        return p, v.squeeze(-1)
+        hidden = F.relu(self.value_fc1(v))
+        v = torch.tanh(self.value_fc2(hidden))
+        m = torch.tanh(self.margin_fc(hidden))
+        return p, v.squeeze(-1), m.squeeze(-1)
 
 
 def _canonical_name(name: str) -> str:
@@ -125,7 +136,7 @@ class TorchModel:
             # Half precision roughly doubles inference throughput on CUDA.
             torch.autocast("cuda", dtype=torch.float16, enabled=self._cuda),
         ):
-            logits, values = self.net(self._input(planes))
+            logits, values, _ = self.net(self._input(planes))
         policies = F.softmax(logits.float(), dim=-1)
         return policies.cpu().numpy(), values.float().cpu().numpy()
 
@@ -134,9 +145,10 @@ class TorchModel:
         planes: np.ndarray,
         policies: np.ndarray,
         outcomes: np.ndarray,
+        margins: np.ndarray,
         policy_weights: np.ndarray,
         value_weights: np.ndarray,
-    ) -> float:
+    ) -> dict[str, float]:
         self.net.train()
 
         def tensor(a: np.ndarray) -> torch.Tensor:
@@ -150,22 +162,40 @@ class TorchModel:
             policies
         ) + LABEL_SMOOTHING / 64.0
         value_targets = tensor(outcomes)
+        margin_targets = tensor(margins)
+        known_margin = torch.isfinite(margin_targets)
+        margin_targets = torch.where(known_margin, margin_targets, 0.0)
         policy_w = tensor(policy_weights)
         value_w = tensor(value_weights) * (0.5 + 1.5 * phase)
+        margin_w = value_w * known_margin
 
-        logits, values = self.net(x)
+        def mean(per_sample, weights):
+            return (per_sample * weights).sum() / weights.sum().clamp(min=1.0)
+
+        logits, values, margin = self.net(x)
         policy_loss_per = -(policy_targets * F.log_softmax(logits, dim=-1)).sum(dim=-1)
-        policy_loss = (policy_loss_per * policy_w).sum() / policy_w.sum().clamp(min=1.0)
-        value_loss = (
-            (values - value_targets) ** 2 * value_w
-        ).sum() / value_w.sum().clamp(min=1.0)
-        loss = policy_loss + value_loss
+        policy_loss = mean(policy_loss_per, policy_w)
+        value_loss = mean((values - value_targets) ** 2, value_w)
+        margin_loss = mean((margin - margin_targets) ** 2, margin_w)
+        loss = policy_loss + value_loss + MARGIN_LOSS_WEIGHT * margin_loss
 
         self._optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), GRAD_CLIP_NORM)
         self._optimizer.step()
-        return float(loss.item())
+
+        # The part of the policy loss that can go down: the cross-entropy
+        # minus the entropy of the targets themselves (the KL divergence).
+        with torch.no_grad():
+            target_entropy = -(policy_targets * policy_targets.log()).sum(dim=-1)
+            policy_kl = policy_loss - mean(target_entropy, policy_w)
+        return {
+            "loss": float(loss.item()),
+            "policy": float(policy_loss.item()),
+            "policy_kl": float(policy_kl.item()),
+            "value": float(value_loss.item()),
+            "margin": float(margin_loss.item()),
+        }
 
     def set_learning_rate(self, learning_rate: float) -> None:
         for group in self._optimizer.param_groups:

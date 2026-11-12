@@ -47,7 +47,7 @@ class MlxModel:
 
     def infer(self, planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         self._set_training(False)
-        logits, values = self.net(mx.array(planes))
+        logits, values, _ = self.net(mx.array(planes))
         policies = mx.softmax(logits, axis=-1)
         mx.eval(policies, values)
         return np.array(policies), np.array(values)
@@ -57,28 +57,51 @@ class MlxModel:
         planes: np.ndarray,
         policies: np.ndarray,
         outcomes: np.ndarray,
+        margins: np.ndarray,
         policy_weights: np.ndarray,
         value_weights: np.ndarray,
-    ) -> float:
+    ) -> dict[str, float]:
         self._set_training(True)
         x = mx.array(np.asarray(planes, dtype=np.float32))
         phase = x[:, 3, 0, 0]
         policy_targets = (1.0 - LABEL_SMOOTHING) * mx.array(
             policies
         ) + LABEL_SMOOTHING / 64.0
-        loss, grads = self._loss_and_grad(
+        policy_w = mx.array(policy_weights)
+        (loss, policy_loss, value_loss, margin_loss), grads = self._loss_and_grad(
             self.net,
             x,
             policy_targets,
             mx.array(outcomes),
-            mx.array(policy_weights),
+            mx.array(margins),
+            policy_w,
             mx.array(value_weights),
             phase,
         )
         grads, _ = optim.clip_grad_norm(grads, max_norm=GRAD_CLIP_NORM)
         self._optimizer.update(self.net, grads)
-        mx.eval(self.net.parameters(), self._optimizer.state, loss)
-        return loss.item()
+        # The part of the policy loss that can go down: the cross-entropy
+        # minus the entropy of the targets themselves (the KL divergence).
+        entropy = -mx.sum(policy_targets * mx.log(policy_targets), axis=-1)
+        target_entropy = mx.sum(entropy * policy_w) / mx.maximum(
+            mx.sum(policy_w), mx.array(1.0)
+        )
+        mx.eval(
+            self.net.parameters(),
+            self._optimizer.state,
+            loss,
+            policy_loss,
+            value_loss,
+            margin_loss,
+            target_entropy,
+        )
+        return {
+            "loss": loss.item(),
+            "policy": policy_loss.item(),
+            "policy_kl": policy_loss.item() - target_entropy.item(),
+            "value": value_loss.item(),
+            "margin": margin_loss.item(),
+        }
 
     def set_learning_rate(self, learning_rate: float) -> None:
         self._optimizer.learning_rate = mx.array(learning_rate)

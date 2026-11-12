@@ -25,14 +25,15 @@ class ReplayShardWriter:
         self._planes: list[np.ndarray] = []
         self._policies: list[np.ndarray] = []
         self._outcomes: list[np.ndarray] = []
+        self._margins: list[np.ndarray] = []
         self._policy_weights: list[np.ndarray] = []
         self._value_weights: list[np.ndarray] = []
         self._positions = 0
         self._lock = Lock()
 
     def add_record(self, record) -> int:
-        planes, policies, outcomes, policy_weights, value_weights = materialize_record(
-            record
+        planes, policies, outcomes, margins, policy_weights, value_weights = (
+            materialize_record(record)
         )
         count = int(len(planes))
         if count == 0:
@@ -42,6 +43,7 @@ class ReplayShardWriter:
             self._planes.append(planes)
             self._policies.append(policies)
             self._outcomes.append(outcomes)
+            self._margins.append(margins)
             self._policy_weights.append(policy_weights)
             self._value_weights.append(value_weights)
             self._positions += count
@@ -58,11 +60,13 @@ class ReplayShardWriter:
             planes = np.concatenate(self._planes, axis=0)
             policies = np.concatenate(self._policies, axis=0)
             outcomes = np.concatenate(self._outcomes, axis=0)
+            margins = np.concatenate(self._margins, axis=0)
             policy_weights = np.concatenate(self._policy_weights, axis=0)
             value_weights = np.concatenate(self._value_weights, axis=0)
             self._planes.clear()
             self._policies.clear()
             self._outcomes.clear()
+            self._margins.clear()
             self._policy_weights.clear()
             self._value_weights.clear()
             self._positions = 0
@@ -76,6 +80,7 @@ class ReplayShardWriter:
                 planes=planes,
                 policies=policies,
                 outcomes=outcomes,
+                margins=margins,
                 policy_weights=policy_weights,
                 value_weights=value_weights,
             )

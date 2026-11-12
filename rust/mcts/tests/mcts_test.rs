@@ -140,6 +140,10 @@ fn pool_produces_valid_games() {
         for pos in &record.positions {
             let expected = if pos.is_black { black_outcome } else { -black_outcome };
             assert_eq!(pos.outcome, expected);
+            let black_margin = (record.black_discs as f32 - record.white_discs as f32) / 64.0;
+            let margin = if pos.is_black { black_margin } else { -black_margin };
+            assert_eq!(pos.margin, margin);
+            assert_eq!(pos.margin.signum() * pos.outcome.abs(), pos.outcome);
             if pos.policy_weight > 0.0 {
                 let sum: f32 = pos.mcts_policy.iter().sum();
                 assert!((sum - 1.0).abs() < 1e-5, "policy sum = {sum}");

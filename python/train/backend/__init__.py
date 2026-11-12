@@ -42,10 +42,16 @@ class Model(Protocol):
         planes: np.ndarray,
         policies: np.ndarray,
         outcomes: np.ndarray,
+        margins: np.ndarray,
         policy_weights: np.ndarray,
         value_weights: np.ndarray,
-    ) -> float:
-        """One optimizer step on a batch; returns the loss."""
+    ) -> dict[str, float]:
+        """One optimizer step on a batch.
+
+        Returns the total ``loss`` and its parts: ``policy`` (cross-entropy),
+        ``policy_kl`` (the same minus the entropy of the targets, the part
+        that can still go down), ``value`` and ``margin``.
+        """
 
     def set_learning_rate(self, learning_rate: float) -> None: ...
 

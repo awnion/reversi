@@ -35,6 +35,9 @@ class AlphaZeroNet(nn.Module):
         self.value_bn = nn.BatchNorm(1)
         self.value_fc1 = nn.Linear(64, 64)
         self.value_fc2 = nn.Linear(64, 1)
+        # Auxiliary head: the final disc margin. Training only; the Rust
+        # inference ignores it.
+        self.margin_fc = nn.Linear(64, 1)
 
     def __call__(self, x):
         # Input planes: my pieces, opp pieces, legal moves, phase.
@@ -49,6 +52,7 @@ class AlphaZeroNet(nn.Module):
         # Value
         v = nn.relu(self.value_bn(self.value_conv(x)))  # (B, 8, 8, 1)
         v = v.reshape(v.shape[0], -1)  # (B, 64)
-        v = nn.relu(self.value_fc1(v))
-        v = mx.tanh(self.value_fc2(v))  # (B, 1)
-        return p, v.squeeze(-1)
+        hidden = nn.relu(self.value_fc1(v))
+        v = mx.tanh(self.value_fc2(hidden))  # (B, 1)
+        m = mx.tanh(self.margin_fc(hidden))  # (B, 1)
+        return p, v.squeeze(-1), m.squeeze(-1)

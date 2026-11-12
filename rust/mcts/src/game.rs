@@ -20,6 +20,8 @@ pub struct PositionRecord {
     pub mcts_policy: [f32; 64],
     /// Game outcome from this player's perspective: +1 win, -1 loss, 0 draw.
     pub outcome: f32,
+    /// Final disc difference from this player's perspective, divided by 64.
+    pub margin: f32,
     pub policy_weight: f32,
     pub value_weight: f32,
 }
