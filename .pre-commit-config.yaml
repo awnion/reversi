@@ -7,14 +7,14 @@ repos:
       # ── Rust ──────────────────────────────────────────────────────────────
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --manifest-path rust/minimax/Cargo.toml -- --check
+        entry: cargo fmt --all -- --check
         language: system
         types: [rust]
         pass_filenames: false
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --manifest-path rust/minimax/Cargo.toml -- -D warnings
+        entry: bazel build --config=clippy //rust/...
         language: system
         types: [rust]
         pass_filenames: false

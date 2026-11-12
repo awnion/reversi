@@ -30,8 +30,9 @@ from .export import MAGIC, VERSION, export_model
 from .loop import _load_compatible_weights, _record_champion
 from .model import AlphaZeroNet
 
-WEIGHTS_DIR = Path(__file__).parent.parent.parent / "weights"
-REPO_ROOT = WEIGHTS_DIR.parent
+_WEIGHTS_BASE = Path(__file__).parent.parent.parent / "weights"
+REPO_ROOT = _WEIGHTS_BASE.parent
+WEIGHTS_DIR = _WEIGHTS_BASE / "alphazero"  # replaced by --run-name before use
 CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 
 
@@ -159,6 +160,12 @@ def run_tournament(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        required=True,
+        help="Named run; reads weights from weights/<run-name>/",
+    )
     parser.add_argument("--top", type=int, default=10, help="Top N checkpoints by loss")
     parser.add_argument(
         "--games", type=int, default=2, help="Games per pair (use even number)"
@@ -175,6 +182,10 @@ def main():
         help="Exclude the current champion.bin from the tournament",
     )
     args = parser.parse_args()
+
+    global WEIGHTS_DIR, CHAMPION_BIN
+    WEIGHTS_DIR = _WEIGHTS_BASE / args.run_name
+    CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 
     def _loss(p: Path) -> float:
         try:
@@ -237,7 +248,7 @@ def main():
     # Rebuild WASM
     print("Rebuilding WASM...")
     subprocess.run(
-        ["bun", "--filter", "@reversi/bot-alphazero", "build:wasm"],
+        ["bun", "run", "build:wasm"],
         cwd=REPO_ROOT,
         check=True,
     )

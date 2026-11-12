@@ -6,14 +6,14 @@ use reversi_nn::AlphaZeroNet;
 use wasm_bindgen::prelude::*;
 
 // Embed champion weights at compile time.
-static CHAMPION_WEIGHTS: &[u8] = include_bytes!("../../../weights/champion.bin");
+static CHAMPION_WEIGHTS: &[u8] = include_bytes!("../../../weights/alphazero/champion.bin");
 
 /// Returns JSON metadata about this compiled champion.
 /// Known-static fields are hardcoded; champion-specific fields
 /// are embedded at build time via env vars (empty string if unset).
 #[wasm_bindgen]
 pub fn meta() -> String {
-    let build_date = env!("BUILD_DATE");
+    let build_date = option_env!("BUILD_DATE").unwrap_or("dev");
     let tournament_score = option_env!("TOURNAMENT_SCORE").unwrap_or("");
     format!(
         r#"{{"build_date":"{build_date}","tournament_score":"{tournament_score}","loss":"policy:CE+LS(0.1)+value:MSE+phase","input_shape":"4x8x8","input_features":["my_pieces","opp_pieces","legal_moves","phase_occupied_64"]}}"#

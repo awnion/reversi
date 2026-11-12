@@ -1,0 +1,30 @@
+module(name = "reversi")
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_rust", version = "0.75.0")
+bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.75.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    extra_target_triples = ["wasm32-unknown-unknown"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+        "//rust/alphazero:Cargo.toml",
+        "//rust/mcts:Cargo.toml",
+        "//rust/minimax:Cargo.toml",
+        "//rust/nn:Cargo.toml",
+        "//rust/zerorev:Cargo.toml",
+    ],
+)
+use_repo(crate, "crates")

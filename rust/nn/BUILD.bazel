@@ -1,0 +1,24 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "nn",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "reversi_nn",
+    visibility = ["//visibility:public"],
+)
+
+# Same crate with `AlphaZeroNet::zeros()` enabled, for tests only.
+rust_library(
+    name = "nn_test_utils",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["test-utils"],
+    crate_name = "reversi_nn",
+    visibility = ["//rust:__subpackages__"],
+)
+
+rust_test(
+    name = "nn_test",
+    srcs = ["tests/nn_test.rs"],
+    deps = [":nn_test_utils"],
+)

@@ -14,19 +14,25 @@ export class BotWorkerPool {
   private worker: Worker;
   private pending = new Map<number, PendingEntry>();
   private idCounter = 0;
-  readonly ready: Promise<{ alphazeroName: string }>;
+  readonly ready: Promise<{ alphazeroName: string; zerorevName: string }>;
 
   constructor() {
     this.worker = new Worker(new URL('./botWorker.ts', import.meta.url), {
       type: 'module',
     });
-    let resolveReady!: (value: { alphazeroName: string }) => void;
+    let resolveReady!: (value: {
+      alphazeroName: string;
+      zerorevName: string;
+    }) => void;
     this.ready = new Promise((res) => {
       resolveReady = res;
     });
     this.worker.addEventListener('message', (e: MessageEvent) => {
       if (e.data.type === 'ready') {
-        resolveReady({ alphazeroName: e.data.alphazeroName as string });
+        resolveReady({
+          alphazeroName: e.data.alphazeroName as string,
+          zerorevName: e.data.zerorevName as string,
+        });
         return;
       }
       const entry = this.pending.get(e.data.id as number);
@@ -41,7 +47,7 @@ export class BotWorkerPool {
   }
 
   request(
-    bot: 'minimax' | 'alphazero',
+    bot: 'minimax' | 'alphazero' | 'zerorev',
     action: 'chooseMove' | 'analyzePosition',
     state: GameState,
     thinkMs: number,
@@ -63,7 +69,7 @@ export class BotWorkerPool {
 
 export function createWorkerBot(
   pool: BotWorkerPool,
-  botType: 'minimax' | 'alphazero',
+  botType: 'minimax' | 'alphazero' | 'zerorev',
   name: string,
 ): BotPlayer {
   return {

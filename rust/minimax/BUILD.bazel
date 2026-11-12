@@ -1,0 +1,39 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_test")
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
+
+DEPS = [
+    "@crates//:console_error_panic_hook",
+    "@crates//:js-sys",
+    "@crates//:wasm-bindgen",
+]
+
+rust_library(
+    name = "minimax",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "reversi_minimax",
+    visibility = ["//visibility:public"],
+    deps = DEPS,
+)
+
+# cdylib for wasm32; see :wasm.
+rust_shared_library(
+    name = "minimax_cdylib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "reversi_minimax",
+    deps = DEPS,
+)
+
+rust_test(
+    name = "board_test",
+    srcs = ["tests/board_test.rs"],
+    deps = [":minimax"],
+)
+
+# JS glue + .wasm for the browser, in bazel-bin/rust/minimax/wasm/.
+# `bun run build:wasm` copies it to packages/bot-minimax/wasm/.
+rust_wasm_bindgen(
+    name = "wasm",
+    out_name = "reversi_minimax",
+    target = "web",
+    wasm_file = ":minimax_cdylib",
+)

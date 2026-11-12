@@ -41,7 +41,7 @@ from .replay_spool import ReplayShardWriter, ingest_replay_shards
 
 # --- hyper-parameters --------------------------------------------------------
 
-SIMULATIONS = 3000
+SIMULATIONS = 200
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
@@ -55,7 +55,9 @@ BASE_LR = 3e-4
 LR_DECAY_EVERY = 5_000  # multiply LR by LR_DECAY_FACTOR every N steps
 LR_DECAY_FACTOR = 0.5
 LR_MIN = 1e-5
-WEIGHTS_DIR = Path(__file__).parent.parent.parent / "weights"
+_WEIGHTS_BASE = Path(__file__).parent.parent.parent / "weights"
+
+WEIGHTS_DIR = _WEIGHTS_BASE / "alphazero"  # replaced by _apply_run_name() before use
 CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 
 # Workers block on threading.Event.wait() (GIL released) most of the time,
@@ -79,6 +81,20 @@ REPLAY_SAVE_EVERY = 1_000  # save replay buffer every N training steps
 PID_FILE = WEIGHTS_DIR / "train.pid"
 REPLAY_SPOOL_DIR = WEIGHTS_DIR / "replay_spool"
 SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
+
+
+def _apply_run_name(name: str) -> None:
+    """Point all path globals at weights/<name>/."""
+    global WEIGHTS_DIR, CHAMPION_BIN, REPLAY_PATH, PID_FILE
+    global REPLAY_SPOOL_DIR, SELFPLAY_MODEL_BIN
+    WEIGHTS_DIR = _WEIGHTS_BASE / name
+    CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
+    REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
+    PID_FILE = WEIGHTS_DIR / "train.pid"
+    REPLAY_SPOOL_DIR = WEIGHTS_DIR / "replay_spool"
+    SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
+
+
 DEFAULT_SELFPLAY_PROCESSES = max(1, os.cpu_count() // 2)
 DEFAULT_SHARD_POSITIONS = 4_096
 WEIGHT_REFRESH_GAMES = 5
@@ -609,7 +625,9 @@ def _record_champion(
                 old_path.unlink()
                 log_event("champion", "pruned", file=old["file"])
 
-    history_file.write_text(json.dumps(history, indent=2))
+    with history_file.open("w") as f:
+        json.dump(history, f, indent=2)
+        f.write("\n")
 
 
 # --- checkpoint helpers ------------------------------------------------------
@@ -766,6 +784,7 @@ def _spawn_selfplay_processes(
     count: int,
     workers_per_process: int,
     positions_per_shard: int,
+    run_name: str,
 ) -> list[subprocess.Popen]:
     children: list[subprocess.Popen] = []
     for process_index in range(count):
@@ -781,6 +800,8 @@ def _spawn_selfplay_processes(
             str(workers_per_process),
             "--positions-per-shard",
             str(positions_per_shard),
+            "--run-name",
+            run_name,
         ]
         child = subprocess.Popen(cmd)
         children.append(child)
@@ -906,6 +927,7 @@ async def _run_learner(
     selfplay_processes: int,
     selfplay_workers: int,
     positions_per_shard: int,
+    run_name: str,
     inline_workers: int = 0,
 ) -> None:
     # Guard against duplicate instances
@@ -974,7 +996,7 @@ async def _run_learner(
 
     if selfplay_processes > 0:
         children = _spawn_selfplay_processes(
-            selfplay_processes, selfplay_workers, positions_per_shard
+            selfplay_processes, selfplay_workers, positions_per_shard, run_name
         )
 
     try:
@@ -1020,11 +1042,18 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_SHARD_POSITIONS,
     )
     parser.add_argument("--process-index", type=int, default=0)
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        required=True,
+        help="Named run; weights go to weights/<run-name>/",
+    )
     return parser.parse_args()
 
 
 async def main() -> None:
     args = _parse_args()
+    _apply_run_name(args.run_name)
     workers = args.selfplay_workers
     if workers is None:
         workers = _default_selfplay_workers(args.selfplay_processes)
@@ -1039,6 +1068,7 @@ async def main() -> None:
         selfplay_processes=args.selfplay_processes,
         selfplay_workers=workers,
         positions_per_shard=args.positions_per_shard,
+        run_name=args.run_name,
         inline_workers=args.inline_workers,
     )
 

@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "mcts",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/py.rs"],
+    ),
+    crate_name = "reversi_mcts",
+    visibility = ["//visibility:public"],
+    deps = ["//rust/minimax"],
+)
+
+rust_test(
+    name = "mcts_test",
+    srcs = ["tests/mcts_test.rs"],
+    deps = [
+        ":mcts",
+        "//rust/minimax",
+    ],
+)

@@ -9,6 +9,7 @@ import './styles.css';
 const pool = new BotWorkerPool();
 const minimaxBot = createWorkerBot(pool, 'minimax', 'Minimax');
 const alphazeroBot = createWorkerBot(pool, 'alphazero', 'AlphaZero');
+const zerorevBot = createWorkerBot(pool, 'zerorev', 'ZeroRev');
 
 const app = document.getElementById('app');
 if (!app) throw new Error('Missing app root');
@@ -34,6 +35,7 @@ app.innerHTML = `
             <option value="greedy">Greedy</option>
             <option value="minimax">Minimax</option>
             <option value="alphazero">AlphaZero</option>
+            <option value="zerorev">ZeroRev</option>
           </select>
           <select id="time-black" class="time-select" disabled>
             ${timeOptions()}
@@ -46,6 +48,7 @@ app.innerHTML = `
             <option value="greedy">Greedy</option>
             <option value="minimax">Minimax</option>
             <option value="alphazero">AlphaZero</option>
+            <option value="zerorev">ZeroRev</option>
           </select>
           <select id="time-white" class="time-select" disabled>
             ${timeOptions()}
@@ -89,7 +92,9 @@ function syncTimeSelect(
   time: HTMLSelectElement,
 ): void {
   const needsTime =
-    strategy.value === 'minimax' || strategy.value === 'alphazero';
+    strategy.value === 'minimax' ||
+    strategy.value === 'alphazero' ||
+    strategy.value === 'zerorev';
   time.disabled = !needsTime;
 }
 
@@ -113,6 +118,9 @@ function getPlayerConfig(
   }
   if (strategy.value === 'alphazero') {
     return { type: 'bot', player: alphazeroBot, thinkMs };
+  }
+  if (strategy.value === 'zerorev') {
+    return { type: 'bot', player: zerorevBot, thinkMs };
   }
   return { type: 'human' };
 }
@@ -198,11 +206,15 @@ analyzeButton.addEventListener('click', async () => {
 
 void controller.start();
 
-pool.ready.then(({ alphazeroName }) => {
+void pool.ready.then(({ alphazeroName, zerorevName }) => {
   for (const select of [strategyBlack, strategyWhite]) {
-    const opt = select.querySelector<HTMLOptionElement>(
+    const azOpt = select.querySelector<HTMLOptionElement>(
       'option[value="alphazero"]',
     );
-    if (opt) opt.textContent = alphazeroName;
+    if (azOpt) azOpt.textContent = alphazeroName;
+    const zrOpt = select.querySelector<HTMLOptionElement>(
+      'option[value="zerorev"]',
+    );
+    if (zrOpt) zrOpt.textContent = zerorevName;
   }
 });

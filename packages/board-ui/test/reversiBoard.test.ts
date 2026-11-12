@@ -1,3 +1,5 @@
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { GlobalRegistrator } from '@happy-dom/global-registrator';
 import {
   applyMove,
   type Cell,
@@ -7,9 +9,17 @@ import {
   getLegalMoves,
   indexOf,
 } from '@reversi/core';
-import { describe, expect, test, vi } from 'vitest';
-import { page } from 'vitest/browser';
 import { createReversiBoard } from '../src/reversiBoard';
+
+// Simulated DOM, scoped to this file so the other suites keep Bun's native
+// globals (the WASM bots load through the real fetch). Real browsers are
+// covered by the Playwright e2e tests.
+beforeAll(() => {
+  GlobalRegistrator.register();
+});
+afterAll(async () => {
+  await GlobalRegistrator.unregister();
+});
 
 function makeBoard(rows: string[]): Cell[] {
   const board: Cell[] = Array(64).fill(null);
@@ -49,11 +59,18 @@ function setup(
   return { root, board };
 }
 
+function squareAt(root: HTMLElement, row: number, col: number): HTMLElement {
+  const square = root.querySelector<HTMLElement>(
+    `[aria-label="row ${row + 1} column ${col + 1}"]`,
+  );
+  if (!square) throw new Error(`no square at row ${row}, column ${col}`);
+  return square;
+}
+
 describe('reversi board ui', () => {
   test('renders 64 squares and 4 starting discs', async () => {
     const { root } = setup(createInitialState());
 
-    await expect.element(page.getByRole('button').nth(0)).toBeInTheDocument();
     expect(root.querySelectorAll('.rv-square')).toHaveLength(64);
     expect(root.querySelectorAll('.rv-disc')).toHaveLength(4);
   });
@@ -61,8 +78,6 @@ describe('reversi board ui', () => {
   test('marks legal move squares with data-legal and hint', async () => {
     const state = createInitialState();
     const { root } = setup(state);
-
-    await expect.element(page.getByRole('button').nth(0)).toBeInTheDocument();
 
     const legalSquares = root.querySelectorAll('.rv-square[data-legal="true"]');
     expect(legalSquares).toHaveLength(state.legalMoves.length);
@@ -73,25 +88,21 @@ describe('reversi board ui', () => {
 
   test('clicking a legal square triggers onMove', async () => {
     const state = createInitialState();
-    const onMove = vi.fn();
-    setup(state, onMove);
+    const onMove = mock();
+    const { root } = setup(state, onMove);
 
     const move = state.legalMoves[0];
-    const button = page.getByRole('button', {
-      name: `row ${move.row + 1} column ${move.col + 1}`,
-    });
-    await button.click();
+    squareAt(root, move.row, move.col).click();
 
     expect(onMove).toHaveBeenCalledWith({ row: move.row, col: move.col });
   });
 
   test('clicking a non-legal square does not trigger onMove', async () => {
-    const onMove = vi.fn();
-    setup(createInitialState(), onMove);
+    const onMove = mock();
+    const { root } = setup(createInitialState(), onMove);
 
     // (0,0) is never a legal opening move
-    const button = page.getByRole('button', { name: 'row 1 column 1' });
-    await button.click();
+    squareAt(root, 0, 0).click();
 
     expect(onMove).not.toHaveBeenCalled();
   });
@@ -100,7 +111,6 @@ describe('reversi board ui', () => {
     const state = createInitialState();
     const { root, board } = setup(state);
 
-    await expect.element(page.getByRole('button').nth(0)).toBeInTheDocument();
     expect(root.querySelectorAll('.rv-disc')).toHaveLength(4);
 
     const next = applyMove(state, state.legalMoves[0]);
@@ -132,7 +142,6 @@ describe('reversi board ui', () => {
 
     const { root } = setup(state);
 
-    await expect.element(page.getByRole('button').nth(0)).toBeInTheDocument();
     expect(root.querySelectorAll('.rv-hint')).toHaveLength(0);
     expect(root.querySelectorAll('.rv-square[data-legal="true"]')).toHaveLength(
       0,
@@ -142,7 +151,6 @@ describe('reversi board ui', () => {
   test('destroy removes board content', async () => {
     const { root, board } = setup(createInitialState());
 
-    await expect.element(page.getByRole('button').nth(0)).toBeInTheDocument();
     expect(root.querySelectorAll('.rv-square').length).toBe(64);
 
     board.destroy();

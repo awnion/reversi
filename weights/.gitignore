@@ -5,8 +5,16 @@ iter_*.npz
 replay_buffer.npz
 *.tmp.npz
 
-# PID file
+# PID files and logs
 train.pid
+nohup.pid
+train.log
 
 # Keep champion.bin tracked (deployed to WASM bot)
 !champion.bin
+
+# Transient training state
+selfplay_latest.bin
+replay_spool/
+replay_buffer.tmp
+*.bad

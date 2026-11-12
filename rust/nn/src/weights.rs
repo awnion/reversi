@@ -92,8 +92,8 @@ impl WeightStore {
             // Data: numel × 4 bytes
             let data_bytes = read_bytes!(numel * 4);
             let mut data = Vec::with_capacity(numel);
-            for chunk in data_bytes.chunks_exact(4) {
-                data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in data_bytes.as_chunks::<4>().0 {
+                data.push(f32::from_le_bytes(*chunk));
             }
 
             tensors.insert(name.clone(), data);

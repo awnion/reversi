@@ -4,11 +4,24 @@ A browser-based [Reversi](https://en.wikipedia.org/wiki/Reversi) (Othello) game 
 
 ## Structure
 
-Bun workspace monorepo:
+Rust is built by Bazel, TypeScript by Bun/Vite, and the Python training
+pipeline by uv:
 
+- `rust/minimax`, `rust/mcts`, `rust/nn` — engine, search and inference crates
+- `rust/alphazero`, `rust/zerorev` — WASM bots with champion weights embedded
 - `packages/core` — game rules and logic
 - `packages/board-ui` — DOM-based board renderer
-- `apps/web` — playable web app
+- `packages/bot`, `packages/bot-*` — bot players (the `bot-*` ones wrap the WASM crates)
+- `apps/web` — playable web app (Vite)
+- `python/train` — self-play training (MLX, Apple Silicon)
+- `weights/<bot>/` — checkpoints and `champion.bin` per bot
+
+## Prerequisites
+
+- [Bazelisk](https://github.com/bazelbuild/bazelisk) (installed as `bazel`) —
+  compiles Rust to WASM; it downloads the Rust toolchain and wasm-bindgen itself
+- [Bun](https://bun.sh) — package manager, test runner and script runner
+- optional: [`just`](https://github.com/casey/just) wraps the common commands
 
 ## Quick start
 
@@ -17,7 +30,9 @@ bun install
 bun dev
 ```
 
-Open `http://localhost:5173` in your browser.
+`bun dev` first runs `bun run build:wasm` (Bazel builds the bots and the output
+is copied to `packages/bot-*/wasm/`), then starts Vite. Open
+`http://localhost:5173` in your browser.
 
 ## Build
 
@@ -28,15 +43,26 @@ bun run build
 ## Test
 
 ```sh
-# unit tests (core logic)
-bun run test:unit
+# Rust tests
+bazel test //...
 
-# browser integration tests (vitest + playwright)
-bun run test:browser
+# unit tests (bun test; builds the WASM bots first)
+bun run test:unit
 
 # e2e tests (requires browsers: bun run install:browsers)
 bun run test:e2e
 ```
+
+## Lint and format
+
+```sh
+just lint
+just fmt
+```
+
+Rust dependencies: edit `Cargo.toml`, then `cargo update` — Bazel reads
+`Cargo.lock`. `wasm-bindgen` is pinned to the version of the CLI bundled with
+`rules_rust_wasm_bindgen`; bump both together.
 
 ## AlphaZero training
 
@@ -66,6 +92,7 @@ tail -f /tmp/reversi_train.log
 ```
 
 Training runs continuously and:
+
 - Waits until 30 000 positions are collected before starting gradient updates
 - Uses 80 MCTS simulations per move during self-play
 - Rate-limits training to 1 gradient step per 10 new positions (prevents overfitting)
@@ -98,6 +125,7 @@ uv run python -m train.tournament --top 10 --games 4 --sims 100 --no-champion
 ```
 
 The tournament automatically:
+
 1. Loads all candidates (including `champion.bin` as reference baseline)
 2. Plays every pair against each other, alternating colours
 3. Ranks by win points
@@ -114,14 +142,14 @@ uv run python -m train.export \
 
 ### Rebuild WASM bot
 
-After exporting a new `champion.bin`, rebuild the browser bot:
+After exporting a new `champion.bin`, rebuild the browser bots:
 
 ```sh
-cd ..  # repo root
-bun --filter '@reversi/bot-alphazero' build:wasm
+bun run build:wasm
 ```
 
-The WASM bot embeds `weights/champion.bin` at compile time — the file must exist before building.
+The WASM bots embed `weights/<bot>/champion.bin` at compile time — the files
+must exist before building.
 
 ### Champion history
 

@@ -1,20 +1,18 @@
 {
   "name": "reversi",
   "private": true,
-  "packageManager": "bun@1.3.11",
+  "packageManager": "bun@1.4.4",
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
-    "dev": "bun --filter @reversi/web dev",
-    "build": "bun run build:packages && bun --filter @reversi/web build",
-    "build:wasm": "bun --filter '@reversi/bot-*' build:wasm",
-    "build:packages": "bun run build:wasm && bun --filter @reversi/core build && bun --filter @reversi/board-ui build && bun --filter @reversi/bot build && bun --filter @reversi/bot-minimax build && bun --filter @reversi/bot-alphazero build",
-    "test": "bun run test:unit && bun run test:browser",
-    "test:all": "bun run test:unit && bun run test:browser && bun run test:e2e",
-    "test:unit": "bun test packages/core/test",
-    "test:browser": "bunx vitest --config vitest.workspace.ts",
+    "dev": "bun run build:wasm && bun --filter @reversi/web dev",
+    "build": "bun run build:wasm && bun --filter @reversi/web build",
+    "build:wasm": "tools/build_wasm.sh",
+    "test": "bun run test:unit",
+    "test:all": "bun run test:unit && bun run test:e2e",
+    "test:unit": "bun run build:wasm && bun test",
     "test:e2e": "bun run build && bunx playwright test",
     "test:e2e:headed": "bunx playwright test --headed",
     "install:browsers": "bunx playwright install chromium webkit",
@@ -25,14 +23,11 @@
     "check": "bun run lint && bun run test:unit"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.8",
-    "@playwright/test": "^1.58.2",
-    "@types/bun": "^1.3.11",
-    "@vitest/browser": "^4.1.1",
-    "@vitest/browser-playwright": "^4.1.1",
-    "playwright": "^1.58.2",
-    "typescript": "^6.0.2",
-    "vite": "^8.0.2",
-    "vitest": "^4.1.1"
+    "@biomejs/biome": "^2.6.7",
+    "@happy-dom/global-registrator": "^21.0.4",
+    "@playwright/test": "^1.65.0",
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
   }
 }

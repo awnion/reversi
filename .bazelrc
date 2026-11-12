@@ -1,0 +1,15 @@
+common --enable_platform_specific_config
+
+# Bots and self-play are compute-bound; debug builds are unusably slow.
+build --compilation_mode=opt
+build:dbg --compilation_mode=dbg
+
+# Stamps BUILD_DATE into the WASM bots (see //tools:build_env).
+build --workspace_status_command=tools/workspace_status.sh
+
+test --test_output=errors
+
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=+clippy_checks
+
+try-import %workspace%/.bazelrc.user

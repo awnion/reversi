@@ -48,7 +48,7 @@ fn weight_store_empty() {
 #[test]
 fn net_forward_zero_weights() {
     let net = AlphaZeroNet::zeros();
-    let planes = vec![0.0f32; 3 * 8 * 8];
+    let planes = vec![0.0f32; 4 * 8 * 8];
     let (policy, value) = net.forward(&planes);
 
     // softmax of all-equal logits → uniform distribution
@@ -107,7 +107,7 @@ fn net_forward_random_weights() {
     }
 
     // Stem
-    t!("stem.conv.weight", [CH, 3, 3, 3], rng.vec(CH * 3 * 3 * 3));
+    t!("stem.conv.weight", [CH, 3, 3, 4], rng.vec(CH * 3 * 3 * 4));
     t!("stem.conv.bias", [CH], rng.vec(CH));
     t!("stem.bn.gamma", [CH], rng.vec(CH));
     t!("stem.bn.beta", [CH], rng.vec(CH));
@@ -162,7 +162,7 @@ fn net_forward_random_weights() {
     // ── Load and run forward pass ─────────────────────────────────────────
     let net = AlphaZeroNet::load(&bytes).expect("AlphaZeroNet::load failed");
 
-    let mut planes = vec![0.0f32; 3 * 8 * 8];
+    let mut planes = vec![0.0f32; 4 * 8 * 8];
     // Set a few bits to make the input non-trivial
     planes[0] = 1.0;
     planes[9] = 1.0;

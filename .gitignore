@@ -8,4 +8,12 @@ test-results
 *.tsbuildinfo
 
 __pycache__
+.venv
 .cargo-target/
+
+# Bazel
+/bazel-*
+.bazelrc.user
+
+# wasm-bindgen output copied from bazel-bin by tools/build_wasm.sh
+packages/*/wasm/
