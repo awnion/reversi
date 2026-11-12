@@ -12,12 +12,15 @@ let minimax: BotPlayer;
 let alphazero: BotPlayer & { meta: NetworkBotMeta };
 let zerorev: BotPlayer & { meta: NetworkBotMeta };
 
+// The page says how many threads this worker's searches may use.
+const threads = Number(self.name) || 1;
+
 void (async () => {
   try {
     [minimax, alphazero, zerorev] = await Promise.all([
-      createMinimaxBot('Minimax'),
-      createAlphaZeroBot(),
-      createZeroRevBot(),
+      createMinimaxBot('Minimax', { threads }),
+      createAlphaZeroBot(undefined, { threads }),
+      createZeroRevBot(undefined, { threads }),
     ]);
   } catch (err) {
     // Without this the page would wait for the bots forever.

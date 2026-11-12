@@ -180,6 +180,23 @@ describe('last move marker', () => {
     expect(root.dataset.turn).toBe('white');
   });
 
+  test('rings the discs the move turned over, with a line through them', async () => {
+    const state = createInitialState();
+    const { root, board } = setup(state);
+    expect(root.querySelector('.rv-flips')).toBeNull();
+
+    const move = state.legalMoves[0];
+    board.setState(applyMove(state, move));
+    await nextFrame();
+
+    const rings = [...root.querySelectorAll('.rv-flip')].map((ring) => ({
+      row: Number(ring.getAttribute('cy')) - 0.5,
+      col: Number(ring.getAttribute('cx')) - 0.5,
+    }));
+    expect(rings).toEqual(move.flips);
+    expect(root.querySelectorAll('.rv-flip-line')).toHaveLength(1);
+  });
+
   test('clears the marker when a new game starts', async () => {
     const state = createInitialState();
     const { root, board } = setup(state);
@@ -188,5 +205,82 @@ describe('last move marker', () => {
     board.setState(createInitialState());
     await nextFrame();
     expect(root.querySelectorAll('[data-last="true"]')).toHaveLength(0);
+  });
+});
+
+describe('mirrored board', () => {
+  const nextFrame = () =>
+    new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve)),
+    );
+
+  test('shows the columns right to left and keeps the real coordinates', async () => {
+    const state = createInitialState();
+    const { root, board } = setup(state);
+    const firstRow = () =>
+      [...root.querySelectorAll<HTMLElement>('.rv-square')]
+        .slice(0, 8)
+        .map((square) => Number(square.dataset.col));
+    expect(firstRow()).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+
+    board.setMirrored(true);
+    await nextFrame();
+    expect(root.dataset.mirrored).toBe('true');
+    expect(firstRow()).toEqual([7, 6, 5, 4, 3, 2, 1, 0]);
+
+    // A click still plays the square it lands on.
+    const onMove = mock(() => {});
+    board.destroy();
+    const mirrored = createReversiBoard(root, {
+      state,
+      onMove,
+      mirrored: true,
+    });
+    const move = state.legalMoves[0];
+    squareAt(root, move.row, move.col).click();
+    expect(onMove).toHaveBeenCalledWith({ row: move.row, col: move.col });
+    mirrored.destroy();
+  });
+});
+
+describe('square notes', () => {
+  const nextFrame = () =>
+    new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve)),
+    );
+
+  test('notes replace the hint on their square and mark the best move', async () => {
+    const state = createInitialState();
+    const { root, board } = setup(state);
+    const [first, second] = state.legalMoves;
+
+    board.setNotes([
+      { position: first, label: '+19', best: true },
+      { position: second, label: '\u22124' },
+    ]);
+    await nextFrame();
+
+    const notes = root.querySelectorAll<HTMLElement>('.rv-note');
+    expect([...notes].map((n) => n.textContent)).toEqual(['+19', '\u22124']);
+    expect(root.querySelectorAll('.rv-note[data-best="true"]')).toHaveLength(1);
+    expect(
+      squareAt(root, first.row, first.col).querySelector('.rv-hint'),
+    ).toBeNull();
+    // The other legal squares keep their hints.
+    expect(root.querySelectorAll('.rv-hint')).toHaveLength(
+      state.legalMoves.length - 2,
+    );
+  });
+
+  test('notes are dropped when the position changes', async () => {
+    const state = createInitialState();
+    const { root, board } = setup(state);
+    board.setNotes([{ position: state.legalMoves[0], label: '+1' }]);
+    await nextFrame();
+    expect(root.querySelectorAll('.rv-note')).toHaveLength(1);
+
+    board.setState(applyMove(state, state.legalMoves[1]));
+    await nextFrame();
+    expect(root.querySelectorAll('.rv-note')).toHaveLength(0);
   });
 });

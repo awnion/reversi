@@ -10,6 +10,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Nightly used for the multi-threaded WASM build (tools/build_wasm.sh).
+  REVERSI_NIGHTLY: nightly-2026-11-11
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -34,6 +38,8 @@ jobs:
           repository-cache: true
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # The threaded WASM bots are built by cargo with a pinned nightly.
+      - run: rustup toolchain install "$REVERSI_NIGHTLY" --profile minimal --component rust-src --target wasm32-unknown-unknown
       # tsc needs the generated wasm-bindgen typings.
       - run: bun run build:wasm
       - run: bun run lint
@@ -49,6 +55,8 @@ jobs:
           repository-cache: true
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # The threaded WASM bots are built by cargo with a pinned nightly.
+      - run: rustup toolchain install "$REVERSI_NIGHTLY" --profile minimal --component rust-src --target wasm32-unknown-unknown
       - run: bun run test:unit
 
   test-e2e:
@@ -62,5 +70,7 @@ jobs:
           repository-cache: true
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # The threaded WASM bots are built by cargo with a pinned nightly.
+      - run: rustup toolchain install "$REVERSI_NIGHTLY" --profile minimal --component rust-src --target wasm32-unknown-unknown
       - run: bunx playwright install --with-deps chromium webkit
       - run: bun run test:e2e

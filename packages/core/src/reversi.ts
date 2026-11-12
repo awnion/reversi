@@ -98,6 +98,35 @@ export function passTurn(state: GameState): GameState {
   });
 }
 
+/**
+ * A position as a short string, to keep it across page loads:
+ * 64 cells (`x` black, `o` white, `.` empty), the side to move and the
+ * passes in a row, e.g. `...ox...:b:0`.
+ */
+export function serializeState(state: GameState): string {
+  const cells = state.board
+    .map((cell) => (cell === 'black' ? 'x' : cell === 'white' ? 'o' : '.'))
+    .join('');
+  const mover = state.currentPlayer === 'black' ? 'b' : 'w';
+  return `${cells}:${mover}:${state.consecutivePasses}`;
+}
+
+/** The position `serializeState` wrote, or `null` if `text` is not one. */
+export function parseState(text: string): GameState | null {
+  const match = /^([xo.]{64}):([bw]):([0-2])$/.exec(text);
+  const [, cells, mover, passes] = match ?? [];
+  if (cells === undefined) return null;
+  const board = Array.from(
+    cells,
+    (c): Cell => (c === 'x' ? 'black' : c === 'o' ? 'white' : null),
+  );
+  return withDerivedState({
+    board,
+    currentPlayer: mover === 'b' ? 'black' : 'white',
+    consecutivePasses: Number(passes),
+  });
+}
+
 export function countDiscs(board: ReadonlyArray<Cell>): Record<Disc, number> {
   let black = 0;
   let white = 0;

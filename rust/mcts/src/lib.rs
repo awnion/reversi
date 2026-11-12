@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod game;
+pub mod parallel;
 #[cfg(feature = "python")]
 pub mod py;
 pub mod search;
@@ -12,6 +13,9 @@ pub use game::PositionRecord;
 pub use game::play_game;
 pub use game::play_match_from;
 pub use game::random_opening;
+pub use parallel::SharedSearch;
+#[cfg(not(target_arch = "wasm32"))]
+pub use parallel::run_threads;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 pub use search::EvalFn;

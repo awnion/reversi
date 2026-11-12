@@ -1,3 +1,6 @@
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
+
 use crate::board::Board;
 use crate::eval::evaluate;
 
@@ -29,6 +32,11 @@ impl Deadline {
         self.expired
     }
 
+    /// A deadline for another thread: same limit, its own node counter.
+    pub fn fork(&self) -> Self {
+        Deadline { limit: self.limit, nodes: 0, expired: self.expired }
+    }
+
     /// Count one node; returns true once the time is up.
     fn tick(&mut self) -> bool {
         if self.expired {
@@ -53,32 +61,137 @@ pub fn evaluate_all_moves(board: Board, is_black: bool, depth: u8) -> Vec<(u64, 
 }
 
 /// Like [`evaluate_all_moves`], but returns `None` if the deadline passes
-/// before every move has been searched.
+/// before every move has been searched. Moves are searched in parallel when
+/// the `threads` feature is on.
 pub fn evaluate_all_moves_until(
     board: Board,
     is_black: bool,
     depth: u8,
     deadline: &mut Deadline,
 ) -> Option<Vec<(u64, i32)>> {
+    let moves = moves_of(board.legal_moves(is_black));
+    let results = par_map(&moves, |&m| {
+        let mut deadline = deadline.fork();
+        let next = board.apply_move(is_black, m);
+        // Search from opponent's perspective at depth-1; negate score.
+        let (_, opp_score) = search_until(
+            next,
+            !is_black,
+            depth.saturating_sub(1),
+            -MAX_SCORE,
+            MAX_SCORE,
+            &mut deadline,
+        )?;
+        Some((m, -opp_score))
+    });
+    let results: Option<Vec<_>> = results.into_iter().collect();
+    if results.is_none() {
+        deadline.expired = true;
+    }
+    results
+}
+
+/// Alpha-beta search from the root, splitting the work between threads (with
+/// the `threads` feature; otherwise one move after another).
+///
+/// `first` (usually the best move of the previous depth) is searched first.
+/// Returns `None` if the deadline passes first.
+pub fn search_root_until(
+    board: Board,
+    is_black: bool,
+    depth: u8,
+    first: Option<u64>,
+    deadline: &mut Deadline,
+) -> Option<(Option<u64>, i32)> {
+    split_search(board, is_black, depth, MIN_SCORE, MAX_SCORE, first, deadline)
+}
+
+/// Below this depth a node is searched on one thread: splitting would cost
+/// more than it saves.
+const SPLIT_DEPTH: u8 = 4;
+
+/// Principal-variation splitting: the first move is searched alone (itself
+/// split the same way, one level down) to get a good bound, then the other
+/// moves run in parallel, each starting from the best score found so far.
+/// Fail-soft, like [`search_until`].
+fn split_search(
+    board: Board,
+    is_black: bool,
+    depth: u8,
+    alpha: i32,
+    beta: i32,
+    first: Option<u64>,
+    deadline: &mut Deadline,
+) -> Option<(Option<u64>, i32)> {
     let legal = board.legal_moves(is_black);
-    let mut results = Vec::new();
-    for i in 0..64 {
-        let m = 1u64 << i;
-        if (legal & m) != 0 {
-            let next = board.apply_move(is_black, m);
-            // Search from opponent's perspective at depth-1; negate score.
-            let (_, opp_score) = search_until(
-                next,
-                !is_black,
-                depth.saturating_sub(1),
-                -MAX_SCORE,
-                MAX_SCORE,
-                deadline,
-            )?;
-            results.push((m, -opp_score));
+    if depth < SPLIT_DEPTH || legal.count_ones() < 2 {
+        return search_until(board, is_black, depth, alpha, beta, deadline);
+    }
+
+    let mut moves = moves_of(legal);
+    // Likely best moves first: the hint, then by a static look one move
+    // ahead. A good first move gives the parallel moves a tight bound.
+    moves.sort_by_cached_key(|&m| evaluate(&board.apply_move(is_black, m), !is_black));
+    if let Some(at) = first.and_then(|f| moves.iter().position(|&m| m == f)) {
+        moves[..=at].rotate_right(1);
+    }
+
+    let next = board.apply_move(is_black, moves[0]);
+    let (_, score) = split_search(next, !is_black, depth - 1, -beta, -alpha, None, deadline)?;
+    let mut best = (moves[0], -score);
+    if best.1 >= beta {
+        return Some((Some(best.0), best.1));
+    }
+
+    let bound = AtomicI32::new(alpha.max(best.1));
+    let rest = par_map(&moves[1..], |&m| {
+        let alpha = bound.load(Ordering::Relaxed);
+        if alpha >= beta {
+            // Another move already refuted this node.
+            return Some(None);
+        }
+        let mut deadline = deadline.fork();
+        let next = board.apply_move(is_black, m);
+        let (_, score) = search_until(next, !is_black, depth - 1, -beta, -alpha, &mut deadline)?;
+        bound.fetch_max(-score, Ordering::Relaxed);
+        Some(Some((m, -score)))
+    });
+    // Moves keep their search order, so ties go to the earlier move, as in a
+    // sequential search.
+    for result in rest {
+        match result {
+            None => {
+                deadline.expired = true;
+                return None;
+            }
+            Some(Some((m, score))) if score > best.1 => best = (m, score),
+            Some(_) => {}
         }
     }
-    Some(results)
+    Some((Some(best.0), best.1))
+}
+
+/// The set bits of `moves`, lowest first.
+fn moves_of(mut moves: u64) -> Vec<u64> {
+    let mut out = Vec::with_capacity(moves.count_ones() as usize);
+    while moves != 0 {
+        let m = 1u64 << moves.trailing_zeros();
+        out.push(m);
+        moves ^= m;
+    }
+    out
+}
+
+/// `items.map(f)`, on the rayon thread pool with the `threads` feature.
+#[cfg(feature = "threads")]
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+    use rayon::prelude::*;
+    items.par_iter().map(f).collect()
+}
+
+#[cfg(not(feature = "threads"))]
+fn par_map<T, R>(items: &[T], f: impl Fn(&T) -> R) -> Vec<R> {
+    items.iter().map(f).collect()
 }
 
 pub const MIN_SCORE: i32 = -100000;

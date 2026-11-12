@@ -5,6 +5,7 @@ import type {
   Position,
   PositionAnalysis,
 } from '@reversi/core';
+import botWorkerUrl from './botWorker.ts?worker&url';
 
 /** Sent by the worker once the WASM bots are loaded. */
 export type BotsReady = { alphazero: NetworkBotMeta; zerorev: NetworkBotMeta };
@@ -14,16 +15,21 @@ type PendingEntry = {
   reject: (reason: unknown) => void;
 };
 
+let poolCount = 0;
+
 export class BotWorkerPool {
   private worker: Worker;
   private pending = new Map<number, PendingEntry>();
   private idCounter = 0;
   readonly ready: Promise<BotsReady>;
 
-  constructor() {
-    this.worker = new Worker(new URL('./botWorker.ts', import.meta.url), {
-      type: 'module',
-    });
+  /** `threads`: CPU threads the worker's searches may use, where possible. */
+  constructor(threads = 1) {
+    // Each pool gets its own script URL: under cross-origin isolation Safari
+    // refuses a second worker whose script it serves from its cache.
+    const url = new URL(botWorkerUrl, import.meta.url);
+    url.searchParams.set('pool', String(++poolCount));
+    this.worker = new Worker(url, { type: 'module', name: String(threads) });
     let resolveReady!: (value: BotsReady) => void;
     let rejectReady!: (reason: Error) => void;
     this.ready = new Promise((res, rej) => {

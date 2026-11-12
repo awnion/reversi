@@ -49,3 +49,61 @@ mod deadlines {
         assert!(deadline.expired());
     }
 }
+
+// ── root search (split between threads with the `threads` feature) ────────
+
+mod root_search {
+    use reversi_minimax::board::Board;
+    use reversi_minimax::engine::Deadline;
+    use reversi_minimax::engine::MAX_SCORE;
+    use reversi_minimax::engine::MIN_SCORE;
+    use reversi_minimax::engine::search;
+    use reversi_minimax::engine::search_root_until;
+
+    /// A middle-game position: a few moves from the start.
+    fn positions() -> Vec<(Board, bool)> {
+        let mut board = Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36));
+        let mut is_black = true;
+        let mut out = vec![(board, is_black)];
+        for _ in 0..8 {
+            let legal = board.legal_moves(is_black);
+            // Deterministic but not always the lowest move.
+            let m = 1u64 << (63 - legal.leading_zeros());
+            board = board.apply_move(is_black, m);
+            is_black = !is_black;
+            out.push((board, is_black));
+        }
+        out
+    }
+
+    #[test]
+    fn root_search_finds_the_same_score_as_plain_search() {
+        for (board, is_black) in positions() {
+            for depth in 1..=5 {
+                let (_, plain) = search(board, is_black, depth, MIN_SCORE, MAX_SCORE);
+                for first in
+                    [None, Some(1u64 << (63 - board.legal_moves(is_black).leading_zeros()))]
+                {
+                    let (m, score) =
+                        search_root_until(board, is_black, depth, first, &mut Deadline::never())
+                            .unwrap();
+                    assert_eq!(score, plain, "depth {depth}");
+                    let m = m.unwrap();
+                    assert_ne!(board.legal_moves(is_black) & m, 0);
+                    // The chosen move really scores that much.
+                    let next = board.apply_move(is_black, m);
+                    let (_, reply) = search(next, !is_black, depth - 1, MIN_SCORE, MAX_SCORE);
+                    assert_eq!(-reply, plain);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_search_gives_up_once_the_deadline_has_passed() {
+        let (board, is_black) = positions()[4];
+        let mut deadline = Deadline::at(|| 1.0, 0.0);
+        assert_eq!(search_root_until(board, is_black, 12, None, &mut deadline), None);
+        assert!(deadline.expired());
+    }
+}

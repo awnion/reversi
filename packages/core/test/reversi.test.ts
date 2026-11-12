@@ -9,7 +9,9 @@ import {
   type GameState,
   getLegalMoves,
   indexOf,
+  parseState,
   passTurn,
+  serializeState,
 } from '../src/reversi';
 
 /** Build a board from 8 rows of space-separated chars: B=black, W=white, .=empty */
@@ -229,5 +231,28 @@ describe('game over', () => {
     const board: Cell[] = Array(64).fill('white');
     expect(getLegalMoves(board, 'black')).toHaveLength(0);
     expect(getLegalMoves(board, 'white')).toHaveLength(0);
+  });
+});
+
+describe('serializeState / parseState', () => {
+  test('a position survives the round trip', () => {
+    let state = createInitialState();
+    for (let i = 0; i < 6; i++) state = applyMove(state, state.legalMoves[0]);
+    const restored = parseState(serializeState(state));
+    expect(restored).toEqual(state);
+  });
+
+  test('the side to move and the passes are kept', () => {
+    const text = `${'.'.repeat(27)}ox${'.'.repeat(6)}xo${'.'.repeat(27)}:w:0`;
+    const state = parseState(text);
+    expect(state?.currentPlayer).toBe('white');
+    expect(state && serializeState(state)).toBe(text);
+  });
+
+  test('anything else is rejected', () => {
+    expect(parseState('')).toBeNull();
+    expect(parseState('garbage')).toBeNull();
+    expect(parseState(`${'.'.repeat(63)}:b:0`)).toBeNull();
+    expect(parseState(`${'.'.repeat(64)}:x:0`)).toBeNull();
   });
 });

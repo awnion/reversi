@@ -17,3 +17,4 @@ __pycache__
 
 # wasm-bindgen output copied from bazel-bin by tools/build_wasm.sh
 packages/*/wasm/
+packages/*/wasm-threads/

@@ -11,6 +11,18 @@ export interface PositionAnalysis {
   score: number;
   depth: number;
   moves: MoveEval[];
+  /** Simulations behind the analysis, for bots that search by simulation. */
+  simulations?: number;
+  /**
+   * The expected result for the side to move, from −1 (a loss) to +1 (a
+   * win), for bots that estimate one (the network bots).
+   */
+  value?: number;
+  /**
+   * For bots whose analysis carries on from call to call: it has gone as far
+   * as it goes, and asking again returns the same result.
+   */
+  complete?: boolean;
 }
 
 export interface BotPlayer {
@@ -35,4 +47,6 @@ export interface NetworkBotMeta {
   loss: number | null;
   /** Share of tournament points it scored, 0..1. */
   winRate: number | null;
+  /** CPU threads its search runs on (1 unless the page is cross-origin isolated). */
+  threads: number;
 }

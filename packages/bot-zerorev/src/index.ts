@@ -6,7 +6,6 @@ import type {
   Position,
   PositionAnalysis,
 } from '@reversi/core';
-import init, { meta, ZeroRevBot as WasmBot } from '../wasm/reversi_zerorev.js';
 
 /** Raw shape of the JSON returned by the WASM `meta()`. */
 interface WasmMeta {
@@ -43,12 +42,35 @@ function toBitboards(state: GameState) {
   };
 }
 
+export interface ZeroRevOptions {
+  /** Threads to search on, where the page allows it. Default: one. */
+  threads?: number;
+}
+
+/**
+ * Load the WASM engine. A cross-origin isolated page may share memory between
+ * workers, so there the search runs on a pool of threads working on one tree;
+ * everywhere else the single-threaded build is used.
+ */
+async function loadEngine(threads: number) {
+  if (threads > 1 && globalThis.crossOriginIsolated) {
+    const engine = await import('../wasm-threads/reversi_zerorev.js');
+    await engine.default();
+    await engine.initThreadPool(threads);
+    return engine;
+  }
+  const engine = await import('../wasm/reversi_zerorev.js');
+  await engine.default();
+  return engine;
+}
+
 export async function createZeroRevBot(
   name?: string,
+  options: ZeroRevOptions = {},
 ): Promise<BotPlayer & { meta: NetworkBotMeta }> {
-  await init();
-  const wasm = new WasmBot();
-  const m: WasmMeta = JSON.parse(meta());
+  const engine = await loadEngine(Math.max(1, options.threads ?? 1));
+  const wasm = new engine.ZeroRevBot();
+  const m: WasmMeta = JSON.parse(engine.meta());
   const displayName = name ?? `ZeroRev (${m.build_date})`;
 
   return {
@@ -59,6 +81,7 @@ export async function createZeroRevBot(
       trainedOn: m.champion.date,
       loss: m.champion.loss,
       winRate: m.champion.win_rate,
+      threads: engine.search_threads(),
     },
 
     async chooseMove(state: GameState, timeLimitMs: number): Promise<Position> {
@@ -110,6 +133,9 @@ export async function createZeroRevBot(
         score: best?.score ?? 0,
         depth: 0,
         moves,
+        simulations: wasm.last_simulations(),
+        value: wasm.last_value(),
+        complete: wasm.analysis_complete(),
       };
     },
 

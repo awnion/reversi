@@ -21,6 +21,9 @@ pipeline by uv:
 - [Bazelisk](https://github.com/bazelbuild/bazelisk) (installed as `bazel`) —
   compiles Rust to WASM; it downloads the Rust toolchain and wasm-bindgen itself
 - [Bun](https://bun.sh) — package manager, test runner and script runner
+- Rust nightly with `rust-src` and the `wasm32-unknown-unknown` target — for
+  the multi-threaded bots:
+  `rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown`
 - optional: [`just`](https://github.com/casey/just) wraps the common commands
 
 ## Quick start
@@ -38,6 +41,15 @@ is copied to `packages/bot-*/wasm/`), then starts Vite. Open
 
 ```sh
 bun run build
+```
+
+Minimax, AlphaZero and ZeroRev search on several threads when the page is cross-origin
+isolated. The dev and preview servers send the required headers; a production
+host has to send them too, otherwise the bots fall back to one thread:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
 ```
 
 ## Test

@@ -40,6 +40,17 @@ The bridge is `tools/build_wasm.sh` (`bun run build:wasm`): it runs
 `packages/bot-<bot>/wasm/` (gitignored), which the TS wrappers import as
 `../wasm/reversi_<bot>.js`.
 
+One deliberate exception to "Bazel builds Rust": the WASM bots also get a
+multi-threaded build in `packages/bot-<bot>/wasm-threads/` (feature `threads`:
+the network bots share one search tree between Web Workers, Minimax splits the
+root moves between them). It needs the standard library
+rebuilt with atomics, which rules_rust cannot do, so the same script builds it
+with `cargo +nightly -Z build-std` and the wasm-bindgen CLI that Bazel built.
+Nightly Rust is fine in this project. The page loads the threaded build only
+when it is cross-origin isolated (COOP/COEP headers, set in
+`apps/web/vite.config.ts`); otherwise the bots search on one thread. Any host
+serving the bundle must send the same two headers to get threads.
+
 ```sh
 bun install
 bun dev                                # build wasm + Vite dev server
@@ -57,6 +68,8 @@ just lint / just fmt                   # biome, tsc, ruff, rustfmt, taplo
 - `BUILD_DATE` is stamped into the WASM bots from `tools/workspace_status.sh`.
 - After changing Rust code, rerun `bun run build:wasm`; Vite and `bun test`
   only see the copied output.
+- `bun test` and `just vs-minimax` run outside a browser and always use the
+  single-threaded build; threads are exercised by the e2e tests.
 
 ## Conventions
 

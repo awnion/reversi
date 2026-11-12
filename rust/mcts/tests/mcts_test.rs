@@ -3,10 +3,12 @@ use reversi_mcts::GameRecord;
 use reversi_mcts::MctsSearch;
 use reversi_mcts::PLANES_LEN;
 use reversi_mcts::SelfPlayPool;
+use reversi_mcts::SharedSearch;
 use reversi_mcts::StaticEval;
 use reversi_mcts::play_game;
 use reversi_mcts::play_match_from;
 use reversi_mcts::random_opening;
+use reversi_mcts::run_threads;
 use reversi_mcts::write_planes;
 use reversi_minimax::board::Board;
 
@@ -241,4 +243,68 @@ fn match_from_opening_completes() {
     let (board, black_to_move) = random_opening(4, 3);
     let outcome = play_match_from(board, black_to_move, &eval, &eval, 20);
     assert!([-1.0, 0.0, 1.0].contains(&outcome));
+}
+
+// ── shared (multi-threaded) search ────────────────────────────────────────
+
+#[test]
+fn shared_search_counts_every_simulation() {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::Ordering;
+
+    let search = SharedSearch::new(starting_board(), true);
+    let budget = AtomicU32::new(2_000);
+    let take_one = || {
+        budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_ok()
+    };
+    run_threads(&search, &StaticEval, 8, &take_one);
+
+    let tree = search.into_inner();
+    assert_eq!(tree.visits(), 2_000, "each simulation is one root visit");
+    assert_eq!(tree.in_flight(), 0, "nothing is left marked as in flight");
+    let sum: f32 = tree.policy_target().iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "policy sum = {sum}");
+    let best = tree.best_move().expect("a best move");
+    assert_ne!(best & starting_board().legal_moves(true), 0);
+}
+
+#[test]
+fn shared_search_on_one_thread_matches_plain_search() {
+    let eval = StaticEval;
+    let mut plain = MctsSearch::new(starting_board(), true);
+    let shared = SharedSearch::new(starting_board(), true);
+    for _ in 0..400 {
+        plain.simulate(&eval);
+        shared.simulate(&eval);
+    }
+    assert_eq!(shared.with(|tree| tree.policy_target()), plain.policy_target());
+}
+
+/// An evaluator that always thinks Black is ahead.
+struct BlackIsBetter;
+
+impl EvalFn for BlackIsBetter {
+    fn evaluate(&self, _board: Board, is_black: bool, legal: u64) -> ([f32; 64], f32) {
+        let mut policy = [0.0_f32; 64];
+        let n = legal.count_ones().max(1) as f32;
+        for (i, p) in policy.iter_mut().enumerate() {
+            if (legal >> i) & 1 == 1 {
+                *p = 1.0 / n;
+            }
+        }
+        (policy, if is_black { 0.5 } else { -0.5 })
+    }
+}
+
+#[test]
+fn root_value_is_from_the_side_to_move() {
+    for is_black in [true, false] {
+        let mut mcts = MctsSearch::new(starting_board(), is_black);
+        assert_eq!(mcts.root_value(), 0.0);
+        for _ in 0..200 {
+            mcts.simulate(&BlackIsBetter);
+        }
+        let expected = if is_black { 0.5 } else { -0.5 };
+        assert!((mcts.root_value() - expected).abs() < 1e-5, "{}", mcts.root_value());
+    }
 }

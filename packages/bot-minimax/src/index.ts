@@ -5,7 +5,6 @@ import type {
   Position,
   PositionAnalysis,
 } from '@reversi/core';
-import init, { MinimaxBot as WasmBot } from '../wasm/reversi_minimax.js';
 
 function toBitboards(state: GameState) {
   let blackLow = 0,
@@ -30,11 +29,34 @@ function toBitboards(state: GameState) {
   };
 }
 
+export interface MinimaxOptions {
+  /** Threads to search on, where the page allows it. Default: one. */
+  threads?: number;
+}
+
+/**
+ * Load the WASM engine. A cross-origin isolated page may share memory between
+ * workers, so there the root moves are searched on a pool of threads;
+ * everywhere else the single-threaded build is used.
+ */
+async function loadEngine(threads: number) {
+  if (threads > 1 && globalThis.crossOriginIsolated) {
+    const engine = await import('../wasm-threads/reversi_minimax.js');
+    await engine.default();
+    await engine.initThreadPool(threads);
+    return engine;
+  }
+  const engine = await import('../wasm/reversi_minimax.js');
+  await engine.default();
+  return engine;
+}
+
 export async function createMinimaxBot(
   name: string = 'Minimax',
+  options: MinimaxOptions = {},
 ): Promise<BotPlayer> {
-  await init();
-  const wasm = new WasmBot();
+  const engine = await loadEngine(Math.max(1, options.threads ?? 1));
+  const wasm = new engine.MinimaxBot();
 
   return {
     name,
@@ -71,7 +93,13 @@ export async function createMinimaxBot(
 
       // No legal moves
       if (raw.length === 0) {
-        return { bestMove: null, score: 0, depth: 0, moves: [] };
+        return {
+          bestMove: null,
+          score: 0,
+          depth: 0,
+          moves: [],
+          complete: true,
+        };
       }
 
       // Layout: [depth, idx0, score0, idx1, score1, ...]
@@ -94,6 +122,7 @@ export async function createMinimaxBot(
         score: best?.score ?? 0,
         depth,
         moves,
+        complete: wasm.analysis_complete(),
       };
     },
 

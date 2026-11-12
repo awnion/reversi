@@ -55,6 +55,8 @@ pub struct EvalRequest {
     pub legal: u64,
     /// The leaf's player has no moves and must pass.
     pass: bool,
+    /// The simulation is counted as in flight along its path (shared search).
+    in_flight: bool,
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -70,6 +72,9 @@ struct Node {
     n: u32,
     /// Accumulated value from **this node's player's** perspective.
     w: f32,
+    /// Simulations that passed through this node and are still waiting for
+    /// their evaluation. Always 0 in a single-threaded search.
+    in_flight: u32,
     parent: Option<usize>,
     children: Vec<usize>,
     expanded: bool,
@@ -94,6 +99,7 @@ impl MctsSearch {
             p: 1.0,
             n: 0,
             w: 0.0,
+            in_flight: 0,
             parent: None,
             children: Vec::new(),
             expanded: false,
@@ -116,24 +122,46 @@ impl MctsSearch {
     /// every `Some` with exactly one [`MctsSearch::apply_eval`] before selecting
     /// again; this split lets a caller batch evaluations across many trees.
     pub fn select_leaf(&mut self) -> Option<EvalRequest> {
+        self.select_leaf_impl(false)
+    }
+
+    /// [`MctsSearch::select_leaf`] for a search shared between threads: the
+    /// simulation is marked as in flight along its path ("virtual loss"), so
+    /// that other threads selecting meanwhile are steered to other leaves.
+    /// [`MctsSearch::apply_eval`] clears the mark.
+    pub fn select_leaf_shared(&mut self) -> Option<EvalRequest> {
+        self.select_leaf_impl(true)
+    }
+
+    fn select_leaf_impl(&mut self, shared: bool) -> Option<EvalRequest> {
         let idx = self.select(0);
         let board = self.nodes[idx].board;
         let is_black = self.nodes[idx].is_black;
 
         let legal = board.legal_moves(is_black);
         if legal != 0 {
-            return Some(EvalRequest { node: idx, board, is_black, legal, pass: false });
+            self.mark_in_flight(idx, shared);
+            return Some(EvalRequest {
+                node: idx,
+                board,
+                is_black,
+                legal,
+                pass: false,
+                in_flight: shared,
+            });
         }
 
         let opp_legal = board.legal_moves(!is_black);
         if opp_legal != 0 {
             // Forced pass: the position is evaluated from the opponent's side.
+            self.mark_in_flight(idx, shared);
             return Some(EvalRequest {
                 node: idx,
                 board,
                 is_black: !is_black,
                 legal: opp_legal,
                 pass: true,
+                in_flight: shared,
             });
         }
 
@@ -159,6 +187,20 @@ impl MctsSearch {
         let idx = request.node;
         let board = request.board;
 
+        if request.in_flight {
+            let mut node = Some(idx);
+            while let Some(i) = node {
+                self.nodes[i].in_flight -= 1;
+                node = self.nodes[i].parent;
+            }
+        }
+        // In a shared search another thread may have expanded this leaf in the
+        // meantime; the evaluation still counts as a visit.
+        if self.nodes[idx].expanded {
+            self.backup(idx, if request.pass { -value } else { value });
+            return;
+        }
+
         if request.pass {
             // `request.is_black` is the opponent, who moves next from this node.
             let child_idx = self.nodes.len();
@@ -169,6 +211,7 @@ impl MctsSearch {
                 p: 1.0,
                 n: 0,
                 w: 0.0,
+                in_flight: 0,
                 parent: Some(idx),
                 children: Vec::new(),
                 expanded: false,
@@ -194,6 +237,7 @@ impl MctsSearch {
                 p: policy[i],
                 n: 0,
                 w: 0.0,
+                in_flight: 0,
                 parent: Some(idx),
                 children: Vec::new(),
                 expanded: false,
@@ -248,13 +292,53 @@ impl MctsSearch {
     // ── private ───────────────────────────────────────────────────────────────
 
     /// Walk down the tree from `start` using PUCT until reaching an unexpanded node.
+    /// Expected result for the side to move at the root, from −1 (a loss) to
+    /// +1 (a win): the value of its most visited move, the one it would play.
+    /// Before any move has been visited, the root's own average.
+    pub fn root_value(&self) -> f32 {
+        let root = &self.nodes[0];
+        let best = root.children.iter().map(|&c| &self.nodes[c]).max_by_key(|c| c.n);
+        match best {
+            // A child's value is from the opponent's side.
+            Some(child) if child.n > 0 => -child.w / child.n as f32,
+            _ if root.n > 0 => root.w / root.n as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Nodes in the tree; each one costs memory.
+    pub fn nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Total visits of the root, i.e. the number of finished simulations.
+    pub fn visits(&self) -> u32 {
+        self.nodes[0].n
+    }
+
+    /// Simulations selected but not yet applied (shared search only).
+    pub fn in_flight(&self) -> u32 {
+        self.nodes[0].in_flight
+    }
+
+    fn mark_in_flight(&mut self, leaf: usize, shared: bool) {
+        if !shared {
+            return;
+        }
+        let mut node = Some(leaf);
+        while let Some(i) = node {
+            self.nodes[i].in_flight += 1;
+            node = self.nodes[i].parent;
+        }
+    }
+
     fn select(&self, mut idx: usize) -> usize {
         loop {
             let node = &self.nodes[idx];
             if !node.expanded || node.children.is_empty() {
                 return idx;
             }
-            let parent_n = node.n;
+            let parent_n = node.n + node.in_flight;
             idx = *node
                 .children
                 .iter()
@@ -270,9 +354,12 @@ impl MctsSearch {
     /// PUCT score of `child_idx` as seen **from the parent**.
     fn puct(&self, child_idx: usize, parent_n: u32) -> f32 {
         let c = &self.nodes[child_idx];
+        // In-flight simulations count as visits that the parent lost, which
+        // makes the child less attractive until their results arrive.
+        let visits = (c.n + c.in_flight) as f32;
         // Q from parent's perspective: parent wins when child loses → negate child's w/n.
-        let q = if c.n == 0 { 0.0 } else { -(c.w / c.n as f32) };
-        let u = C_PUCT * c.p * (parent_n as f32).sqrt() / (1.0 + c.n as f32);
+        let q = if visits == 0.0 { 0.0 } else { (-c.w - c.in_flight as f32) / visits };
+        let u = C_PUCT * c.p * (parent_n as f32).sqrt() / (1.0 + visits);
         q + u
     }
 

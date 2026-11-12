@@ -1,10 +1,9 @@
 use reversi_mcts::EvalFn;
-use reversi_mcts::MctsSearch;
+use reversi_mcts::SharedSearch;
 use reversi_minimax::board::Board;
 use reversi_nn::AlphaZeroNet;
 use wasm_bindgen::prelude::*;
 
-// Embed champion weights at compile time.
 static CHAMPION_WEIGHTS: &[u8] = include_bytes!("../../../weights/alphazero/champion.bin");
 
 /// Facts about the embedded champion, written by the trainer next to
@@ -44,7 +43,7 @@ impl EvalFn for NnEval {
     }
 }
 
-fn make_eval() -> Box<dyn EvalFn> {
+fn make_eval() -> Box<dyn EvalFn + Sync> {
     // The weights are embedded at build time, so a load failure is a build
     // defect. Fail loudly: silently falling back to another evaluator once hid
     // a format mismatch and the bot never used its network.
@@ -53,11 +52,11 @@ fn make_eval() -> Box<dyn EvalFn> {
     Box::new(NnEval { net })
 }
 
-fn run_mcts_timed(mcts: &mut MctsSearch, eval: &dyn EvalFn, time_ms: f64) {
-    let deadline = js_sys::Date::now() + time_ms;
+/// Simulate on this thread until the deadline (milliseconds, `Date.now()`).
+fn simulate_until(search: &SharedSearch, eval: &dyn EvalFn, deadline: f64) {
     loop {
-        for _ in 0..10 {
-            mcts.simulate(eval);
+        for _ in 0..4 {
+            search.simulate(eval);
         }
         if js_sys::Date::now() >= deadline {
             break;
@@ -65,16 +64,53 @@ fn run_mcts_timed(mcts: &mut MctsSearch, eval: &dyn EvalFn, time_ms: f64) {
     }
 }
 
+/// Search for `time_ms` milliseconds on every thread of the pool, all working
+/// on the same tree.
+#[cfg(feature = "threads")]
+fn run_mcts_timed(search: &SharedSearch, eval: &(dyn EvalFn + Sync), time_ms: f64) {
+    let deadline = js_sys::Date::now() + time_ms;
+    rayon::scope(|scope| {
+        for _ in 0..rayon::current_num_threads() {
+            scope.spawn(|_| simulate_until(search, eval, deadline));
+        }
+    });
+}
+
+/// Search for `time_ms` milliseconds on the calling thread.
+#[cfg(not(feature = "threads"))]
+fn run_mcts_timed(search: &SharedSearch, eval: &(dyn EvalFn + Sync), time_ms: f64) {
+    simulate_until(search, eval, js_sys::Date::now() + time_ms);
+}
+
+/// Start the worker threads of the search; resolves once they are running.
+#[cfg(feature = "threads")]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+/// Number of threads the search runs on (1 in the single-threaded build).
+#[wasm_bindgen]
+pub fn search_threads() -> usize {
+    #[cfg(feature = "threads")]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(not(feature = "threads"))]
+    {
+        1
+    }
+}
+
 #[wasm_bindgen]
 pub struct AlphaZeroBot {
-    eval: Box<dyn EvalFn>,
+    eval: Box<dyn EvalFn + Sync>,
+    /// Simulations made by the most recent search.
+    last_simulations: std::cell::Cell<u32>,
 }
 
 #[wasm_bindgen]
 impl AlphaZeroBot {
     #[wasm_bindgen(constructor)]
     pub fn new() -> AlphaZeroBot {
-        AlphaZeroBot { eval: make_eval() }
+        AlphaZeroBot { eval: make_eval(), last_simulations: std::cell::Cell::new(0) }
     }
 
     /// Choose best move within `think_ms` milliseconds.
@@ -101,10 +137,17 @@ impl AlphaZeroBot {
             return legal.trailing_zeros() as i32;
         }
 
-        let mut mcts = MctsSearch::new(board, is_black);
-        run_mcts_timed(&mut mcts, self.eval.as_ref(), think_ms);
+        let search = SharedSearch::new(board, is_black);
+        run_mcts_timed(&search, self.eval.as_ref(), think_ms);
 
-        mcts.best_move().map(|m| m.trailing_zeros() as i32).unwrap_or(-1)
+        let tree = search.into_inner();
+        self.last_simulations.set(tree.visits());
+        tree.best_move().map(|m| m.trailing_zeros() as i32).unwrap_or(-1)
+    }
+
+    /// Simulations made by the most recent `choose_move`/`analyze_position`.
+    pub fn last_simulations(&self) -> u32 {
+        self.last_simulations.get()
     }
 
     /// Returns policy array (64 f32) as Float32Array.
@@ -122,10 +165,12 @@ impl AlphaZeroBot {
         let board = Board::new(black, white);
 
         let legal = board.legal_moves(is_black);
-        let mut mcts = MctsSearch::new(board, is_black);
-        run_mcts_timed(&mut mcts, self.eval.as_ref(), think_ms);
+        let search = SharedSearch::new(board, is_black);
+        run_mcts_timed(&search, self.eval.as_ref(), think_ms);
 
-        let policy = mcts.policy_target();
+        let tree = search.into_inner();
+        self.last_simulations.set(tree.visits());
+        let policy = tree.policy_target();
         let mut result = policy;
         for (i, r) in result.iter_mut().enumerate() {
             if (legal >> i) & 1 == 0 {

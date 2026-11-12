@@ -14,8 +14,35 @@
   --disc-black: #161a18;
   --disc-white: #f0ede3;
   --accent: #e2d08a;
+  /* A chosen option: a quiet fill, the same in every control. */
+  --chosen: rgba(233, 229, 216, 0.15);
+  --hover: rgba(233, 229, 216, 0.06);
+  --control-height: 30px;
+  /* Space between the panel's groups, and inside one. */
+  --gap-group: 36px;
+  --gap-inner: 16px;
 
-  --board-size: min(86vmin, 720px, calc(100vw - 500px));
+  /*
+   * Side by side, space gives way before the board does: first the gap
+   * between board and panel (64px to 24px), then the page's side margins
+   * (right 40px to 16px, left 40px to 36px, room for the eval bar). Only
+   * then does the board shrink, and before it would drop below about 556px
+   * the layout turns vertical (see the media queries at the end).
+   */
+  --panel-width: 460px;
+  --table-pad: 40px;
+  --table-gap: clamp(24px, 100vw - 1260px, 64px);
+  --pad-right: clamp(16px, 100vw - 1244px, 40px);
+  --pad-left: clamp(36px, 100vw - 1224px, 40px);
+  --board-size: min(
+    86vmin,
+    720px,
+    100vw -
+    var(--panel-width) -
+    var(--table-gap) -
+    var(--pad-left) -
+    var(--pad-right)
+  );
 
   color: var(--ink);
   background: var(--table);
@@ -50,14 +77,156 @@ button {
 .table {
   min-height: 100dvh;
   display: grid;
-  grid-template-columns: auto minmax(300px, 400px);
-  gap: clamp(28px, 5vw, 64px);
+  grid-template-columns: auto var(--panel-width);
+  gap: var(--table-gap);
   align-items: center;
   justify-content: center;
-  padding: clamp(16px, 3vw, 40px);
+  padding: var(--table-pad) var(--pad-right) var(--table-pad) var(--pad-left);
 }
 
 /* ── Board ──────────────────────────────────────────────────────────────── */
+
+/* The eval bar hangs beside the board and never moves it. */
+.board-area {
+  position: relative;
+}
+
+/*
+ * Who is better, as on Lichess: Black's share from the top, White's from the
+ * bottom, a tick at even, and the number at the leading end.
+ */
+.eval-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: calc(100% + 8px);
+  width: 22px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--disc-black);
+  box-shadow: inset 0 0 0 1px var(--panel-line);
+}
+
+.eval-bar[hidden] {
+  display: none;
+}
+
+.eval-white {
+  position: absolute;
+  inset: auto 0 0;
+  height: calc(var(--white-share, 0.5) * 100%);
+  background: var(--disc-white);
+  transition: height 0.45s ease-out;
+}
+
+.eval-bar::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--accent);
+  opacity: 0.8;
+}
+
+.eval-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+}
+
+.eval-bar[data-lead="black"] .eval-label {
+  top: 5px;
+  color: var(--disc-white);
+}
+
+.eval-bar[data-lead="white"] .eval-label {
+  bottom: 5px;
+  color: var(--disc-black);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .eval-white {
+    transition: none;
+  }
+}
+
+/*
+ * Mirror the board, with the flip icon of an image editor; over the board's
+ * corner, next to what it changes. Straw while the board is mirrored.
+ */
+.mirror {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-quiet);
+  cursor: pointer;
+}
+
+.mirror:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.mirror[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.mirror svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+}
+
+.mirror-axis {
+  stroke-dasharray: 2 2.5;
+}
+
+/* The original filled, its mirror image in outline. */
+.mirror-shape:not(.mirror-image) {
+  fill: currentColor;
+}
+
+/* No legal move: a note and the Pass button, over the middle of the board. */
+.pass-prompt {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 10px 10px 18px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: var(--frame);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
+}
+
+.pass-prompt[hidden] {
+  display: none;
+}
 
 /* The frame is the board's rim: the same width on all four sides. */
 .board-frame {
@@ -157,6 +326,53 @@ button {
   box-shadow: inset 0 0 0 3px var(--accent);
 }
 
+/* What the last move captured: a line through each run and a dot per disc,
+   in the colour the discs had before. Every disc in a captured run now has
+   the mover's colour, so the mark always stands out against it. */
+.rv-flips {
+  position: absolute;
+  inset: 1px;
+  width: calc(100% - 2px);
+  height: calc(100% - 2px);
+  pointer-events: none;
+}
+
+.rv-flips[data-by="black"] {
+  --was: var(--disc-white);
+}
+
+.rv-flips[data-by="white"] {
+  --was: var(--disc-black);
+}
+
+.rv-flip-line {
+  stroke: var(--was);
+  stroke-width: 0.03;
+  stroke-linecap: round;
+  opacity: 0.55;
+}
+
+.rv-flip {
+  fill: var(--was);
+}
+
+/* An engine's opinion of a move, written on its square. */
+.rv-note {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: calc(var(--board-size) * 0.03);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  pointer-events: none;
+}
+
+.rv-note[data-best="true"] {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 /* Where the side on the move can go — shown for bots too, for the onlooker. */
 .rv-hint {
   inset: 35%;
@@ -196,62 +412,103 @@ button {
 
 .players {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 28px;
+  gap: 12px;
 }
 
+/*
+ * Each side keeps its things in a tray of its own colour, like the disc
+ * wells beside a real board: Black's darker than the table, White's lighter.
+ */
+/* The tray's left edge says whose move it is: straw for the side on the
+   move (and for the winner), a quiet line for the other. */
+.player {
+  padding: 20px;
+  border-radius: 10px;
+  border-left: 3px solid var(--panel-line);
+}
+
+.player:is([data-turn="true"], [data-result="won"]) {
+  border-left-color: var(--accent);
+}
+
+.player[data-side="black"] {
+  --tray: #111613;
+  background: var(--tray);
+}
+
+.player[data-side="white"] {
+  --tray: #29312d;
+  background: var(--tray);
+}
+
+/*
+ * The side is told by its disc, as on the board. The clock keeps the top
+ * corner with whose move it is beside it; the disc and the score sit in the
+ * middle of the tray.
+ */
 .player-head {
-  display: grid;
-  grid-template-columns: auto auto 1fr;
-  align-items: center;
-  column-gap: 8px;
-  padding-bottom: 14px;
-  /* The rule under the side on the move turns straw. */
-  border-bottom: 2px solid var(--panel-line);
+  display: contents;
 }
 
-.player[data-turn="true"] .player-head {
-  border-bottom-color: var(--accent);
+/* The top line mirrors the time presets at the bottom: the same height,
+   so the tray stays balanced around the score. */
+.player-top {
+  grid-area: top;
+  align-self: start;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  /* The presets' cells plus their frame. */
+  height: calc(var(--think-height) + 2px);
+  font-size: var(--think-font);
+}
+
+.player-score {
+  grid-area: score;
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 
 .player-disc {
-  width: 14px;
-  height: 14px;
+  flex: none;
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 
 .player-disc[data-disc="black"] {
-  background: var(--disc-black);
-  box-shadow: 0 0 0 1px rgba(233, 229, 216, 0.35);
+  background: radial-gradient(
+    circle at 35% 30%,
+    #363d39,
+    var(--disc-black) 62%
+  );
+  box-shadow: 0 0 0 1px rgba(233, 229, 216, 0.22);
 }
 
 .player-disc[data-disc="white"] {
-  background: var(--disc-white);
+  background: radial-gradient(
+    circle at 35% 30%,
+    #ffffff,
+    var(--disc-white) 55%,
+    #cfccc0
+  );
 }
 
-.player-name {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 500;
-}
-
-/* "to move", "thinking", "wins" — the state of the game, next to the name. */
+/* "to move", "thinking", "wins" — the state of the game, over the clock. */
 .player-state {
-  justify-self: end;
-  font-size: 0.875rem;
+  white-space: nowrap;
   color: var(--accent);
 }
 
-.player[data-result="won"] .player-head {
-  border-bottom-color: var(--accent);
-}
-
+/* The score is what the tray is for: big, and in a regular weight that
+   holds up on both trays. */
 .player-count {
-  grid-column: 1 / 3;
-  margin-top: 6px;
-  font-size: 3.5rem;
-  font-weight: 300;
+  font-size: 5rem;
+  font-weight: 400;
   line-height: 1;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
 
@@ -260,28 +517,29 @@ button {
 }
 
 /*
- * A small clock under the state: time left for the side on the move, time
- * taken over the last move for the other. Thousands stand apart from the rest.
+ * The clock, always in the top corner: time left for the side on the move,
+ * time taken over the last move for the other. Monospace, every digit
+ * always present, so it does not twitch as it runs.
  */
 .player-clock {
-  align-self: end;
-  justify-self: end;
-  padding-bottom: 6px;
-  font-size: 0.8125rem;
-  font-variant-numeric: tabular-nums;
+  font-size: 1.125em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  letter-spacing: 0.02em;
   white-space: nowrap;
+  color: var(--ink);
+}
+
+.clock-tenth {
   color: var(--ink-quiet);
 }
 
-.ms-thousands {
-  margin-right: 0.18em;
-  color: var(--ink);
-  font-weight: 500;
+.player-clock[data-idle="true"],
+.player[data-turn="false"][data-result=""] .player-clock {
+  color: var(--ink-quiet);
 }
 
-.ms-unit {
-  margin-left: 0.3em;
-  opacity: 0.7;
+.player-clock[data-idle="true"] {
+  opacity: 0.5;
 }
 
 .player[data-thinking="true"] .player-disc {
@@ -294,10 +552,29 @@ button {
   }
 }
 
+/*
+ * Whose move it is reads from the whole column: the side to move is lit and
+ * its disc wears a straw ring; the waiting side steps back.
+ */
+.player[data-turn="true"] .player-disc {
+  box-shadow:
+    0 0 0 3px var(--tray),
+    0 0 0 5px var(--accent);
+}
+
+/* The waiting side's score stays legible, just quieter. */
+.player[data-turn="false"][data-result=""] .player-count {
+  opacity: 0.6;
+}
+
+.player[data-turn="false"][data-result=""] .player-disc {
+  opacity: 0.7;
+}
+
 /* Strategy list: one choice per side. */
 .options {
   display: grid;
-  margin-top: 10px;
+  margin-top: var(--gap-inner);
 }
 
 .option {
@@ -326,14 +603,33 @@ button {
 }
 
 .option-name {
+  font-size: 1.1875rem;
   color: var(--ink-quiet);
 }
 
 .option-detail {
-  font-size: 0.75rem;
-  line-height: 1.3;
+  font-size: 0.6875rem;
+  line-height: 1.25;
   color: var(--ink-quiet);
+}
+
+/*
+ * A bot's line is shown only for the bot that is chosen and the one under
+ * the pointer or keyboard focus (on a phone, tapping chooses, so the line
+ * shows there too). It fades in from nothing; a network bot's waits for its
+ * weights to be known. The hidden line keeps its height so nothing moves.
+ */
+.option-detail {
+  opacity: 0;
+  transition: opacity 0.5s ease-out;
+}
+
+.option:is(:hover, :focus-within) .option-detail:not([data-pending]) {
   opacity: 0.75;
+}
+
+.option-detail:empty::before {
+  content: "\00a0";
 }
 
 .option:hover .option-name {
@@ -345,7 +641,7 @@ button {
   font-weight: 500;
 }
 
-.option input:checked + .option-body .option-detail {
+.option input:checked + .option-body .option-detail:not([data-pending]) {
   opacity: 1;
 }
 
@@ -353,7 +649,7 @@ button {
   content: "";
   position: absolute;
   left: 3px;
-  top: 13px;
+  top: 15px;
   width: 8px;
   height: 8px;
   border-radius: 50%;
@@ -373,9 +669,9 @@ button {
   outline-offset: 2px;
 }
 
-/* Time per move: presets in seconds and a custom value in milliseconds. */
+/* Time per move in seconds: presets and a custom, possibly fractional, value. */
 .think {
-  margin: 14px 0 0;
+  margin: var(--gap-inner) 0 0;
   padding: 0;
   border: 0;
   min-width: 0;
@@ -383,22 +679,20 @@ button {
   color: var(--ink-quiet);
 }
 
-.think-label {
-  padding: 0;
-  margin-bottom: 6px;
-}
-
 .think-cells {
-  display: grid;
-  grid-template-columns: repeat(4, 26px) minmax(0, 1fr);
+  /* Equal presets, each a little wider than "0.5s"; the custom field may
+     take more. */
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(2.9em, auto);
   border: 1px solid var(--panel-line);
-  border-radius: 4px;
+  border-radius: 5px;
 }
 
 .think-cell {
   min-width: 0;
-  height: 28px;
-  padding: 0;
+  height: var(--think-height, var(--control-height));
+  padding: 0 7px;
   border: 0;
   border-right: 1px solid var(--panel-line);
   background: transparent;
@@ -414,28 +708,29 @@ button {
 }
 
 button.think-cell:hover:enabled:not([aria-pressed="true"]) {
-  background: rgba(233, 229, 216, 0.08);
+  background: var(--hover);
 }
 
 .think-cell[aria-pressed="true"],
 .think-custom[data-active="true"] {
-  background: var(--ink);
-  color: var(--table);
+  background: var(--chosen);
+  font-weight: 500;
 }
 
+/* The custom value sits in the middle of its cell, like the presets. */
 .think-custom {
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 0 6px 0 0;
+  justify-content: center;
+  gap: 1px;
   cursor: text;
 }
 
 .think-custom input {
-  width: 100%;
+  width: 3.2ch;
   min-width: 0;
   height: 100%;
-  padding: 0 0 0 6px;
+  padding: 0;
   border: 0;
   background: transparent;
   color: inherit;
@@ -467,7 +762,7 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
 
 /* No searching bot on this side: the time is shown but cannot be changed. */
 .think:disabled .think-cells {
-  opacity: 0.4;
+  opacity: 0.45;
 }
 
 .think:disabled .think-cell {
@@ -475,7 +770,7 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
 }
 
 .status {
-  margin: 28px 0 0;
+  margin: var(--gap-group) 0 0;
   font-size: 1rem;
 }
 
@@ -487,23 +782,26 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 28px;
+  margin-top: var(--gap-group);
 }
 
 .status + .actions {
-  margin-top: 16px;
+  margin-top: var(--gap-inner);
 }
 
 .status:empty + .actions {
-  margin-top: 28px;
+  margin-top: var(--gap-group);
 }
 
+/* Play is the one filled control on the panel. */
 .action {
-  padding: 8px 16px;
+  height: calc(var(--control-height) + 4px);
+  padding: 0 18px;
   border: 1px solid var(--ink);
   border-radius: 999px;
   background: var(--ink);
   color: var(--table);
+  font-weight: 500;
   cursor: pointer;
 }
 
@@ -519,6 +817,7 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
   background: transparent;
   color: var(--ink);
   border-color: var(--panel-line);
+  font-weight: 400;
 }
 
 .action-quiet:hover {
@@ -526,43 +825,266 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
   border-color: var(--ink-quiet);
 }
 
+/* Nothing to play yet: an outline, not a faded fill. */
 .action:disabled {
-  opacity: 0.5;
+  background: transparent;
+  border-color: var(--panel-line);
+  color: var(--ink-quiet);
   cursor: default;
 }
 
+/* Analysis: pick an engine; its opinion of each move appears on the board. */
 .analysis {
-  margin-top: 20px;
-  font-size: 0.875rem;
+  margin-top: var(--gap-group);
+  font-size: 0.8125rem;
   color: var(--ink-quiet);
 }
 
-.analysis-title {
-  margin: 0 0 6px;
+/* The switch on the left, the engine to ask on the right. */
+.analysis-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
 }
 
-.analysis-list {
-  margin: 0;
+/* The on/off switch for analysis. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   padding: 0;
-  list-style: none;
-  max-height: 11.5em;
-  overflow-y: auto;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.switch-track {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--panel-line);
+  transition: background 0.15s;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--ink-quiet);
+  transition:
+    transform 0.15s,
+    background 0.15s;
+}
+
+.switch[aria-checked="true"] .switch-track {
+  background: var(--accent);
+}
+
+.switch[aria-checked="true"] .switch-knob {
+  transform: translateX(14px);
+  background: var(--table);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch-track,
+  .switch-knob {
+    transition: none;
+  }
+}
+
+/* Engines as plain tabs; the chosen one is underlined in straw, like the
+   side on the move. */
+.analysis-engines {
+  display: flex;
+  gap: 16px;
+}
+
+.analysis-engine {
+  height: var(--control-height);
+  padding: 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--ink-quiet);
+  font: inherit;
+  cursor: pointer;
+}
+
+.analysis-engine:hover:not([aria-pressed="true"]) {
+  color: var(--ink);
+}
+
+.analysis-engine[aria-pressed="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+/* Analysis off: the choice stays available but steps back. */
+.analysis:has(.switch[aria-checked="false"])
+  .analysis-engine[aria-pressed="true"] {
+  color: var(--ink-quiet);
+  border-bottom-color: var(--panel-line);
+}
+
+.analysis-summary {
+  margin: var(--gap-inner) 0 0;
+}
+
+.analysis-summary:empty {
+  display: none;
+}
+
+/* Three figures in the light numerals of the scoreboard. */
+.analysis-summary[data-kind="readout"] {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.figure-value {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 1.5rem;
+  font-weight: 300;
+  line-height: 1.1;
   color: var(--ink);
   font-variant-numeric: tabular-nums;
 }
 
-.analysis-list li {
+/* Waiting for the first result: the blanks breathe. */
+.analysis-summary[data-pending="true"] .figure-value {
+  color: var(--ink-quiet);
+  animation: pending 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes pending {
+  to {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .analysis-summary[data-pending="true"] .figure-value {
+    animation: none;
+  }
+}
+
+.figure-unit {
+  font-size: 0.75rem;
+  color: var(--ink-quiet);
+  white-space: nowrap;
+}
+
+.figure-disc {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+}
+
+.figure-disc[data-disc="black"] {
+  background: var(--disc-black);
+  box-shadow: 0 0 0 1px rgba(233, 229, 216, 0.35);
+}
+
+.figure-disc[data-disc="white"] {
+  background: var(--disc-white);
+}
+
+/*
+ * CPU load as a small equalizer: one column of dots per thread, lit while a
+ * bot or the analysis searches on it. The top of a busy column flickers.
+ */
+/* Sits at the right end of the row of actions. */
+.cpu {
   display: flex;
-  justify-content: space-between;
-  max-width: 9em;
-  padding: 1px 0;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 0 auto;
+  align-self: center;
+}
+
+.cpu-label {
+  font-size: 0.75rem;
+  line-height: 1;
+  color: var(--ink-quiet);
+}
+
+.cpu-cores {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+}
+
+.cpu-cores i {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 2px;
+}
+
+.cpu-cores b {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--panel-line);
+}
+
+.cpu-cores i.busy b {
+  background: var(--accent);
+}
+
+.cpu-cores i.busy b:nth-child(n + 3) {
+  animation: cpu-level 0.8s ease-in-out infinite alternate;
+  /* Each core at its own point of the beat. */
+  animation-delay: calc(var(--core) * -230ms);
+}
+
+.cpu-cores i.busy b:nth-child(4) {
+  animation-duration: 1.15s;
+}
+
+@keyframes cpu-level {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cpu-cores i.busy b:nth-child(n + 3) {
+    animation: none;
+  }
 }
 
 /* ── Narrow screens: board on top, panel below ──────────────────────────── */
 
-@media (max-width: 860px) {
+/* ── Board on top, panel below ──────────────────────────────────────────── */
+
+@media (max-width: 1091px) {
   :root {
-    --board-size: min(92vw, 720px);
+    --table-pad: clamp(16px, 3vw, 40px);
+    --pad-left: var(--table-pad);
+    --pad-right: var(--table-pad);
+    --table-gap: 28px;
+    /* Room on the left for the eval bar. */
+    --board-size: min(100vw - 80px, 720px);
   }
 
   .table {
@@ -572,16 +1094,118 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
   }
 
   .panel {
-    width: min(100%, 420px);
+    width: min(100%, var(--panel-width));
+  }
+
+  /* Room over the board for the mirror button. */
+  .board-area {
+    margin-top: 36px;
+  }
+}
+
+/*
+ * At every width the trays stack, Black's over White's, and each has the
+ * score and the time per move on the left and the bots on the right.
+ */
+.player {
+  display: grid;
+  /* The left column is as wide as the time presets need. */
+  grid-template-columns: auto minmax(0, 1fr);
+  /* Equal rows above and below keep the score in the middle of the tray. */
+  grid-template-rows: 1fr auto 1fr;
+  grid-template-areas:
+    "top options"
+    "score options"
+    "think options";
+  column-gap: 24px;
+  --think-height: 36px;
+  --think-font: 0.9375rem;
+}
+
+.player .options {
+  grid-area: options;
+  margin-top: 0;
+}
+
+.player .think {
+  grid-area: think;
+  align-self: end;
+  font-size: var(--think-font);
+}
+
+/* Phones: the left column is too narrow for the time presets, so they run
+   along the bottom of the tray, under both columns. */
+@media (max-width: 599px) {
+  .player {
+    grid-template-rows: 1fr auto 1fr auto;
+    grid-template-areas:
+      "top options"
+      "score options"
+      ". options"
+      "think think";
+    row-gap: 0;
+    --think-height: var(--control-height);
+    --think-font: 0.875rem;
+  }
+
+  .player .think {
+    margin-top: 14px;
+  }
+
+  /* Along the whole tray: the cells share its width. */
+  .think-cells {
+    display: grid;
+    grid-auto-columns: 1fr;
+  }
+
+  .player-top {
+    gap: 10px;
+  }
+}
+
+/* Vertical, with room to spare: the panel is as wide as the board. */
+@media (max-width: 1091px) and (min-width: 600px) {
+  .panel {
+    width: min(100%, var(--board-size));
+  }
+}
+
+/* ── Narrow screens: everything a little tighter ────────────────────────── */
+
+@media (max-width: 860px) {
+  :root {
+    --board-size: min(100vw - 64px, 720px);
+  }
+
+  .eval-bar {
+    right: calc(100% + 5px);
+    width: 9px;
+  }
+
+  .player {
+    padding: 14px;
+  }
+
+  .players {
+    gap: 10px;
+  }
+
+  /* Too narrow for the number; the summary below the panel says it. */
+  .eval-label {
+    display: none;
   }
 
   .player-count {
-    font-size: 2.75rem;
+    font-size: 3.75rem;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .player[data-thinking="true"] .player-disc {
     animation: none;
+  }
+
+  .option-detail {
+    transition: none;
   }
 }

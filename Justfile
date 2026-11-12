@@ -108,6 +108,9 @@ tournament botname:
 # Runs are interchangeable between machines: checkpoints are framework-neutral
 # (MLX on Apple Silicon, PyTorch on Linux/CUDA).
 
+# The ssh host of the training machine. Away from its network use a host that
+# jumps through a relay, e.g. `REVERSI_TRAIN_HOST=ku-jump just snapshot`.
+_train_host := env_var_or_default("REVERSI_TRAIN_HOST", "ku")
 _remote_dir := "gh/awnion/reversi"
 _remote_path := "export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
@@ -144,10 +147,11 @@ logs-remote host botname:
     ssh {{ host }} 'tail -f {{ _remote_dir }}/weights/{{ botname }}/train.log'
 
 # Download the newest champion from the training machine into a browser bot
-# and rebuild the WASM. With no arguments: zerorev-v2 from ku into ZeroRev.
+# and rebuild the WASM. With no arguments: zerorev-v2 from the training host
+# into ZeroRev.
 #   just snapshot [host] [run] [bot] [champion|latest]
 # "champion" is the last tournament winner, "latest" the newest trained weights.
-snapshot host="ku" run="zerorev-v2" bot="zerorev" which="champion":
+snapshot host=_train_host run="zerorev-v2" bot="zerorev" which="champion":
     #!/usr/bin/env bash
     set -euo pipefail
     remote={{ host }}:{{ _remote_dir }}/weights/{{ run }}
