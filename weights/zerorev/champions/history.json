@@ -6,7 +6,10 @@
     "step": 522000,
     "loss": 2.0211,
     "win_rate": 0.611,
-    "vs_minimax_300ms": { "as_black": "46:18 win", "as_white": "8:56 loss" }
+    "vs_minimax_300ms": {
+      "as_black": "46:18 win",
+      "as_white": "8:56 loss"
+    }
   },
   {
     "file": "zerorev-v2_step624000.bin",
@@ -15,7 +18,10 @@
     "step": 624000,
     "loss": 2.0346,
     "win_rate": 0.611,
-    "vs_minimax_300ms": { "as_black": "28:36 loss", "as_white": "40:24 win" }
+    "vs_minimax_300ms": {
+      "as_black": "28:36 loss",
+      "as_white": "40:24 win"
+    }
   },
   {
     "file": "zerorev-v2_step639000.bin",
@@ -24,15 +30,23 @@
     "step": 639000,
     "loss": 1.9297,
     "win_rate": 0.611,
-    "vs_minimax_300ms": { "as_black": "37:27 win", "as_white": "33:31 win" }
+    "vs_minimax_300ms": {
+      "as_black": "37:27 win",
+      "as_white": "33:31 win"
+    }
   },
   {
-    "file": "zerorev-v2_step1239000.bin",
+    "file": "gladiator0.bin",
     "run": "zerorev-v2",
     "date": "2026-11-12",
     "step": 1239000,
     "loss": 1.8531,
     "win_rate": 0.583,
-    "vs_minimax_300ms": { "as_black": "18:46 loss", "as_white": "38:26 win" }
+    "vs_minimax_300ms": {
+      "as_black": "18:46 loss",
+      "as_white": "38:26 win"
+    },
+    "name": "gladiator0",
+    "note": "promoted through hundreds of mini-tournaments of the old 18-game gating"
   }
 ]
