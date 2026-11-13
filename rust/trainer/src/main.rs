@@ -27,6 +27,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use reversi_mcts::Budget;
 use tch::Device;
 use tch::Tensor;
 
@@ -56,7 +57,10 @@ commands:
                                 probabilities and the value per position
 
 self-play options (selfplay, bench):
-  --simulations N         MCTS simulations per move (800)
+  --simulations N         MCTS simulations per recorded move (800)
+  --fast-simulations N    playout cap randomization: simulations on the moves
+                          that are only played, not recorded (= --simulations: off)
+  --full-fraction F       share of moves searched with --simulations and recorded (1)
   --workers N             search threads (6)
   --pools-per-worker N    game pools per search thread (1)
   --games-per-pool N      concurrent games per pool (1024)
@@ -221,7 +225,11 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         // evaluations answered by the cache, 6k games still fill the GPU.
         pools_per_worker: args.num("pools-per-worker", 1usize)?.max(1),
         games_per_pool: args.num("games-per-pool", 1024usize)?.max(1),
-        simulations: args.num("simulations", 800u32)?,
+        budget: {
+            let full = args.num("simulations", 800u32)?;
+            let fast = args.num("fast-simulations", full)?;
+            Budget::capped(full, fast, args.num("full-fraction", 1.0f32)?)
+        },
         stagger,
         batch_target: args.num("batch-target", 8192usize)?.max(1),
         min_batch: args.num("min-batch", 0usize)?,
@@ -276,7 +284,9 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         workers = config.workers,
         pools = config.workers * config.pools_per_worker,
         games = config.workers * config.pools_per_worker * config.games_per_pool,
-        simulations = config.simulations,
+        simulations = config.budget.full,
+        fast_simulations = config.budget.fast,
+        full_fraction = config.budget.full_fraction,
         batch_target = config.batch_target,
         stagger = config.stagger,
     );

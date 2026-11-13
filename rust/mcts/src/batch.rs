@@ -23,9 +23,62 @@ use crate::search::MctsSearch;
 /// Moves sampled from the visit distribution at the start of each game.
 const SELF_PLAY_TEMPERATURE_MOVES: usize = 12;
 const ROOT_NOISE_EPSILON: f32 = 0.25;
+/// Share of the search's own evaluation in the value target: the target is
+/// `(1 - w) · z + w · q`, with `z` the game result and `q` the search value of
+/// the position. The result alone is noisy (sampled opening moves, root noise,
+/// later mistakes); the search value is less noisy but biased by the network.
+const VALUE_TARGET_SEARCH_WEIGHT: f32 = 0.5;
 /// Positions with at most this many empty squares are solved exactly
 /// ([`crate::endgame::solve`]) instead of searched.
 pub const ENDGAME_SOLVE_EMPTIES: u32 = 12;
+
+/// Search budget per move: playout cap randomization (KataGo). A random
+/// `full_fraction` of the moves get `full` simulations, root noise and a
+/// training sample; the rest a quick `fast` search that only picks the move.
+/// Many more games for the same work, and every recorded position still has a
+/// full-strength policy target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Budget {
+    pub full: u32,
+    pub fast: u32,
+    pub full_fraction: f32,
+}
+
+impl Budget {
+    /// Every move searched with `simulations` and recorded.
+    pub fn fixed(simulations: u32) -> Self {
+        Budget { full: simulations, fast: simulations, full_fraction: 1.0 }
+    }
+
+    /// `full` simulations on `full_fraction` of the moves, `fast` on the rest.
+    pub fn capped(full: u32, fast: u32, full_fraction: f32) -> Self {
+        if fast >= full || full_fraction >= 1.0 {
+            return Self::fixed(full);
+        }
+        Budget { full, fast: fast.max(1), full_fraction: full_fraction.max(0.0) }
+    }
+
+    /// Average simulations per move.
+    fn expected(&self) -> u32 {
+        let f = self.full_fraction;
+        (f * self.full as f32 + (1.0 - f) * self.fast as f32).round() as u32
+    }
+
+    /// Draw the search for the next move: `(simulations, full)`.
+    fn draw(&self, rng: &mut SimpleRng) -> (u32, bool) {
+        if self.full_fraction >= 1.0 || rng.next_f32() < self.full_fraction {
+            (self.full, true)
+        } else {
+            (self.fast, false)
+        }
+    }
+}
+
+impl From<u32> for Budget {
+    fn from(simulations: u32) -> Self {
+        Budget::fixed(simulations)
+    }
+}
 
 /// Number of `f32`s per position in the network input (4 planes of 8×8).
 pub const PLANES_LEN: usize = 4 * 64;
@@ -62,6 +115,9 @@ struct Sample {
     policy: [f32; 64],
     policy_weight: f32,
     value_weight: f32,
+    /// The search's value of the position for the side to move, if searched
+    /// or solved.
+    q: Option<f32>,
 }
 
 /// One self-play game in progress.
@@ -74,6 +130,10 @@ struct Game {
     /// Search for the current move; `None` between moves.
     search: Option<MctsSearch>,
     sims_done: u32,
+    /// Simulations for the current move, and whether it is a full search
+    /// (noised and recorded) or a fast one.
+    target: u32,
+    full: bool,
     /// The subtree of the last move played, reused by the next search.
     reuse: Option<MctsSearch>,
     /// Root noise has been added to the current search.
@@ -91,6 +151,8 @@ impl Game {
             rng: SimpleRng::new(),
             search: None,
             sims_done: 0,
+            target: 0,
+            full: true,
             reuse: None,
             noised: false,
         }
@@ -98,7 +160,7 @@ impl Game {
 
     /// Advance until the game needs an evaluation (`Ok`) or is over (`Err`
     /// with the finished record).
-    fn advance(&mut self, simulations: u32) -> Result<EvalRequest, GameRecord> {
+    fn advance(&mut self, budget: &Budget) -> Result<EvalRequest, GameRecord> {
         loop {
             if self.search.is_none() {
                 // Skip forced passes; two in a row end the game.
@@ -115,11 +177,11 @@ impl Game {
                 if empties <= ENDGAME_SOLVE_EMPTIES {
                     // Perfect play to the end, no network needed.
                     self.reuse = None;
-                    let (best, _) = solve(self.board, self.is_black);
+                    let (best, score) = solve(self.board, self.is_black);
                     let m = best.expect("the side to move has a move");
                     let mut policy = [0.0; 64];
                     policy[m.trailing_zeros() as usize] = 1.0;
-                    self.record_and_play(legal, policy, 1.0, m);
+                    self.record_and_play(legal, policy, 1.0, Some(score.signum() as f32), m);
                     continue;
                 }
                 if legal.count_ones() == 1 {
@@ -127,7 +189,7 @@ impl Game {
                     let mut policy = [0.0; 64];
                     policy[legal.trailing_zeros() as usize] = 1.0;
                     self.reuse = self.reuse.take().and_then(|tree| tree.into_child(legal));
-                    self.record_and_play(legal, policy, 0.0, legal);
+                    self.record_and_play(legal, policy, 0.0, None, legal);
                     continue;
                 }
                 let search = match self.reuse.take() {
@@ -135,12 +197,13 @@ impl Game {
                     _ => MctsSearch::new(self.board, self.is_black),
                 };
                 self.sims_done = search.visits();
+                (self.target, self.full) = budget.draw(&mut self.rng);
                 self.noised = false;
                 self.search = Some(search);
                 self.add_noise_once(legal);
             }
 
-            if self.sims_done >= simulations {
+            if self.sims_done >= self.target {
                 self.play_move();
                 continue;
             }
@@ -155,10 +218,11 @@ impl Game {
     }
 
     /// Perturb the root priors once they exist (after the first evaluation,
-    /// or right away for a reused tree).
+    /// or right away for a reused tree). Fast searches stay noise-free: they
+    /// only pick the move.
     fn add_noise_once(&mut self, legal: u64) {
         let search = self.search.as_mut().expect("a search in progress");
-        if !self.noised && search.root_expanded() {
+        if self.full && !self.noised && search.root_expanded() {
             add_root_noise(search, legal, &mut self.rng, ROOT_NOISE_EPSILON);
             self.noised = true;
         }
@@ -173,7 +237,8 @@ impl Game {
         self.add_noise_once(legal);
     }
 
-    /// Record the searched position and play the chosen move.
+    /// Record the searched position (full searches only) and play the chosen
+    /// move.
     fn play_move(&mut self) {
         let search = self.search.take().expect("a finished search");
         let legal = self.board.legal_moves(self.is_black);
@@ -186,12 +251,24 @@ impl Game {
             search.best_move()
         };
         let m = selected.expect("a searched position has a legal move");
+        let q = search.root_value();
         self.reuse = search.into_child(m);
-        self.record_and_play(legal, policy, 1.0, m);
+        if self.full {
+            self.record_and_play(legal, policy, 1.0, Some(q), m);
+        } else {
+            self.play(m);
+        }
     }
 
     /// Add the training sample for the current position and play `m`.
-    fn record_and_play(&mut self, legal: u64, policy: [f32; 64], policy_weight: f32, m: u64) {
+    fn record_and_play(
+        &mut self,
+        legal: u64,
+        policy: [f32; 64],
+        policy_weight: f32,
+        q: Option<f32>,
+        m: u64,
+    ) {
         let sample = |policy_weight, value_weight| Sample {
             board: self.board,
             is_black: self.is_black,
@@ -199,12 +276,17 @@ impl Game {
             policy,
             policy_weight,
             value_weight,
+            q,
         };
         self.samples.push(sample(policy_weight, 1.0));
         if (self.board.black | self.board.white).count_ones() == 63 {
             // Forced last move: an extra value-only sample.
             self.samples.push(sample(0.0, 2.0));
         }
+        self.play(m);
+    }
+
+    fn play(&mut self, m: u64) {
         self.board = self.board.apply_move(self.is_black, m);
         self.is_black = !self.is_black;
         self.ply += 1;
@@ -234,12 +316,18 @@ impl Game {
         };
         let positions = std::mem::take(&mut self.samples)
             .into_iter()
-            .map(|s| PositionRecord {
+            .map(|s| {
+                let z = if s.is_black { black_outcome } else { -black_outcome };
+                let w = VALUE_TARGET_SEARCH_WEIGHT;
+                let value = s.q.map_or(z, |q| (1.0 - w) * z + w * q);
+                (s, value)
+            })
+            .map(|(s, value)| PositionRecord {
                 board: s.board,
                 is_black: s.is_black,
                 legal: s.legal,
                 mcts_policy: s.policy,
-                outcome: if s.is_black { black_outcome } else { -black_outcome },
+                outcome: value,
                 margin: if s.is_black { black_margin } else { -black_margin },
                 policy_weight: s.policy_weight,
                 value_weight: s.value_weight,
@@ -256,7 +344,7 @@ const TYPICAL_GAME_MOVES: u64 = 60;
 
 /// A set of self-play games advanced together, one simulation per round.
 pub struct SelfPlayPool {
-    simulations: u32,
+    budget: Budget,
     games: Vec<Game>,
     /// `start_round[i]`: first round in which game `i` takes part.
     start_round: Vec<u64>,
@@ -268,11 +356,15 @@ pub struct SelfPlayPool {
 }
 
 impl SelfPlayPool {
-    /// `games` concurrent games with `simulations` MCTS simulations per move
-    /// (at least one, so that every move has a policy target).
-    pub fn new(games: usize, simulations: u32) -> Self {
+    /// `games` concurrent games with a search `budget` per move (a plain
+    /// number of simulations, or a [`Budget`]); at least one simulation, so
+    /// that every move has a policy target.
+    pub fn new(games: usize, budget: impl Into<Budget>) -> Self {
+        let mut budget = budget.into();
+        budget.full = budget.full.max(1);
+        budget.fast = budget.fast.max(1);
         SelfPlayPool {
-            simulations: simulations.max(1),
+            budget,
             games: (0..games).map(|_| Game::new()).collect(),
             start_round: vec![0; games],
             round: 0,
@@ -285,9 +377,9 @@ impl SelfPlayPool {
     /// Like [`SelfPlayPool::new`], but the games start one after another over
     /// about one game length. Batches grow from one request to `games` during
     /// that ramp-up; afterwards games finish evenly instead of all at once.
-    pub fn staggered(games: usize, simulations: u32) -> Self {
-        let mut pool = Self::new(games, simulations);
-        let game_rounds = u64::from(pool.simulations) * TYPICAL_GAME_MOVES;
+    pub fn staggered(games: usize, budget: impl Into<Budget>) -> Self {
+        let mut pool = Self::new(games, budget);
+        let game_rounds = u64::from(pool.budget.expected()) * TYPICAL_GAME_MOVES;
         for (i, start) in pool.start_round.iter_mut().enumerate() {
             *start = game_rounds * i as u64 / games.max(1) as u64;
         }
@@ -307,7 +399,7 @@ impl SelfPlayPool {
                 continue;
             }
             let request = loop {
-                match game.advance(self.simulations) {
+                match game.advance(&self.budget) {
                     Ok(request) => break request,
                     Err(record) => {
                         self.finished.push(record);

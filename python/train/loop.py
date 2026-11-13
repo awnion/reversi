@@ -44,6 +44,12 @@ from .weights import Weights
 # spare speed buys sharper policy targets instead of positions nobody trains
 # on.
 SIMULATIONS = 800
+# Playout cap randomization (KataGo): only FULL_FRACTION of the moves get the
+# full search and become training positions; the others are played after a
+# FAST_SIMULATIONS search without root noise. About 2.5x more games for the
+# same search work, which is what the value head is short of.
+FAST_SIMULATIONS = 150
+FULL_FRACTION = 0.25
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
@@ -56,6 +62,12 @@ TRAIN_RATIO = 100
 # Cap on training steps owed to already-ingested positions.
 MAX_PENDING_STEPS = 1_000
 CHECKPOINT_EVERY = 500
+# Exponential moving average of the weights, with a time constant of
+# EMA_STEPS steps, updated every EMA_EVERY steps. Self-play, the champion
+# match and the champion use the average, which plays better than the
+# weights of any single step; training continues from the raw weights.
+EMA_STEPS = 10_000
+EMA_EVERY = 10
 KEEP_CHECKPOINTS = 20
 LOG_EVERY = 100
 # Learning-rate schedule: a short warmup, then a few long constant stages,
@@ -75,24 +87,25 @@ CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
 SELFPLAY_GAMES = 1024
 
 # Tournament settings
-# Self-play always uses the newest weights; the champion (what the browser
-# plays, what `just snapshot` fetches) changes only after a long match shows
-# the current network is stronger. 18 games a minute were mostly noise.
-# A match every TOURNAMENT_EVERY_SECONDS of training, once the network has
-# had at least TOURNAMENT_MIN_STEPS steps since the last one. By the clock
-# rather than by steps, because the step rate follows the self-play speed
-# and the thermal throttling.
+# Self-play always uses the weight average; the champion (what the browser
+# plays, what `just snapshot` fetches) is that average, replaced every
+# TOURNAMENT_EVERY_SECONDS of training once the network has had at least
+# TOURNAMENT_MIN_STEPS steps since. By the clock rather than by steps, because
+# the step rate follows the self-play speed and the thermal throttling.
+# No gating, as in AlphaZero: telling +10 Elo apart takes ~4 000 games, and an
+# SPRT match of 400 at 800 simulations took 30 minutes and stayed inconclusive.
 TOURNAMENT_EVERY_SECONDS = 30 * 60
 TOURNAMENT_MIN_STEPS = 5_000
-TOURNAMENT_POOL_CHECKPOINTS = 0  # current vs champion only
-# Games in the match. Every random opening is played twice with colours
-# swapped, so keep this even.
-TOURNAMENT_GAMES_PER_PAIR = 200
-TOURNAMENT_SIMS = 200  # MCTS simulations per move in tournament
+# Before the replacement, TOURNAMENT_PAIRS pairs of games against the old
+# champion, from one random opening each, each colour once: an Elo trend for
+# the log (±90 Elo at 50 games), not a decision.
+TOURNAMENT_PAIRS = 25
+# Same search as the recorded self-play moves, so the match measures the
+# network that training produces.
+TOURNAMENT_SIMS = SIMULATIONS
 TOURNAMENT_OPENING_PLIES = 4  # random moves before the engines take over
 # Tournament games run on CPU threads; leave cores for self-play and training.
 TOURNAMENT_THREADS = max(1, (os.cpu_count() or 2) // 2)
-WIN_THRESHOLD = 0.55  # win rate required to crown a new champion
 CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 
 # Replay persistence
@@ -114,13 +127,15 @@ COOLDOWN_MAX_SECONDS = 300.0
 LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
 # Facts about champion.bin (run, date, loss, win rate, training step).
 CHAMPION_META = WEIGHTS_DIR / "champion.json"
+# The weight average (EMA_STEPS), saved with every checkpoint.
+EMA_PATH = WEIGHTS_DIR / "ema.npz"
 
 
 def _apply_run_name(name: str) -> None:
     """Point all path globals at weights/<name>/."""
     global WEIGHTS_DIR, CHAMPION_BIN, REPLAY_PATH, PID_FILE
     global REPLAY_SPOOL_DIR, SELFPLAY_MODEL_BIN, COOLDOWN_FLAG, CHAMPION_META
-    global LR_ORIGIN_FILE
+    global LR_ORIGIN_FILE, EMA_PATH
     WEIGHTS_DIR = _WEIGHTS_BASE / name
     CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
     REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
@@ -130,6 +145,7 @@ def _apply_run_name(name: str) -> None:
     COOLDOWN_FLAG = WEIGHTS_DIR / "cooldown"
     CHAMPION_META = WEIGHTS_DIR / "champion.json"
     LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
+    EMA_PATH = WEIGHTS_DIR / "ema.npz"
 
 
 # A self-play process alternates between the search trees (one CPU core) and
@@ -201,6 +217,45 @@ def _champion_meta() -> dict:
         return {}
 
 
+class WeightAverage:
+    """Exponential moving average of the weights (see EMA_STEPS)."""
+
+    def __init__(self, weights: Weights) -> None:
+        self.weights: Weights = {name: arr.copy() for name, arr in weights.items()}
+
+    @classmethod
+    def resume(cls, weights: Weights) -> WeightAverage:
+        """The saved average if it fits these weights, else start from them."""
+        try:
+            saved = weights_io.load(EMA_PATH)
+        except Exception:
+            saved = {}
+        fits = saved.keys() == weights.keys() and all(
+            saved[name].shape == arr.shape for name, arr in weights.items()
+        )
+        log_event("ema", "resume" if fits else "start", path=EMA_PATH.name)
+        return cls(saved if fits else weights)
+
+    def update(self, weights: Weights, steps: int) -> None:
+        """Fold in `weights`, which stand for the last `steps` steps."""
+        keep = math.exp(-steps / EMA_STEPS)
+        for name, arr in weights.items():
+            avg = self.weights.get(name)
+            if avg is None or avg.shape != arr.shape or "num_batches" in name:
+                self.weights[name] = arr.copy()
+                continue
+            avg *= keep
+            avg += (1.0 - keep) * arr
+
+    def snapshot(self) -> Weights:
+        return {name: arr.copy() for name, arr in self.weights.items()}
+
+    def save(self) -> None:
+        tmp = EMA_PATH.with_name("ema.tmp.npz")
+        weights_io.save_npz(self.weights, tmp)
+        tmp.replace(EMA_PATH)
+
+
 # --- temperature control -----------------------------------------------------
 
 
@@ -262,7 +317,8 @@ async def train_loop(
     next_tournament_step[0] = step + TOURNAMENT_MIN_STEPS
     next_tournament_at = time.monotonic() + TOURNAMENT_EVERY_SECONDS
     replay_at_last_step = replay.total_added
-    _publish_selfplay_weights(model.weights())
+    ema = WeightAverage.resume(model.weights())
+    _publish_selfplay_weights(ema.weights)
 
     tournament_task: asyncio.Task | None = None
     governor = ThermalGovernor()
@@ -336,6 +392,11 @@ async def train_loop(
             log_event("train", "nan-loss", step=step)
             continue
 
+        if step % EMA_EVERY == 0:
+            with lock:
+                raw = model.weights()
+            ema.update(raw, EMA_EVERY)
+
         now = time.monotonic()
         if step % LOG_EVERY == 0 or now - step_log_t >= 30.0:
             elapsed = now - step_log_t
@@ -363,9 +424,11 @@ async def train_loop(
 
         if save:
             path = WEIGHTS_DIR / f"iter_{step:06d}_loss{loss_val:.4f}.npz"
-            current = model.weights()
+            with lock:
+                current = model.weights()
             _save_checkpoint(current, path)
-            _publish_selfplay_weights(current)
+            ema.save()
+            _publish_selfplay_weights(ema.weights)
             log_event("train", "checkpoint", step=step, path=path.name)
             _prune_checkpoints()
 
@@ -397,7 +460,7 @@ async def train_loop(
             next_tournament_step[0] = step + TOURNAMENT_MIN_STEPS
             next_tournament_at = time.monotonic() + TOURNAMENT_EVERY_SECONDS
             tournament_task = asyncio.create_task(
-                _run_mini_tournament(model, lock, best_loss, step)
+                _run_champion_match(ema.snapshot(), best_loss, step)
             )
             tournament_task.add_done_callback(
                 lambda t: (
@@ -413,159 +476,75 @@ async def train_loop(
 # --- tournament --------------------------------------------------------------
 
 
-async def _run_mini_tournament(
-    current_model: Model,
-    lock: threading.Lock,
+async def _run_champion_match(
+    challenger: Weights,
     current_loss: float = float("inf"),
     current_step: int = 0,
 ) -> None:
-    """Run a small round-robin over champion/current/recent checkpoints."""
+    """Play the weight average against the champion for the log, then make it
+    the champion."""
     import traceback
 
     import reversi_mcts
 
-    # Snapshot the current weights so that training can go on while the
-    # tournament games are running.
-    with lock:
-        snapshot = current_model.weights()
-
     if not CHAMPION_BIN.exists():
         log_event("tournament", "bootstrap-champion")
-        weights_io.save_bin(snapshot, CHAMPION_BIN)
-        _record_champion(snapshot, win_rate=1.0, loss=current_loss, step=current_step)
+        weights_io.save_bin(challenger, CHAMPION_BIN)
+        _record_champion(challenger, win_rate=1.0, loss=current_loss, step=current_step)
         log_event("tournament", "promoted", path=CHAMPION_BIN.name, mode="bootstrap")
         return
 
     try:
-        champion_weights = weights_io.load(CHAMPION_BIN)
-    except Exception as e:
+        champion_blob = CHAMPION_BIN.read_bytes()
+    except OSError as e:
         log_event("tournament", "load-failed", error=repr(e))
         return
+    challenger_blob = weights_io.to_bytes(challenger)
 
-    def _loss_from_path(path: Path) -> float:
-        try:
-            return float(path.stem.split("loss")[-1])
-        except ValueError:
-            return float("inf")
+    log_event("tournament", "start", sims=TOURNAMENT_SIMS, games=2 * TOURNAMENT_PAIRS)
+    seed = time.time_ns() & 0xFFFF_FFFF
+    started = time.monotonic()
 
-    def _step_from_path(path: Path) -> int:
-        try:
-            return int(path.stem.split("_")[1])
-        except (IndexError, ValueError):
-            return -1
+    def play():
+        return reversi_mcts.run_pairs(
+            challenger_blob,
+            champion_blob,
+            TOURNAMENT_PAIRS,
+            TOURNAMENT_SIMS,
+            opening_plies=TOURNAMENT_OPENING_PLIES,
+            seed=seed,
+            threads=TOURNAMENT_THREADS,
+        )
 
-    # "Recent" means recently written: step numbers alone could point at files
-    # left over from an earlier session.
-    recent_paths = sorted(
-        WEIGHTS_DIR.glob("iter_*.npz"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:TOURNAMENT_POOL_CHECKPOINTS]
-
-    entrants: list[dict] = [
-        {
-            "name": "champion.bin",
-            "source": CHAMPION_BIN,
-            "weights": champion_weights,
-            "step": _champion_meta().get("step"),
-            "loss": float("inf"),
-            "is_champion": True,
-            "is_current": False,
-        },
-        {
-            "name": "current",
-            "source": None,
-            "weights": snapshot,
-            "step": current_step,
-            "loss": current_loss,
-            "is_champion": False,
-            "is_current": True,
-        },
-    ]
-    for path in recent_paths:
-        try:
-            entrants.append(
-                {
-                    "name": path.name,
-                    "source": path,
-                    "weights": weights_io.load(path),
-                    "step": _step_from_path(path),
-                    "loss": _loss_from_path(path),
-                    "is_champion": False,
-                    "is_current": False,
-                }
-            )
-        except Exception as e:
-            log_event("tournament", "checkpoint-skip", file=path.name, error=repr(e))
-
-    log_event(
-        "tournament",
-        "start",
-        entrants=len(entrants),
-        games_per_pair=TOURNAMENT_GAMES_PER_PAIR,
-        sims=TOURNAMENT_SIMS,
-    )
-
-    # The games run in Rust on CPU threads, with the same inference code as
-    # the browser bots: no GIL, and the GPU stays with training and self-play.
-    blobs = [weights_io.to_bytes(entrant["weights"]) for entrant in entrants]
-    pairings = len(entrants) * (len(entrants) - 1) // 2
-    total_games = pairings * TOURNAMENT_GAMES_PER_PAIR
-
-    def run_games():
-        try:
-            started = time.monotonic()
-            scores = reversi_mcts.run_tournament(
-                blobs,
-                TOURNAMENT_GAMES_PER_PAIR,
-                TOURNAMENT_SIMS,
-                opening_plies=TOURNAMENT_OPENING_PLIES,
-                seed=time.time_ns() & 0xFFFF_FFFF,
-                threads=TOURNAMENT_THREADS,
-            )
-            log_event(
-                "tournament",
-                "played",
-                games=total_games,
-                seconds=f"{time.monotonic() - started:.0f}",
-            )
-            ranking = sorted(
-                zip((entrant["name"] for entrant in entrants), scores, strict=True),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-            return ranking, total_games
-        except Exception:
-            log_event("tournament", "run-error", error=traceback.format_exc().strip())
-            return None, 0
-
-    loop = asyncio.get_running_loop()
-    ranking, total_games = await loop.run_in_executor(None, run_games)
-    if ranking is None:
+    try:
+        points = await asyncio.get_running_loop().run_in_executor(None, play)
+    except Exception:
+        log_event("tournament", "run-error", error=traceback.format_exc().strip())
         log_event("tournament", "aborted")
         return
-    winner_name, winner_score = ranking[0]
-    entrants_by_name = {entrant["name"]: entrant for entrant in entrants}
-    winner = entrants_by_name[winner_name]
-    max_points = (len(entrants) - 1) * TOURNAMENT_GAMES_PER_PAIR
-    win_rate = winner_score / max_points if max_points > 0 else 0.0
+
+    n = len(points)
+    score = sum(points) / (2 * n)
+    # Two standard errors of the mean pair score, in Elo around `score`.
+    spread = 2 * math.sqrt(sum((p / 2 - score) ** 2 for p in points) / n / n)
+    low, high = _score_to_elo(score - spread), _score_to_elo(score + spread)
     log_event(
         "tournament",
         "result",
-        winner=winner_name,
-        score=f"{winner_score:.1f}/{max_points}",
-        win_rate=f"{win_rate:.0%}",
+        score=f"{sum(points):.1f}/{2 * n}",
+        win_rate=f"{score:.0%}",
+        elo=f"{_score_to_elo(score):+.0f}",
+        elo_range=f"[{low:+.0f},{high:+.0f}]",
+        seconds=f"{time.monotonic() - started:.0f}",
     )
+    weights_io.save_bin(challenger, CHAMPION_BIN)
+    _record_champion(challenger, score, current_loss, step=current_step)
+    log_event("tournament", "promoted", path=CHAMPION_BIN.name, step=current_step)
 
-    if not winner["is_champion"] and win_rate >= WIN_THRESHOLD:
-        log_event("tournament", "promote", threshold=f"{WIN_THRESHOLD:.0%}")
-        weights_io.save_bin(winner["weights"], CHAMPION_BIN)
-        _record_champion(
-            winner["weights"], win_rate, winner["loss"], step=winner["step"]
-        )
-        log_event("tournament", "promoted", path=CHAMPION_BIN.name, winner=winner_name)
-    else:
-        log_event("tournament", "retain-champion")
+
+def _score_to_elo(score: float) -> float:
+    score = min(max(score, 1e-3), 1.0 - 1e-3)
+    return -400.0 * math.log10(1.0 / score - 1.0)
 
 
 def _record_champion(
@@ -858,6 +837,10 @@ def _spawn_rust_selfplay(
         str(WEIGHTS_DIR.resolve()),
         "--simulations",
         str(SIMULATIONS),
+        "--fast-simulations",
+        str(FAST_SIMULATIONS),
+        "--full-fraction",
+        str(FULL_FRACTION),
         "--positions-per-shard",
         str(positions_per_shard),
         "--parent-pid",
@@ -963,7 +946,12 @@ async def _run_selfplay_process(
         producer_id=f"sp{process_index}_pid{os.getpid()}",
         positions_per_shard=positions_per_shard,
     )
-    pool = reversi_mcts.BatchedSelfPlay(selfplay_games, SIMULATIONS)
+    pool = reversi_mcts.BatchedSelfPlay(
+        selfplay_games,
+        SIMULATIONS,
+        fast_simulations=FAST_SIMULATIONS,
+        full_fraction=FULL_FRACTION,
+    )
     stop_flag = [False]
 
     def _shutdown(signum, frame):
@@ -1075,6 +1063,8 @@ async def _run_learner(
         selfplay=selfplay,
         selfplay_processes=selfplay_processes,
         simulations=SIMULATIONS,
+        fast_simulations=FAST_SIMULATIONS,
+        full_fraction=FULL_FRACTION,
         min_replay=MIN_REPLAY,
         train_ratio=TRAIN_RATIO,
         tournament_every=f"{TOURNAMENT_EVERY_SECONDS}s",

@@ -335,7 +335,6 @@ impl MctsSearch {
 
     // ── private ───────────────────────────────────────────────────────────────
 
-    /// Walk down the tree from `start` using PUCT until reaching an unexpanded node.
     /// Expected result for the side to move at the root, from −1 (a loss) to
     /// +1 (a win): the value of its most visited move, the one it would play.
     /// Before any move has been visited, the root's own average.

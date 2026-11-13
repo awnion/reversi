@@ -6,6 +6,7 @@ pub mod parallel;
 pub mod py;
 pub mod search;
 
+pub use batch::Budget;
 pub use batch::PLANES_LEN;
 pub use batch::SelfPlayPool;
 pub use batch::write_planes;

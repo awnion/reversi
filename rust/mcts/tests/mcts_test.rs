@@ -1,3 +1,4 @@
+use reversi_mcts::Budget;
 use reversi_mcts::EvalFn;
 use reversi_mcts::GameRecord;
 use reversi_mcts::MctsSearch;
@@ -75,11 +76,15 @@ fn outcomes_are_consistent() {
         std::cmp::Ordering::Less => -1.0_f32,
         std::cmp::Ordering::Equal => 0.0_f32,
     };
-    // The first position is always black's turn; its outcome should match final_outcome.
+    // The first position is always black's turn and searched: its value target
+    // is halfway between the final outcome and the search value (in [-1, 1]).
     if let Some(first) = record.positions.first() {
         assert!(first.is_black);
-        assert_eq!(first.outcome, final_outcome);
+        assert!((first.outcome - 0.5 * final_outcome).abs() <= 0.5 + 1e-6, "{}", first.outcome);
     }
+    // The terminal samples carry the outcome itself.
+    let last = record.positions.last().expect("a finished game has positions");
+    assert_eq!(last.outcome, if last.is_black { final_outcome } else { -final_outcome });
 }
 
 // ── split select/apply API ────────────────────────────────────────────────
@@ -139,12 +144,19 @@ fn pool_produces_valid_games() {
         // At least one searched move plus the two terminal value samples.
         assert!(record.positions.len() >= 3);
         for pos in &record.positions {
-            let expected = if pos.is_black { black_outcome } else { -black_outcome };
-            assert_eq!(pos.outcome, expected);
+            let z = if pos.is_black { black_outcome } else { -black_outcome };
+            if pos.policy_weight > 0.0 {
+                // Searched or solved: halfway between the result and the
+                // search value, which lies in [-1, 1].
+                assert!((pos.outcome - z).abs() <= 1.0 + 1e-6, "{} vs {z}", pos.outcome);
+                assert!(pos.outcome.abs() <= 1.0);
+            } else {
+                assert_eq!(pos.outcome, z);
+            }
             let black_margin = (record.black_discs as f32 - record.white_discs as f32) / 64.0;
             let margin = if pos.is_black { black_margin } else { -black_margin };
             assert_eq!(pos.margin, margin);
-            assert_eq!(pos.margin.signum() * pos.outcome.abs(), pos.outcome);
+            assert_eq!(pos.margin.signum() * z.abs(), z);
             if pos.policy_weight > 0.0 {
                 let sum: f32 = pos.mcts_policy.iter().sum();
                 assert!((sum - 1.0).abs() < 1e-5, "policy sum = {sum}");
@@ -156,6 +168,31 @@ fn pool_produces_valid_games() {
             }
         }
     }
+}
+
+#[test]
+fn playout_cap_records_only_full_searches() {
+    // Searched positions (before the endgame solver) per game: all of them
+    // with a fixed budget, about a quarter with a capped one.
+    let searched = |budget: Budget| {
+        let mut pool = SelfPlayPool::new(16, budget);
+        let records = run_pool(&mut pool, 32);
+        let positions: usize = records
+            .iter()
+            .flat_map(|r| &r.positions)
+            .filter(|p| {
+                let empties = 64 - (p.board.black | p.board.white).count_ones();
+                p.policy_weight > 0.0 && empties > ENDGAME_SOLVE_EMPTIES
+            })
+            .count();
+        positions as f64 / records.len() as f64
+    };
+    let fixed = searched(Budget::fixed(20));
+    let capped = searched(Budget::capped(20, 4, 0.25));
+    assert!(fixed > 30.0, "fixed: {fixed} searched positions per game");
+    assert!(capped < 0.5 * fixed, "capped: {capped}, fixed: {fixed}");
+    assert!(capped > 0.1 * fixed, "capped: {capped}, fixed: {fixed}");
+    assert_eq!(Budget::capped(20, 20, 0.25), Budget::fixed(20));
 }
 
 #[test]

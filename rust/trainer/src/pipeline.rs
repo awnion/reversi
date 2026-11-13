@@ -27,6 +27,7 @@ use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TryRecvError;
 use crossbeam_channel::select;
+use reversi_mcts::Budget;
 use reversi_mcts::GameRecord;
 use reversi_mcts::SelfPlayPool;
 
@@ -45,7 +46,9 @@ pub struct PipelineConfig {
     pub workers: usize,
     pub pools_per_worker: usize,
     pub games_per_pool: usize,
-    pub simulations: u32,
+    /// Simulations per move: `full` on a random `full_fraction` of the moves
+    /// (recorded), `fast` on the rest (only played).
+    pub budget: Budget,
     /// Spread game starts over one game length (steady output, but small
     /// batches for the first ~60 × simulations rounds).
     pub stagger: bool,
@@ -371,9 +374,9 @@ pub fn run_worker(id: usize, config: &PipelineConfig, links: WorkerLinks) {
     let _guard = PanicGuard { stop: links.stop.clone(), stage: "worker" };
     let new_pool = || {
         if config.stagger {
-            SelfPlayPool::staggered(config.games_per_pool, config.simulations)
+            SelfPlayPool::staggered(config.games_per_pool, config.budget)
         } else {
-            SelfPlayPool::new(config.games_per_pool, config.simulations)
+            SelfPlayPool::new(config.games_per_pool, config.budget)
         }
     };
     let pools: Vec<SelfPlayPool> = (0..config.pools_per_worker).map(|_| new_pool()).collect();

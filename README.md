@@ -28,19 +28,18 @@ human games, no hand-written evaluation.
 flowchart TD
     subgraph SP["Self-play: 6 144 games at once"]
         P["Position"] --> E{"≤ 12 empty<br/>squares?"}
-        E -->|no| S["Tree search: 800 simulations<br/>network suggests moves (policy)<br/>and rates positions (value)"]
+        E -->|no| S["Tree search: 800 simulations on ¼ of the moves,<br/>150 on the rest; network suggests moves<br/>(policy) and rates positions (value)"]
         E -->|yes| X["Exact endgame solver"]
         S -->|"visit counts"| MV["Move: sampled for the first 12,<br/>then the most visited"]
         X --> MV
-        MV -->|"game over"| T["Every position labelled<br/>policy: share of visits<br/>value: result<br/>margin: disc difference"]
+        MV -->|"game over"| T["Positions of the 800-simulation<br/>moves labelled<br/>policy: share of visits<br/>value: ½ result + ½ search<br/>margin: disc difference"]
         MV -.->|"next position"| P
     end
     T --> R[("Replay buffer<br/>last 2 M positions")]
     R -->|"random batches of 512,<br/>one per 100 new positions"| L["Learner<br/>random board symmetry<br/>loss = policy + value + margin"]
-    L -.->|"new weights every 500 steps"| S
-    L -->|"every 30 min"| M{"Match against the champion<br/>200 games, 200 simulations"}
-    M -->|"≥ 55 % of the points"| C["champion.bin"]
-    M -->|"less"| K["Champion stays"]
+    L -.->|"weight average,<br/>every 500 steps"| S
+    L -->|"weight average,<br/>every 30 min"| M["50 games against the old champion,<br/>800 simulations: Elo to the log"]
+    M --> C["New champion.bin"]
     C -->|"bun run build:wasm"| B["ZeroRev in the browser"]
 ```
 
@@ -50,15 +49,18 @@ so that the GPU always gets large batches. Before each move it runs a
 of 800 simulations: the network's *policy* head suggests which moves to try,
 its *value* head judges the positions the search reaches. The search plays
 noticeably better than the network alone, and that gap is what the network
-learns from.
+learns from. Only a random quarter of the moves get the full search and
+become training examples; the rest are played after a quick 150-simulation
+search ([playout cap randomization](https://arxiv.org/abs/1902.10565), from
+KataGo). That gives about 2.5 times more games for the same work.
 
 **What it learns.** Every position becomes a training example with three
 targets:
 
 1. *policy*: how the search spread its visits over the moves, so that the
    network suggests good moves without searching;
-2. *value*: who won that game, so that the network judges a position at a
-   glance;
+2. *value*: half who won that game, half how the search rated the position,
+   so that the network judges a position at a glance;
 3. *margin*, auxiliary: by how many discs the game was won, e.g. 40:24 is +16
    for the winner (scaled to ±1). "Won" and "won big" are different
    positions, and the margin lets the network tell them apart. The bots do not
@@ -67,14 +69,18 @@ targets:
 **Training.** Positions go into a replay buffer that keeps the last 2 M of them
 (about 33 000 games). The learner draws batches of 512 from it, one step per
 100 new positions, so each position is used about 5 times before it ages out.
-Every 500 steps the new weights go back to self-play: a better network plays
-better games, and those make better examples.
+Every 500 steps self-play gets new weights: not the latest step's, but their
+moving average over the last ~10 000 steps (EMA), which plays better than any
+single step. A better network plays better games, and those make better
+examples.
 
-**Champion.** A lower loss does not guarantee stronger play, so the version
-that ships is picked by playing. Every 30 minutes the latest network plays the
-champion 200 games (at 200 simulations, to keep it quick); with 55 % of the
-points or more it takes the champion's place. The browser bot is built from
-the champion.
+**Champion.** Every 30 minutes the weight average becomes the champion, the
+version the browser bot is built from. Before that it plays the old champion
+50 games at 800 simulations, in pairs from one random opening, each colour
+once. The result only goes to the log as an Elo trend: 50 games tell ±90 Elo,
+and seeing +10 Elo would take about 4 000. Gating by
+[SPRT](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) at
+400 games took 30 minutes and stayed inconclusive.
 
 Where it differs from AlphaZero:
 
@@ -85,7 +91,7 @@ Where it differs from AlphaZero:
 | Targets | move, result | move, result, final disc margin |
 | Board symmetries | none | each position in a random one of 8 |
 | Endgame | searched | solved exactly from 12 empty squares |
-| New network | used at once | only if it beats the champion, as in [AlphaGo Zero](https://www.nature.com/articles/nature24270) |
+| Self-play network | latest weights | weight average (EMA) |
 | Self-play hardware | 5 000 TPUs | one laptop: RTX 3080, Ryzen 9 5900HX |
 
 ## Progress
@@ -113,6 +119,7 @@ Where it differs from AlphaZero:
 | 1 883 761 | 1.70 | ●●●●●●●●●○ | |
 | 2 109 942 | 1.66 | ●●●●●●●●●○ | current; beat 1 569 467 in both games |
 | | | | **800 simulations** |
+| | | | **Playout cap randomization**, weight average (EMA), value target ½ result + ½ search; champion = weight average every 30 min, no gating |
 
 ### Fixes
 
@@ -131,6 +138,8 @@ What the old scheme did wrong, fixed at step 1 239 000:
 
 - Positions/s: training positions from self-play per second, on the laptop.
 - Bar label: row · simulations per move. Compare bars with equal simulations.
+- Row 13 records only a quarter of the moves: fewer positions per second, but
+  1.7 times more games (55 → 92 per second).
 - Steps/s: gradient steps (batch 512). From row 7 at 200 simulations the
   learner, sharing the GPU, sets the pace: 7 900 positions/s would allow 79.
 - Source: the training log over steady minutes; rows 1, 2, 4 are short runs.
@@ -138,9 +147,9 @@ What the old scheme did wrong, fixed at step 1 239 000:
 
 ```mermaid
 xychart-beta
-    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800"]
+    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800", "13·800/150"]
     y-axis "positions per second" 0 --> 8000
-    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500]
+    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500, 2540]
 ```
 
 | # | Change | Sims | Positions/s | Steps/s | GPU °C |
@@ -157,6 +166,7 @@ xychart-beta
 | 10 | Search tree in contiguous arrays, PUCT once per node: +45 % per thread | 800 | 3 100 | 32 | 66 |
 | 11 | Cache looked up by the search threads, not the GPU thread | 800 | 4 100 | 40 | 67 |
 | 12 | Half as many games at once (6 144): 12 k trees took > 12 GB and were OOM-killed | 800 | 3 500 | 35 | 65 |
+| 13 | Playout cap randomization: ¼ of the moves at 800 simulations and recorded, the rest at 150 | 800/150 | 2 540 | 25 | 66 |
 
 ## Running it
 

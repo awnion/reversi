@@ -8,6 +8,7 @@ use pyo3::types::PyDict;
 use pyo3::types::PyList;
 use reversi_minimax::board::Board;
 
+use crate::batch::Budget;
 use crate::batch::PLANES_LEN;
 use crate::batch::SelfPlayPool;
 use crate::batch::write_planes;
@@ -163,13 +164,23 @@ fn read_f32s(bytes: &[u8], out: &mut Vec<f32>) -> PyResult<()> {
 impl BatchedSelfPlay {
     /// `stagger` spreads the game starts over about one game length so that
     /// games finish at a steady rate (batches are smaller during that ramp-up).
+    /// `fast_simulations` and `full_fraction` turn on playout cap
+    /// randomization (see [`Budget`]); by default every move is a full search.
     #[new]
-    #[pyo3(signature = (games, simulations, stagger=true))]
-    pub fn new(games: usize, simulations: u32, stagger: bool) -> Self {
+    #[pyo3(signature = (games, simulations, stagger=true, fast_simulations=None, full_fraction=1.0))]
+    pub fn new(
+        games: usize,
+        simulations: u32,
+        stagger: bool,
+        fast_simulations: Option<u32>,
+        full_fraction: f32,
+    ) -> Self {
+        let budget =
+            Budget::capped(simulations, fast_simulations.unwrap_or(simulations), full_fraction);
         let pool = if stagger {
-            SelfPlayPool::staggered(games, simulations)
+            SelfPlayPool::staggered(games, budget)
         } else {
-            SelfPlayPool::new(games, simulations)
+            SelfPlayPool::new(games, budget)
         };
         BatchedSelfPlay { pool, planes: Vec::new(), policies: Vec::new(), values: Vec::new() }
     }
@@ -332,11 +343,74 @@ pub fn run_tournament(
     Ok(scores)
 }
 
+/// Game pairs between two networks (exported `.bin` blobs), for a sequential
+/// test: pair `i` plays one random opening (`opening_plies` moves, derived
+/// from `seed + i`) twice, with colours swapped.
+///
+/// Returns the points of `a` per pair, from 0 to 2 (win 1, draw 0.5), in pair
+/// order. Games run on `threads` CPU threads without the GIL.
+#[pyfunction]
+#[pyo3(signature = (a, b, pairs, simulations, opening_plies=4, seed=0, threads=1))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_pairs(
+    py: Python,
+    a: Vec<u8>,
+    b: Vec<u8>,
+    pairs: usize,
+    simulations: u32,
+    opening_plies: u32,
+    seed: u64,
+    threads: usize,
+) -> PyResult<Vec<f32>> {
+    let load = |bytes: &[u8], name: &str| {
+        reversi_nn::AlphaZeroNet::load(bytes)
+            .map_err(|err| PyValueError::new_err(format!("{name}: {err}")))
+    };
+    let nets = [load(&a, "a")?, load(&b, "b")?];
+    let next = AtomicUsize::new(0);
+    let points = py.allow_threads(|| {
+        let play = || {
+            let mut points = Vec::new();
+            loop {
+                let game = next.fetch_add(1, Ordering::Relaxed);
+                if game >= 2 * pairs {
+                    break points;
+                }
+                let (pair, a_is_black) = (game / 2, game % 2 == 0);
+                let (board, black_to_move) =
+                    random_opening(opening_plies, seed.wrapping_add(pair as u64));
+                let (black, white) = if a_is_black { (0, 1) } else { (1, 0) };
+                let outcome = play_match_from(
+                    board,
+                    black_to_move,
+                    &NetEval(&nets[black]),
+                    &NetEval(&nets[white]),
+                    simulations,
+                );
+                let for_a = if a_is_black { outcome } else { -outcome };
+                points.push((pair, (1.0 + for_a) / 2.0));
+            }
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads.max(1)).map(|_| scope.spawn(play)).collect();
+            let mut total = vec![0.0f32; pairs];
+            for worker in workers {
+                for (pair, p) in worker.join().expect("match worker panicked") {
+                    total[pair] += p;
+                }
+            }
+            total
+        })
+    });
+    Ok(points)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MctsWorker>()?;
     m.add_class::<BatchedSelfPlay>()?;
     m.add_function(wrap_pyfunction!(run_match, m)?)?;
     m.add_function(wrap_pyfunction!(nn_forward, m)?)?;
     m.add_function(wrap_pyfunction!(run_tournament, m)?)?;
+    m.add_function(wrap_pyfunction!(run_pairs, m)?)?;
     Ok(())
 }

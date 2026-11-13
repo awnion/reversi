@@ -18,7 +18,9 @@ pub struct PositionRecord {
     pub legal: u64,
     /// MCTS visit-count distribution (64 squares).
     pub mcts_policy: [f32; 64],
-    /// Game outcome from this player's perspective: +1 win, -1 loss, 0 draw.
+    /// Value target from this player's perspective: the game outcome (+1 win,
+    /// -1 loss, 0 draw); in batched self-play mixed with the search value for
+    /// searched and solved positions (`VALUE_TARGET_SEARCH_WEIGHT`).
     pub outcome: f32,
     /// Final disc difference from this player's perspective, divided by 64.
     pub margin: f32,
