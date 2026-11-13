@@ -25,13 +25,23 @@ starts knowing only the rules and gets better by playing against itself. No
 human games, no hand-written evaluation.
 
 ```mermaid
-flowchart LR
-    S["Self-play<br/>6 144 games at once<br/>800 simulations per move"] -->|positions| R[("Replay buffer<br/>last 2 M positions")]
-    R -->|"batch of 512<br/>per 100 new positions"| L["Learner"]
-    L -->|"weights, every 500 steps"| S
-    L -->|"every 30 min"| M{"200 games against<br/>the champion,<br/>200 simulations"}
-    M -->|"≥ 55 %"| C["champion.bin"]
-    C -->|"embedded at build"| B["ZeroRev in the browser"]
+flowchart TD
+    subgraph SP["Self-play: 6 144 games at once"]
+        P["Position"] --> E{"≤ 12 empty<br/>squares?"}
+        E -->|no| S["Tree search: 800 simulations<br/>network suggests moves (policy)<br/>and rates positions (value)"]
+        E -->|yes| X["Exact endgame solver"]
+        S -->|"visit counts"| MV["Move: sampled for the first 12,<br/>then the most visited"]
+        X --> MV
+        MV -->|"game over"| T["Every position labelled<br/>policy: share of visits<br/>value: result<br/>margin: disc difference"]
+        MV -.->|"next position"| P
+    end
+    T --> R[("Replay buffer<br/>last 2 M positions")]
+    R -->|"random batches of 512,<br/>one per 100 new positions"| L["Learner<br/>random board symmetry<br/>loss = policy + value + margin"]
+    L -.->|"new weights every 500 steps"| S
+    L -->|"every 30 min"| M{"Match against the champion<br/>200 games, 200 simulations"}
+    M -->|"≥ 55 % of the points"| C["champion.bin"]
+    M -->|"less"| K["Champion stays"]
+    C -->|"bun run build:wasm"| B["ZeroRev in the browser"]
 ```
 
 **Self-play.** The current network plays against itself, 6 144 games at once
