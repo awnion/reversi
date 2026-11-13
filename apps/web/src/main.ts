@@ -246,6 +246,55 @@ function botInputs(side: Disc): HTMLInputElement[] {
   ];
 }
 
+/**
+ * Each side's bot and time per move, kept across page loads like the
+ * position; unknown bots and out-of-range times are ignored.
+ */
+const SETTINGS_KEY = 'reversi.players';
+
+interface SideSettings {
+  bot: string | null;
+  thinkMs: number;
+}
+
+function storeSettings(): void {
+  const settings: Record<string, SideSettings> = {};
+  for (const side of SIDES) {
+    settings[side] = {
+      bot: botInputs(side).find((input) => input.checked)?.value ?? null,
+      thinkMs: thinkMs[side],
+    };
+  }
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // Not remembered; it still applies to this visit.
+  }
+}
+
+function restoreSettings(): void {
+  let settings: Partial<Record<Disc, Partial<SideSettings>>>;
+  try {
+    settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
+  } catch {
+    return;
+  }
+  for (const side of SIDES) {
+    const saved = settings?.[side];
+    if (!saved) continue;
+    const ms = saved.thinkMs;
+    if (typeof ms === 'number' && ms >= MIN_THINK_MS && ms <= MAX_THINK_MS) {
+      thinkMs[side] = ms;
+    }
+    if (saved.bot === null || BOTS.some((bot) => bot.id === saved.bot)) {
+      for (const input of botInputs(side)) {
+        input.checked = input.value === saved.bot;
+      }
+    }
+  }
+}
+restoreSettings();
+
 /** The bot chosen for a side, if any. */
 function chosenBot(side: Disc): (typeof BOTS)[number] | undefined {
   const id = botInputs(side).find((input) => input.checked)?.value;
@@ -532,6 +581,7 @@ for (const side of SIDES) {
         }
       }
       syncThinkControl(side);
+      storeSettings();
       applyPlayers();
     });
   }
@@ -543,6 +593,7 @@ for (const side of SIDES) {
       Math.max(MIN_THINK_MS, Math.round(ms)),
     );
     syncThinkControl(side);
+    storeSettings();
     controller.setPlayers(players());
   };
 
@@ -654,15 +705,18 @@ function hideEval(): void {
   evalBar.hidden = true;
 }
 
-/** The final score as an eval: the winner fills the bar. */
+/**
+ * A finished game has nothing left to evaluate: the result, as on Lichess
+ * (Black first, as White is in chess), with the winner filling the bar.
+ */
 function showFinalEval(state: GameState): void {
   const { black, white } = countDiscs(state.board);
   const margin = Math.abs(black - white);
-  if (black === white) showEval(0.5, '0', 'Draw');
+  if (black === white) showEval(0.5, '½-½', 'Draw');
   else
     showEval(
       black > white ? 1 : 0,
-      String(margin),
+      black > white ? '1-0' : '0-1',
       `${black > white ? 'Black' : 'White'} won by ${margin} discs`,
     );
 }

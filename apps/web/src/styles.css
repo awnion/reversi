@@ -100,7 +100,7 @@ button {
   top: 0;
   bottom: 0;
   right: calc(100% + 8px);
-  width: 22px;
+  width: 26px;
   overflow: hidden;
   border-radius: 3px;
   background: var(--disc-black);
@@ -1179,7 +1179,7 @@ button.think-cell:hover:enabled:not([aria-pressed="true"]) {
 
   .eval-bar {
     right: calc(100% + 5px);
-    width: 9px;
+    width: 11px;
   }
 
   .player {

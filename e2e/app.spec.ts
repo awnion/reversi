@@ -474,3 +474,29 @@ test('a reload keeps the position on the board', async ({ page }) => {
   await expect(page.locator('#score-black')).toHaveText('2');
   await expect(page.locator('#score-white')).toHaveText('2');
 });
+
+test('a reload keeps each side’s bot and time per move', async ({ page }) => {
+  await page.goto('/');
+  const preset = (side: string, label: string) =>
+    page
+      .locator(`#think-${side}`)
+      .locator('button.think-cell', { hasText: new RegExp(`^${label}s$`) });
+  await page.locator('#player-white .option', { hasText: 'Minimax' }).click();
+  await preset('white', '0.5').click();
+  await page.locator('#player-black .option', { hasText: 'Minimax' }).click();
+  await page.locator('#think-custom-black').fill('0.3');
+
+  await page.reload();
+  const chosen = (side: string) =>
+    page.locator(`input[name="bot-${side}"][value="minimax"]`);
+  await expect(chosen('white')).toBeChecked();
+  await expect(chosen('black')).toBeChecked();
+  await expect(preset('white', '0.5')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#think-custom-black')).toHaveValue('0.3');
+
+  // Handing a side back to the person is remembered too.
+  await page.locator('#player-black .option', { hasText: 'Minimax' }).click();
+  await page.reload();
+  await expect(chosen('black')).not.toBeChecked();
+  await expect(chosen('white')).toBeChecked();
+});
