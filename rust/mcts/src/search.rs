@@ -61,6 +61,13 @@ pub struct EvalRequest {
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
+/// No parent (the root).
+const NO_PARENT: u32 = u32::MAX;
+
+/// A tree node. The children of a node are created together and stored next
+/// to each other, so a node only records where they start and how many there
+/// are: no allocation per node, and a subtree copies as plain data.
+#[derive(Clone, Copy)]
 struct Node {
     board: Board,
     is_black: bool,
@@ -71,13 +78,45 @@ struct Node {
     /// Visit count.
     n: u32,
     /// Accumulated value from **this node's player's** perspective.
-    w: f32,
+    /// f64: an f32 sum stops counting past 2^24 visits, and an analysis
+    /// left running on a nearly finished game gets there.
+    w: f64,
     /// Simulations that passed through this node and are still waiting for
     /// their evaluation. Always 0 in a single-threaded search.
     in_flight: u32,
-    parent: Option<usize>,
-    children: Vec<usize>,
+    /// Index of the parent, or [`NO_PARENT`].
+    parent: u32,
+    /// Index of the first child; the children are `first_child..first_child +
+    /// child_count`.
+    first_child: u32,
+    child_count: u32,
     expanded: bool,
+}
+
+impl Node {
+    fn new(board: Board, is_black: bool, move_mask: u64, p: f32, parent: u32) -> Self {
+        Node {
+            board,
+            is_black,
+            move_mask,
+            p,
+            n: 0,
+            w: 0.0,
+            in_flight: 0,
+            parent,
+            first_child: 0,
+            child_count: 0,
+            expanded: false,
+        }
+    }
+
+    fn children(&self) -> std::ops::Range<usize> {
+        self.first_child as usize..(self.first_child + self.child_count) as usize
+    }
+
+    fn parent(&self) -> Option<usize> {
+        (self.parent != NO_PARENT).then_some(self.parent as usize)
+    }
 }
 
 // ── MctsSearch ────────────────────────────────────────────────────────────────
@@ -92,19 +131,7 @@ pub struct MctsSearch {
 
 impl MctsSearch {
     pub fn new(board: Board, is_black: bool) -> Self {
-        let root = Node {
-            board,
-            is_black,
-            move_mask: 0,
-            p: 1.0,
-            n: 0,
-            w: 0.0,
-            in_flight: 0,
-            parent: None,
-            children: Vec::new(),
-            expanded: false,
-        };
-        MctsSearch { nodes: vec![root] }
+        MctsSearch { nodes: vec![Node::new(board, is_black, 0, 1.0, NO_PARENT)] }
     }
 
     /// Run one MCTS simulation: select → expand+eval → backup.
@@ -191,7 +218,7 @@ impl MctsSearch {
             let mut node = Some(idx);
             while let Some(i) = node {
                 self.nodes[i].in_flight -= 1;
-                node = self.nodes[i].parent;
+                node = self.nodes[i].parent();
             }
         }
         // In a shared search another thread may have expanded this leaf in the
@@ -203,48 +230,31 @@ impl MctsSearch {
 
         if request.pass {
             // `request.is_black` is the opponent, who moves next from this node.
-            let child_idx = self.nodes.len();
-            self.nodes.push(Node {
-                board,
-                is_black: request.is_black,
-                move_mask: 0,
-                p: 1.0,
-                n: 0,
-                w: 0.0,
-                in_flight: 0,
-                parent: Some(idx),
-                children: Vec::new(),
-                expanded: false,
-            });
-            self.nodes[idx].children.push(child_idx);
-            self.nodes[idx].expanded = true;
+            let first = self.nodes.len() as u32;
+            self.nodes.push(Node::new(board, request.is_black, 0, 1.0, idx as u32));
+            let node = &mut self.nodes[idx];
+            node.first_child = first;
+            node.child_count = 1;
+            node.expanded = true;
             // Value from the passing player's perspective = -opponent's value.
             self.backup(idx, -value);
             return;
         }
 
         let is_black = request.is_black;
+        let first = self.nodes.len() as u32;
         let mut legal = request.legal;
         while legal != 0 {
             let i = legal.trailing_zeros() as usize;
             let move_mask = 1u64 << i;
             legal &= legal - 1;
-            let child_idx = self.nodes.len();
-            self.nodes.push(Node {
-                board: board.apply_move(is_black, move_mask),
-                is_black: !is_black,
-                move_mask,
-                p: policy[i],
-                n: 0,
-                w: 0.0,
-                in_flight: 0,
-                parent: Some(idx),
-                children: Vec::new(),
-                expanded: false,
-            });
-            self.nodes[idx].children.push(child_idx);
+            let child = board.apply_move(is_black, move_mask);
+            self.nodes.push(Node::new(child, !is_black, move_mask, policy[i], idx as u32));
         }
-        self.nodes[idx].expanded = true;
+        let node = &mut self.nodes[idx];
+        node.first_child = first;
+        node.child_count = request.legal.count_ones();
+        node.expanded = true;
         self.backup(idx, value);
     }
 
@@ -253,45 +263,28 @@ impl MctsSearch {
     /// spent on the position that follows. `None` when that child was never
     /// visited.
     pub fn into_child(self, move_mask: u64) -> Option<MctsSearch> {
-        let child =
-            *self.nodes[0].children.iter().find(|&&c| self.nodes[c].move_mask == move_mask)?;
-        if self.nodes[child].n == 0 {
+        let old = self.nodes;
+        let child = old[0].children().find(|&c| old[c].move_mask == move_mask)?;
+        if old[child].n == 0 {
             return None;
         }
-        let mut old = self.nodes;
-        // Copy the subtree breadth-first; `remap[old index] = new index`.
-        let mut nodes: Vec<Node> = Vec::new();
-        let mut remap = vec![usize::MAX; old.len()];
-        let mut queue = std::collections::VecDeque::from([child]);
-        while let Some(i) = queue.pop_front() {
-            remap[i] = nodes.len();
-            queue.extend(old[i].children.iter().copied());
-            let node = std::mem::replace(
-                &mut old[i],
-                Node {
-                    board: Board::new(0, 0),
-                    is_black: false,
-                    move_mask: 0,
-                    p: 0.0,
-                    n: 0,
-                    w: 0.0,
-                    in_flight: 0,
-                    parent: None,
-                    children: Vec::new(),
-                    expanded: false,
-                },
-            );
-            nodes.push(node);
-        }
-        for node in &mut nodes {
-            node.parent = node.parent.map(|p| remap[p]).filter(|&p| p != usize::MAX);
-            for c in &mut node.children {
-                *c = remap[*c];
+        // Copy the subtree breadth-first. The new array is its own queue, and
+        // siblings stay next to each other: they are appended together.
+        let mut nodes: Vec<Node> = Vec::with_capacity(old.len());
+        let mut root = old[child];
+        root.parent = NO_PARENT;
+        root.move_mask = 0;
+        root.p = 1.0;
+        nodes.push(root);
+        let mut next = 0;
+        while next < nodes.len() {
+            let children = nodes[next].children();
+            if !children.is_empty() {
+                nodes[next].first_child = nodes.len() as u32;
+                nodes.extend(old[children].iter().map(|&c| Node { parent: next as u32, ..c }));
             }
+            next += 1;
         }
-        nodes[0].parent = None;
-        nodes[0].move_mask = 0;
-        nodes[0].p = 1.0;
         Some(MctsSearch { nodes })
     }
 
@@ -307,22 +300,17 @@ impl MctsSearch {
 
     /// Move with the highest visit count (deterministic, no temperature).
     pub fn best_move(&self) -> Option<u64> {
-        self.nodes[0]
-            .children
-            .iter()
-            .max_by_key(|&&c| self.nodes[c].n)
-            .map(|&c| self.nodes[c].move_mask)
+        self.nodes[0].children().max_by_key(|&c| self.nodes[c].n).map(|c| self.nodes[c].move_mask)
     }
 
     /// Normalised visit-count distribution over all 64 squares.
     /// Used as the policy target when building training records.
     pub fn policy_target(&self) -> [f32; 64] {
-        let children = &self.nodes[0].children;
-        let total: u32 = children.iter().map(|&c| self.nodes[c].n).sum();
+        let children = &self.nodes[self.nodes[0].children()];
+        let total: u32 = children.iter().map(|c| c.n).sum();
         let mut policy = [0.0_f32; 64];
         if total > 0 {
-            for &c in children {
-                let child = &self.nodes[c];
+            for child in children {
                 if child.move_mask != 0 {
                     let i = child.move_mask.trailing_zeros() as usize;
                     policy[i] = child.n as f32 / total as f32;
@@ -336,12 +324,11 @@ impl MctsSearch {
     ///
     /// `noise` must have one entry per root child and sum to 1.
     pub fn add_root_noise(&mut self, noise: &[f32], epsilon: f32) {
-        let children = self.nodes[0].children.clone();
+        let children = self.nodes[0].children();
         if children.is_empty() || children.len() != noise.len() {
             return;
         }
-        for (child_idx, &n) in children.iter().zip(noise.iter()) {
-            let child = &mut self.nodes[*child_idx];
+        for (child, &n) in self.nodes[children].iter_mut().zip(noise) {
             child.p = (1.0 - epsilon) * child.p + epsilon * n;
         }
     }
@@ -354,11 +341,11 @@ impl MctsSearch {
     /// Before any move has been visited, the root's own average.
     pub fn root_value(&self) -> f32 {
         let root = &self.nodes[0];
-        let best = root.children.iter().map(|&c| &self.nodes[c]).max_by_key(|c| c.n);
+        let best = self.nodes[root.children()].iter().max_by_key(|c| c.n);
         match best {
             // A child's value is from the opponent's side.
-            Some(child) if child.n > 0 => -child.w / child.n as f32,
-            _ if root.n > 0 => root.w / root.n as f32,
+            Some(child) if child.n > 0 => (-child.w / f64::from(child.n)) as f32,
+            _ if root.n > 0 => (root.w / f64::from(root.n)) as f32,
             _ => 0.0,
         }
     }
@@ -385,39 +372,31 @@ impl MctsSearch {
         let mut node = Some(leaf);
         while let Some(i) = node {
             self.nodes[i].in_flight += 1;
-            node = self.nodes[i].parent;
+            node = self.nodes[i].parent();
         }
     }
 
     fn select(&self, mut idx: usize) -> usize {
         loop {
             let node = &self.nodes[idx];
-            if !node.expanded || node.children.is_empty() {
+            if !node.expanded || node.child_count == 0 {
                 return idx;
             }
-            let parent_n = node.n + node.in_flight;
-            idx = *node
-                .children
-                .iter()
-                .max_by(|&&a, &&b| {
-                    let pa = self.puct(a, parent_n);
-                    let pb = self.puct(b, parent_n);
-                    pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap();
+            // The exploration factor is the same for every child: once per node.
+            let explore = C_PUCT * ((node.n + node.in_flight) as f32).sqrt();
+            let first = node.first_child as usize;
+            let mut best = first;
+            let mut best_score = f32::NEG_INFINITY;
+            for (i, child) in self.nodes[node.children()].iter().enumerate() {
+                let score = puct(child, explore);
+                // `>=`: the last of equal scores, as `Iterator::max_by` picks.
+                if score >= best_score {
+                    best_score = score;
+                    best = first + i;
+                }
+            }
+            idx = best;
         }
-    }
-
-    /// PUCT score of `child_idx` as seen **from the parent**.
-    fn puct(&self, child_idx: usize, parent_n: u32) -> f32 {
-        let c = &self.nodes[child_idx];
-        // In-flight simulations count as visits that the parent lost, which
-        // makes the child less attractive until their results arrive.
-        let visits = (c.n + c.in_flight) as f32;
-        // Q from parent's perspective: parent wins when child loses → negate child's w/n.
-        let q = if visits == 0.0 { 0.0 } else { (-c.w - c.in_flight as f32) / visits };
-        let u = C_PUCT * c.p * (parent_n as f32).sqrt() / (1.0 + visits);
-        q + u
     }
 
     /// Propagate `value` up to root, negating at each level (negamax).
@@ -425,12 +404,24 @@ impl MctsSearch {
         let mut idx = leaf_idx;
         loop {
             self.nodes[idx].n += 1;
-            self.nodes[idx].w += value;
+            self.nodes[idx].w += f64::from(value);
             value = -value;
-            match self.nodes[idx].parent {
+            match self.nodes[idx].parent() {
                 Some(parent) => idx = parent,
                 None => break,
             }
         }
     }
+}
+
+/// PUCT score of `child` as seen **from the parent**; `explore` is
+/// `C_PUCT * sqrt(parent visits)`.
+#[inline]
+fn puct(child: &Node, explore: f32) -> f32 {
+    // In-flight simulations count as visits that the parent lost, which makes
+    // the child less attractive until their results arrive.
+    let visits = (child.n + child.in_flight) as f32;
+    // Q from the parent's side: the parent wins when the child loses.
+    let q = if visits == 0.0 { 0.0 } else { (-child.w as f32 - child.in_flight as f32) / visits };
+    q + child.p * explore / (1.0 + visits)
 }

@@ -54,7 +54,7 @@ pub struct PipelineConfig {
     /// Wait up to `max_wait` for at least this many positions.
     pub min_batch: usize,
     pub max_wait: Duration,
-    /// Network outputs kept per [`EvalCache`] generation (0 = no cache).
+    /// Network outputs the [`SharedCache`] keeps (twice that at most; 0 = off).
     pub cache_entries: usize,
 }
 
@@ -69,7 +69,7 @@ pub struct Stats {
     pub gpu_ns: AtomicU64,
     pub games: AtomicU64,
     pub positions: AtomicU64,
-    /// Positions answered from the [`EvalCache`] or by a duplicate in the
+    /// Positions answered from the [`SharedCache`] or by a duplicate in the
     /// same batch, without a network evaluation.
     pub cache_hits: AtomicU64,
 }
@@ -101,7 +101,8 @@ impl Stats {
     }
 }
 
-/// One pool's positions to evaluate, packed as in [`pack`].
+/// One pool's positions to evaluate, packed as in [`pack`]: only the ones
+/// the cache did not know, each once.
 pub struct Request {
     worker: usize,
     pool: usize,
@@ -114,69 +115,15 @@ impl Request {
     }
 }
 
-/// Evaluations for one [`Request`], in request order.
+/// Network outputs for one [`Request`], 65 floats per position (64 priors,
+/// the value), in request order.
 pub struct Reply {
     pool: usize,
-    policies: Vec<f32>,
-    values: Vec<f32>,
+    rows: Vec<f32>,
+    /// The [`SharedCache`] generation of the weights that computed them.
+    generation: u64,
     /// The request's buffer, handed back for reuse.
     packed: Vec<i64>,
-}
-
-// ── Workers ───────────────────────────────────────────────────────────────
-
-pub fn run_worker(
-    id: usize,
-    config: &PipelineConfig,
-    requests: &Sender<Request>,
-    replies: &Receiver<Reply>,
-    games: &Sender<GameRecord>,
-    stop: &Stop,
-) {
-    let _guard = PanicGuard { stop: stop.clone(), stage: "worker" };
-    let new_pool = || {
-        if config.stagger {
-            SelfPlayPool::staggered(config.games_per_pool, config.simulations)
-        } else {
-            SelfPlayPool::new(config.games_per_pool, config.simulations)
-        }
-    };
-    let mut pools: Vec<SelfPlayPool> = (0..config.pools_per_worker).map(|_| new_pool()).collect();
-    let mut spare: Vec<Vec<i64>> = Vec::new();
-
-    let submit = |pool: usize, pools: &mut [SelfPlayPool], spare: &mut Vec<Vec<i64>>| {
-        let mut packed = spare.pop().unwrap_or_default();
-        packed.clear();
-        for request in pools[pool].collect() {
-            packed.extend(pack(request.board, request.is_black, request.legal));
-        }
-        requests.send(Request { worker: id, pool, packed }).is_ok()
-    };
-
-    for pool in 0..pools.len() {
-        if !submit(pool, &mut pools, &mut spare) {
-            return;
-        }
-    }
-    loop {
-        select! {
-            recv(replies) -> reply => {
-                let Ok(reply) = reply else { return };
-                let pool = &mut pools[reply.pool];
-                pool.apply(&reply.policies, &reply.values);
-                for record in pool.take_finished() {
-                    if games.send(record).is_err() {
-                        return;
-                    }
-                }
-                spare.push(reply.packed);
-                if stop.is_set() || !submit(reply.pool, &mut pools, &mut spare) {
-                    return;
-                }
-            }
-            recv(stop.receiver()) -> _ => return,
-        }
-    }
 }
 
 // ── Evaluation cache ──────────────────────────────────────────────────────
@@ -208,39 +155,254 @@ impl std::hash::Hasher for KeyHasher {
 
 type KeyMap<V> = std::collections::HashMap<CacheKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
 
-/// Network outputs for positions seen recently. The same positions come up
-/// again and again: openings across games and transpositions inside a search.
-/// Two generations bound the memory: when the current one is full it becomes
-/// the previous one and the older entries are dropped. Cleared on every
-/// weights update, so answers always come from the current network.
-pub struct EvalCache {
+const CACHE_SHARDS: usize = 64;
+
+/// One lock's worth of the cache. Two generations bound the memory: when the
+/// current map is full it becomes the previous one and the older entries go.
+struct CacheShard {
+    generation: u64,
     current: KeyMap<Row>,
     previous: KeyMap<Row>,
-    capacity: usize,
 }
 
-impl EvalCache {
-    pub fn new(capacity: usize) -> Self {
-        EvalCache { current: KeyMap::default(), previous: KeyMap::default(), capacity }
+impl CacheShard {
+    /// Forget everything computed by older weights.
+    fn catch_up(&mut self, generation: u64) {
+        if generation > self.generation {
+            self.current.clear();
+            self.previous.clear();
+            self.generation = generation;
+        }
+    }
+}
+
+/// Network outputs for positions seen recently, shared by the workers. The
+/// same positions come up again and again: openings across games and
+/// transpositions inside a search. The workers look positions up before
+/// asking the GPU, so the GPU thread only runs the network.
+///
+/// Every weights update starts a new generation; answers of older weights
+/// are neither returned nor stored.
+pub struct SharedCache {
+    shards: Vec<std::sync::Mutex<CacheShard>>,
+    capacity_per_shard: usize,
+    generation: AtomicU64,
+}
+
+impl SharedCache {
+    pub fn new(entries: usize) -> Self {
+        let shard = || {
+            std::sync::Mutex::new(CacheShard {
+                generation: 0,
+                current: KeyMap::default(),
+                previous: KeyMap::default(),
+            })
+        };
+        SharedCache {
+            shards: (0..CACHE_SHARDS).map(|_| shard()).collect(),
+            capacity_per_shard: entries / CACHE_SHARDS,
+            generation: AtomicU64::new(0),
+        }
     }
 
-    fn get(&self, key: &CacheKey) -> Option<&Row> {
-        self.current.get(key).or_else(|| self.previous.get(key))
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
-    fn insert(&mut self, key: CacheKey, row: Row) {
-        if self.capacity == 0 {
+    /// New weights: everything cached so far is stale. Returns the new
+    /// generation.
+    pub fn invalidate(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn shard(&self, key: &CacheKey) -> std::sync::MutexGuard<'_, CacheShard> {
+        let mixed =
+            (key.0 as u64 ^ (key.1 as u64).rotate_left(23)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let index = (mixed >> 58) as usize % CACHE_SHARDS;
+        self.shards[index].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(&self, key: &CacheKey, generation: u64) -> Option<Row> {
+        if self.capacity_per_shard == 0 {
+            return None;
+        }
+        let mut shard = self.shard(key);
+        shard.catch_up(generation);
+        if shard.generation != generation {
+            return None;
+        }
+        shard.current.get(key).or_else(|| shard.previous.get(key)).copied()
+    }
+
+    fn insert(&self, key: CacheKey, row: Row, generation: u64) {
+        if self.capacity_per_shard == 0 || generation != self.generation() {
             return;
         }
-        if self.current.len() >= self.capacity {
-            self.previous = std::mem::take(&mut self.current);
+        let mut shard = self.shard(&key);
+        shard.catch_up(generation);
+        if shard.generation != generation {
+            return;
         }
-        self.current.insert(key, row);
+        if shard.current.len() >= self.capacity_per_shard {
+            shard.previous = std::mem::take(&mut shard.current);
+        }
+        shard.current.insert(key, row);
+    }
+}
+
+// ── Workers ───────────────────────────────────────────────────────────────
+
+/// A pool's batch while its request is with the GPU.
+#[derive(Default)]
+struct Pending {
+    /// 65 floats per position of the batch; cache hits already filled in.
+    rows: Vec<f32>,
+    /// `(position, slot)`: position of the batch answered by `slot` of the reply.
+    misses: Vec<(u32, u32)>,
+    /// Key of each slot of the request.
+    keys: Vec<CacheKey>,
+}
+
+/// What a worker shares with the rest of the pipeline.
+pub struct WorkerLinks {
+    pub cache: Arc<SharedCache>,
+    pub stats: Arc<Stats>,
+    pub requests: Sender<Request>,
+    pub replies: Receiver<Reply>,
+    pub games: Sender<GameRecord>,
+    pub stop: Stop,
+}
+
+/// A worker's pools and buffers.
+struct Worker {
+    id: usize,
+    links: WorkerLinks,
+    pools: Vec<SelfPlayPool>,
+    pending: Vec<Pending>,
+    spare: Vec<Vec<i64>>,
+    slots: KeyMap<u32>,
+    policies: Vec<f32>,
+    values: Vec<f32>,
+}
+
+impl Worker {
+    /// Apply a pool's completed batch (`pending[pool].rows`) and hand its
+    /// finished games on.
+    fn finish(&mut self, pool: usize) -> bool {
+        self.policies.clear();
+        self.values.clear();
+        for row in self.pending[pool].rows.as_chunks::<65>().0 {
+            self.policies.extend_from_slice(&row[..64]);
+            self.values.push(row[64]);
+        }
+        let pool = &mut self.pools[pool];
+        pool.apply(&self.policies, &self.values);
+        pool.take_finished().into_iter().all(|record| self.links.games.send(record).is_ok())
     }
 
-    fn clear(&mut self) {
-        self.current.clear();
-        self.previous.clear();
+    /// Collect the pool's next batch, answer what the cache knows and send
+    /// the rest to the GPU, each position once. A batch the cache answers
+    /// completely is applied right away and the next one collected.
+    fn submit(&mut self, pool: usize) -> bool {
+        loop {
+            if self.links.stop.is_set() {
+                return false;
+            }
+            let cache = &self.links.cache;
+            let generation = cache.generation();
+            let state = &mut self.pending[pool];
+            let mut packed = self.spare.pop().unwrap_or_default();
+            packed.clear();
+            state.misses.clear();
+            state.keys.clear();
+            self.slots.clear();
+            let batch = self.pools[pool].collect();
+            state.rows.clear();
+            state.rows.resize(batch.len() * 65, 0.0);
+            let mut hits = 0u64;
+            for (i, request) in batch.iter().enumerate() {
+                let position = pack(request.board, request.is_black, request.legal);
+                let key = (position[0], position[1]);
+                if let Some(row) = cache.get(&key, generation) {
+                    state.rows[i * 65..(i + 1) * 65].copy_from_slice(&row);
+                    hits += 1;
+                    continue;
+                }
+                let next = state.keys.len() as u32;
+                let slot = *self.slots.entry(key).or_insert(next);
+                if slot == next {
+                    packed.extend_from_slice(&position);
+                    state.keys.push(key);
+                } else {
+                    hits += 1;
+                }
+                state.misses.push((i as u32, slot));
+            }
+            self.links.stats.cache_hits.fetch_add(hits, Ordering::Relaxed);
+            if !packed.is_empty() {
+                let request = Request { worker: self.id, pool, packed };
+                return self.links.requests.send(request).is_ok();
+            }
+            self.spare.push(packed);
+            if !self.finish(pool) {
+                return false;
+            }
+        }
+    }
+
+    /// The GPU's answer for a pool: fill in the rows, remember them, go on.
+    fn receive(&mut self, reply: Reply) -> bool {
+        let state = &mut self.pending[reply.pool];
+        for &(position, slot) in &state.misses {
+            let (position, slot) = (position as usize * 65, slot as usize * 65);
+            state.rows[position..position + 65].copy_from_slice(&reply.rows[slot..slot + 65]);
+        }
+        for (slot, &key) in state.keys.iter().enumerate() {
+            let mut row = [0.0; 65];
+            row.copy_from_slice(&reply.rows[slot * 65..(slot + 1) * 65]);
+            self.links.cache.insert(key, row, reply.generation);
+        }
+        self.spare.push(reply.packed);
+        self.finish(reply.pool) && self.submit(reply.pool)
+    }
+}
+
+pub fn run_worker(id: usize, config: &PipelineConfig, links: WorkerLinks) {
+    let _guard = PanicGuard { stop: links.stop.clone(), stage: "worker" };
+    let new_pool = || {
+        if config.stagger {
+            SelfPlayPool::staggered(config.games_per_pool, config.simulations)
+        } else {
+            SelfPlayPool::new(config.games_per_pool, config.simulations)
+        }
+    };
+    let pools: Vec<SelfPlayPool> = (0..config.pools_per_worker).map(|_| new_pool()).collect();
+    let mut worker = Worker {
+        id,
+        pending: (0..pools.len()).map(|_| Pending::default()).collect(),
+        pools,
+        links,
+        spare: Vec::new(),
+        slots: KeyMap::default(),
+        policies: Vec::new(),
+        values: Vec::new(),
+    };
+    for pool in 0..worker.pools.len() {
+        if !worker.submit(pool) {
+            return;
+        }
+    }
+    let (replies, stop) = (worker.links.replies.clone(), worker.links.stop.clone());
+    loop {
+        select! {
+            recv(replies) -> reply => {
+                let Ok(reply) = reply else { return };
+                if !worker.receive(reply) {
+                    return;
+                }
+            }
+            recv(stop.receiver()) -> _ => return,
+        }
     }
 }
 
@@ -258,6 +420,7 @@ pub struct GpuThread {
     pub requests: Receiver<Request>,
     pub replies: Vec<Sender<Reply>>,
     pub weights: Receiver<LoadedWeights>,
+    pub cache: Arc<SharedCache>,
     pub paused: Arc<AtomicBool>,
     /// Thermal throttle (f64 bits), see `thermal::Governor`.
     pub throttle: Arc<AtomicU64>,
@@ -274,12 +437,12 @@ impl GpuThread {
             tch::Cuda::cudnn_set_benchmark(true);
         }
 
-        let mut net = select! {
+        let (mut net, mut generation) = select! {
             recv(self.weights) -> loaded => {
                 let Ok(loaded) = loaded else { return };
                 let net = TorchNet::new(&loaded.weights, self.options);
                 log_selfplay!("weights-loaded", process = 0, source = loaded.source);
-                net
+                (net, self.cache.invalidate())
             }
             recv(self.stop.receiver()) -> _ => return,
         };
@@ -289,10 +452,6 @@ impl GpuThread {
         let mut batch: Vec<Request> = Vec::new();
         let mut packed: Vec<i64> = Vec::new();
         let mut out: Vec<f32> = Vec::new();
-        let mut rows: Vec<f32> = Vec::new();
-        let mut cache = EvalCache::new(config.cache_entries);
-        let mut unique: KeyMap<usize> = KeyMap::default();
-        let mut pending: Vec<(usize, usize)> = Vec::new();
         let mut pacer = Pacer::default();
         let mut paused_since: Option<Instant> = None;
 
@@ -304,7 +463,7 @@ impl GpuThread {
             }
             if let Some(loaded) = newest {
                 net = TorchNet::new(&loaded.weights, self.options);
-                cache.clear();
+                generation = self.cache.invalidate();
                 log_selfplay!("weights-reloaded", process = 0, source = loaded.source);
             }
 
@@ -363,78 +522,40 @@ impl GpuThread {
                 batch.push(next);
             }
 
-            // Answer what the cache knows, evaluate each other position once.
-            rows.clear();
-            rows.resize(total * 65, 0.0);
+            // Evaluate.
+            let padded = bucket(total);
             packed.clear();
-            unique.clear();
-            pending.clear();
-            let mut row = 0;
             for request in &batch {
-                for position in request.packed.as_chunks::<4>().0 {
-                    let key = (position[0], position[1]);
-                    if let Some(cached) = cache.get(&key) {
-                        rows[row * 65..(row + 1) * 65].copy_from_slice(cached);
-                    } else {
-                        let next = unique.len();
-                        let slot = *unique.entry(key).or_insert(next);
-                        if slot == next {
-                            packed.extend_from_slice(position);
-                        }
-                        pending.push((row, slot));
-                    }
-                    row += 1;
-                }
+                packed.extend_from_slice(&request.packed);
             }
-            let evaluated = unique.len();
+            packed.resize(padded * 4, 0);
             let started = Instant::now();
-            let mut padded = 0;
-            if evaluated > 0 {
-                padded = bucket(evaluated);
-                packed.resize(padded * 4, 0);
-                let output = net.forward(&net.unpack(&packed));
-                out.resize(padded * 65, 0.0);
-                // Blocks until the batch has completed on the device.
-                output.copy_data(&mut out, padded * 65);
-                for &(row, slot) in &pending {
-                    rows[row * 65..(row + 1) * 65]
-                        .copy_from_slice(&out[slot * 65..(slot + 1) * 65]);
-                }
-                for (key, slot) in unique.drain() {
-                    let mut entry = [0.0; 65];
-                    entry.copy_from_slice(&out[slot * 65..(slot + 1) * 65]);
-                    cache.insert(key, entry);
-                }
-            }
+            let output = net.forward(&net.unpack(&packed));
+            out.resize(padded * 65, 0.0);
+            // Blocks until the batch has completed on the device.
+            output.copy_data(&mut out, padded * 65);
             let work = started.elapsed();
 
-            // Hand every pool its slice.
+            // Hand every pool its rows.
             let mut offset = 0;
             for request in batch.drain(..) {
                 let n = request.len();
-                let rows = &rows[offset * 65..(offset + n) * 65];
-                let mut policies = Vec::with_capacity(n * 64);
-                let mut values = Vec::with_capacity(n);
-                for row in rows.as_chunks::<65>().0 {
-                    policies.extend_from_slice(&row[..64]);
-                    values.push(row[64]);
-                }
+                let rows = out[offset * 65..(offset + n) * 65].to_vec();
                 offset += n;
                 // A worker that is gone is shutting down; nothing to do.
                 let _ = self.replies[request.worker].send(Reply {
                     pool: request.pool,
-                    policies,
-                    values,
+                    rows,
+                    generation,
                     packed: request.packed,
                 });
             }
 
             let stats = &self.stats;
-            stats.evals.fetch_add(evaluated as u64, Ordering::Relaxed);
-            stats.cache_hits.fetch_add((total - evaluated) as u64, Ordering::Relaxed);
+            stats.evals.fetch_add(total as u64, Ordering::Relaxed);
             stats.padded_evals.fetch_add(padded as u64, Ordering::Relaxed);
             stats.batches.fetch_add(1, Ordering::Relaxed);
-            stats.last_batch.store(evaluated as u64, Ordering::Relaxed);
+            stats.last_batch.store(total as u64, Ordering::Relaxed);
             stats.gpu_ns.fetch_add(work.as_nanos() as u64, Ordering::Relaxed);
 
             // Slow down while the machine is too hot, in proportion to the

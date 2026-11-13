@@ -13,9 +13,8 @@ static CHAMPION_META: &str = include_str!("../../../weights/zerorev/champion.jso
 
 /// Gladiator0: a selected earlier champion of the same architecture, kept as
 /// an opponent of its own.
-static GLADIATOR0_WEIGHTS: &[u8] =
-    include_bytes!("../../../weights/zerorev/champions/gladiator0.bin");
-static GLADIATOR0_META: &str = include_str!("../../../weights/zerorev/champions/gladiator0.json");
+static GLADIATOR0_WEIGHTS: &[u8] = include_bytes!("../../../weights/gladiator0/gladiator0.bin");
+static GLADIATOR0_META: &str = include_str!("../../../weights/gladiator0/gladiator0.json");
 
 /// The embedded network called `network`: `"gladiator0"`, or the champion for
 /// any other name. Returns its weights and the facts about them.
@@ -119,6 +118,10 @@ pub fn search_threads() -> usize {
 
 /// An analysis stops growing its tree at this many nodes (a few hundred MB).
 const ANALYSIS_MAX_NODES: usize = 4_000_000;
+/// ... or at this many simulations. Near the end of a game most simulations
+/// reach a finished position and add no node, so the tree would never reach
+/// its node limit and the search would run forever learning nothing new.
+const ANALYSIS_MAX_SIMULATIONS: u32 = 50_000_000;
 
 /// The position under analysis and its search tree, kept between calls so
 /// that each call carries on where the last one stopped.
@@ -227,16 +230,19 @@ impl ZeroRevBot {
             _ => Analysis { board, is_black, search: SharedSearch::new(board, is_black) },
         };
         let search = &analysis.search;
-        if search.with(MctsSearch::nodes) < ANALYSIS_MAX_NODES {
+        let done = |tree: &MctsSearch| {
+            tree.nodes() >= ANALYSIS_MAX_NODES || tree.visits() >= ANALYSIS_MAX_SIMULATIONS
+        };
+        if !search.with(done) {
             run_mcts_timed(search, self.eval.as_ref(), think_ms);
         }
-        let (mut policy, visits, value, nodes) = search
-            .with(|tree| (tree.policy_target(), tree.visits(), tree.root_value(), tree.nodes()));
+        let (mut policy, visits, value, complete) = search
+            .with(|tree| (tree.policy_target(), tree.visits(), tree.root_value(), done(tree)));
         *slot = Some(analysis);
 
         self.last_simulations.set(visits);
         self.last_value.set(value);
-        self.analysis_complete.set(nodes >= ANALYSIS_MAX_NODES);
+        self.analysis_complete.set(complete);
         for (i, r) in policy.iter_mut().enumerate() {
             if (legal >> i) & 1 == 0 {
                 *r = 0.0;

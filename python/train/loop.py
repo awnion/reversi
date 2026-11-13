@@ -39,10 +39,11 @@ from .weights import Weights
 
 # --- hyper-parameters --------------------------------------------------------
 
-# Self-play search per move. 400 since the Rust self-play (with tree reuse,
-# endgame solver and eval cache) outran the learner at 200: the spare speed
-# buys sharper policy targets instead of positions nobody trains on.
-SIMULATIONS = 400
+# Self-play search per move, as in AlphaZero. Raised from 200 once the Rust
+# self-play (tree reuse, endgame solver, eval cache) outran the learner: the
+# spare speed buys sharper policy targets instead of positions nobody trains
+# on.
+SIMULATIONS = 800
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.

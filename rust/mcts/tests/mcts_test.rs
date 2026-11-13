@@ -5,6 +5,7 @@ use reversi_mcts::PLANES_LEN;
 use reversi_mcts::SelfPlayPool;
 use reversi_mcts::SharedSearch;
 use reversi_mcts::StaticEval;
+use reversi_mcts::batch::ENDGAME_SOLVE_EMPTIES;
 use reversi_mcts::play_game;
 use reversi_mcts::play_match_from;
 use reversi_mcts::random_opening;
@@ -342,11 +343,33 @@ fn into_child_keeps_the_subtree() {
 
 #[test]
 fn self_play_games_end_with_solved_moves() {
-    // The last moves are solved exactly: one-hot policy targets.
-    let mut pool = SelfPlayPool::new(4, 8);
-    for record in run_pool(&mut pool, 4) {
+    // The last moves are solved exactly: one-hot policy targets. A game may
+    // also end early, before the solver takes over; those are skipped.
+    let mut pool = SelfPlayPool::new(8, 8);
+    let mut checked = 0;
+    for record in run_pool(&mut pool, 8) {
         let last =
             record.positions.iter().rev().find(|p| p.policy_weight > 0.0).expect("a policy sample");
+        let empties = 64 - (last.board.black | last.board.white).count_ones();
+        if empties > ENDGAME_SOLVE_EMPTIES {
+            continue;
+        }
         assert_eq!(last.mcts_policy.iter().filter(|&&p| p == 1.0).count(), 1);
+        checked += 1;
     }
+    assert!(checked > 0, "no game reached the endgame");
+}
+
+#[test]
+fn values_stay_exact_after_many_simulations() {
+    // A finished game (full board, black 40 : white 24). Every simulation
+    // backs up the same exact result; past 2^24 of them an f32 sum stops
+    // growing and the average drifts towards zero.
+    let black = !0u64 >> 24;
+    let board = Board::new(black, !black);
+    let mut mcts = MctsSearch::new(board, false);
+    for _ in 0..20_000_000 {
+        assert!(mcts.select_leaf().is_none(), "a finished game needs no evaluation");
+    }
+    assert_eq!(mcts.root_value(), -1.0, "white has lost");
 }

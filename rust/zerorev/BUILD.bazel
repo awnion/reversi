@@ -8,8 +8,8 @@ rust_shared_library(
     compile_data = [
         "//weights:zerorev/champion.bin",
         "//weights:zerorev/champion.json",
-        "//weights:zerorev/champions/gladiator0.bin",
-        "//weights:zerorev/champions/gladiator0.json",
+        "//weights:gladiator0/gladiator0.bin",
+        "//weights:gladiator0/gladiator0.json",
     ],
     crate_name = "reversi_zerorev",
     rustc_env_files = ["//tools:build_env"],

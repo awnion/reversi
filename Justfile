@@ -193,8 +193,10 @@ pull-run host botname:
         {{ host }}:{{ _remote_dir }}/weights/{{ botname }}/ {{ _weights_base / botname }}/
 
 # Start / stop / follow training on the remote: just train-remote <host> <botname>
+# REVERSI_SELFPLAY and REVERSI_SELFPLAY_RUST_ARGS are taken from this shell
+# (default python), not from the remote's environment.
 train-remote host botname: (sync-code host)
-    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && just train {{ botname }}'
+    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && REVERSI_SELFPLAY="{{ env_var_or_default("REVERSI_SELFPLAY", "python") }}" REVERSI_SELFPLAY_RUST_ARGS="{{ env_var_or_default("REVERSI_SELFPLAY_RUST_ARGS", "") }}" just train {{ botname }}'
 
 stop-remote host botname:
     ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && just stop {{ botname }}'
@@ -203,11 +205,11 @@ logs-remote host botname:
     ssh {{ host }} 'tail -f {{ _remote_dir }}/weights/{{ botname }}/train.log'
 
 # Download the newest champion from the training machine into a browser bot
-# and rebuild the WASM. With no arguments: zerorev-v2 from the training host
-# into ZeroRev.
+# and rebuild the WASM. With no arguments: the run zerorev from the training
+# host into ZeroRev.
 #   just snapshot [host] [run] [bot] [champion|latest]
 # "champion" is the last tournament winner, "latest" the newest trained weights.
-snapshot host=_train_host run="zerorev-v2" bot="zerorev" which="champion":
+snapshot host=_train_host run="zerorev" bot="zerorev" which="champion":
     #!/usr/bin/env bash
     set -euo pipefail
     remote={{ host }}:{{ _remote_dir }}/weights/{{ run }}
@@ -222,7 +224,10 @@ snapshot host=_train_host run="zerorev-v2" bot="zerorev" which="champion":
             "{{ run }}" "$(date +%F)" > "$target/champion.json"
     else
         rsync -az "$remote/champion.bin" "$remote/champion.json" "$local/"
-        cp "$local/champion.bin" "$local/champion.json" "$target/"
+        # A run named after the bot is its weights folder already.
+        if [ "$local" != "$target" ]; then
+            cp "$local/champion.bin" "$local/champion.json" "$target/"
+        fi
     fi
     bun run build:wasm >/dev/null 2>&1
     echo -e "\033[32m{{ bot }} now plays the {{ which }} weights of '{{ run }}' from {{ host }}:\033[0m"

@@ -56,14 +56,14 @@ commands:
                                 probabilities and the value per position
 
 self-play options (selfplay, bench):
-  --simulations N         MCTS simulations per move (200)
+  --simulations N         MCTS simulations per move (800)
   --workers N             search threads (6)
-  --pools-per-worker N    game pools per search thread (2)
+  --pools-per-worker N    game pools per search thread (1)
   --games-per-pool N      concurrent games per pool (1024)
   --batch-target N        positions per network call (8192)
   --min-batch N           wait up to --max-wait-ms for this many positions (0)
   --max-wait-ms N         (2)
-  --cache-entries N       network outputs kept per cache generation, 0 = off (500000)
+  --cache-entries N       network outputs kept in the cache, 0 = off (1000000)
   --no-stagger            start all games at once (default for bench)
   --stagger               spread game starts over one game length (default for selfplay)
   --positions-per-shard N (4096)
@@ -216,14 +216,17 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
     let stagger = if bench { args.flag("stagger") } else { !args.flag("no-stagger") };
     let config = PipelineConfig {
         workers: args.num("workers", 6usize)?.max(1),
-        pools_per_worker: args.num("pools-per-worker", 2usize)?.max(1),
+        // One: at 800 simulations the search trees of 12k concurrent games
+        // took over 12 GB and the kernel killed the process; with ~60% of the
+        // evaluations answered by the cache, 6k games still fill the GPU.
+        pools_per_worker: args.num("pools-per-worker", 1usize)?.max(1),
         games_per_pool: args.num("games-per-pool", 1024usize)?.max(1),
-        simulations: args.num("simulations", 200u32)?,
+        simulations: args.num("simulations", 800u32)?,
         stagger,
         batch_target: args.num("batch-target", 8192usize)?.max(1),
         min_batch: args.num("min-batch", 0usize)?,
         max_wait: Duration::from_millis(args.num("max-wait-ms", 2u64)?),
-        cache_entries: args.num("cache-entries", 500_000usize)?,
+        cache_entries: args.num("cache-entries", 1_000_000usize)?,
     };
     let process_index: usize = args.num("process-index", 0)?;
     let positions_per_shard: usize = args.num("positions-per-shard", 4096)?;
@@ -340,18 +343,21 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         )?
     };
 
+    let cache = Arc::new(pipeline::SharedCache::new(config.cache_entries));
     let mut reply_txs = Vec::new();
     for id in 0..config.workers {
         let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
         reply_txs.push(reply_tx);
-        let (config, request_tx, games_tx, stop) =
-            (config.clone(), request_tx.clone(), games_tx.clone(), stop.clone());
-        spawn(
-            format!("worker{id}"),
-            Box::new(move || {
-                pipeline::run_worker(id, &config, &request_tx, &reply_rx, &games_tx, &stop)
-            }),
-        )?;
+        let links = pipeline::WorkerLinks {
+            cache: cache.clone(),
+            stats: stats.clone(),
+            requests: request_tx.clone(),
+            replies: reply_rx,
+            games: games_tx.clone(),
+            stop: stop.clone(),
+        };
+        let config = config.clone();
+        spawn(format!("worker{id}"), Box::new(move || pipeline::run_worker(id, &config, links)))?;
     }
     drop((request_tx, games_tx));
 
@@ -361,6 +367,7 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         requests: request_rx,
         replies: reply_txs,
         weights: weights_rx,
+        cache,
         paused,
         throttle,
         stats: stats.clone(),

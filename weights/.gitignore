@@ -22,6 +22,7 @@ replay_buffer.tmp
 # Cool-down marker written by the trainer
 cooldown
 
-# Local mirror of the training run on the remote machine, written by
-# `just snapshot`; the champions worth keeping go to <bot>/champions/.
+# Local mirrors of training runs on the remote machine, written by
+# `just snapshot` for runs not named after a bot.
+zerorev-v1/
 zerorev-v2/

@@ -5,8 +5,8 @@ exports_files(
         "*/champion.bin",
         "*/champion.json",
     ]) + [
-        "zerorev/champions/gladiator0.bin",
-        "zerorev/champions/gladiator0.json",
+        "gladiator0/gladiator0.bin",
+        "gladiator0/gladiator0.json",
     ],
     visibility = ["//rust:__subpackages__"],
 )
