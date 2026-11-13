@@ -56,6 +56,18 @@ lint-fix:
 train botname processes="":
     #!/usr/bin/env bash
     mkdir -p {{ _weights_base / botname }}
+    # Cap the NVIDIA GPU clock (REVERSI_GPU_CLOCK MHz, default 1100; 0 = no
+    # cap). On the RTX 3080 Laptop under the 70/74 °C limits, 1100 MHz gives
+    # ~570k evals/s against ~300k uncapped: lower voltage, less heat, so the
+    # governor stops pausing self-play. Needs passwordless sudo; else skipped.
+    clock="${REVERSI_GPU_CLOCK:-1100}"
+    if command -v nvidia-smi >/dev/null && sudo -n true 2>/dev/null; then
+        if [ "$clock" = 0 ]; then
+            sudo -n nvidia-smi -rgc >/dev/null && echo "GPU clock cap removed"
+        else
+            sudo -n nvidia-smi -lgc "0,$clock" >/dev/null && echo "GPU clock capped at $clock MHz"
+        fi
+    fi
     # Self-play processes: 4 on CUDA, 1 on Apple Silicon unless given.
     nohup uv run --directory python python -m train.loop --run-name {{ botname }} \
         {{ if processes != "" { "--selfplay-processes " + processes } else { "" } }} \
@@ -217,9 +229,10 @@ snapshot host=_train_host run="zerorev-v2" bot="zerorev" which="champion":
     tr -d '\n' < "$target/champion.json"; echo
     echo "Reload the page to play it; \`just vs-minimax\` checks it against Minimax."
 
-# Play ZeroRev against Minimax with each colour: just vs-minimax [ms per move]
-vs-minimax ms="300":
-    bun apps/web/scripts/vs-minimax.ts {{ ms }}
+# Play ZeroRev against Minimax, alternating colours:
+# just vs-minimax [ms per move] [games] [jitter, e.g. 0.2 = ±20 % per move]
+vs-minimax ms="300" games="2" jitter="0":
+    bun apps/web/scripts/vs-minimax.ts {{ ms }} {{ games }} {{ jitter }}
 
 # --- per-bot shortcuts (for tab completion) ---
 train-alphazero:  (train "alphazero")

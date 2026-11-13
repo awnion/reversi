@@ -123,6 +123,10 @@ just train <bot> / just logs <bot> / just stop <bot> / just tournament <bot>
   `REVERSI_SELFPLAY_RUST_ARGS`. Tests: `cargo test` in `rust/trainer` and
   `uv run python -m train.test_selfplay_rs` (parity, shards, shutdown, game
   statistics); throughput: `just bench-selfplay <weights.bin>`.
+- **GPU clock cap.** `just train` locks the NVIDIA clock at
+  `REVERSI_GPU_CLOCK` MHz (default 1100, `0` removes the cap) when sudo
+  needs no password. Under the thermal limits a capped laptop GPU runs
+  self-play about twice as fast as an uncapped one that keeps getting paused.
 
 Training writes to `weights/<bot>/`. Do not delete or rewrite files there
 (checkpoints, replay buffers, `champion.bin`) unless asked; a training run may

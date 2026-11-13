@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod endgame;
 pub mod game;
 pub mod parallel;
 #[cfg(feature = "python")]

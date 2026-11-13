@@ -248,6 +248,63 @@ impl MctsSearch {
         self.backup(idx, value);
     }
 
+    /// The search below the root's child reached by `move_mask` (`0` = the
+    /// pass), as a search of its own: playing a move keeps the visits already
+    /// spent on the position that follows. `None` when that child was never
+    /// visited.
+    pub fn into_child(self, move_mask: u64) -> Option<MctsSearch> {
+        let child =
+            *self.nodes[0].children.iter().find(|&&c| self.nodes[c].move_mask == move_mask)?;
+        if self.nodes[child].n == 0 {
+            return None;
+        }
+        let mut old = self.nodes;
+        // Copy the subtree breadth-first; `remap[old index] = new index`.
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut remap = vec![usize::MAX; old.len()];
+        let mut queue = std::collections::VecDeque::from([child]);
+        while let Some(i) = queue.pop_front() {
+            remap[i] = nodes.len();
+            queue.extend(old[i].children.iter().copied());
+            let node = std::mem::replace(
+                &mut old[i],
+                Node {
+                    board: Board::new(0, 0),
+                    is_black: false,
+                    move_mask: 0,
+                    p: 0.0,
+                    n: 0,
+                    w: 0.0,
+                    in_flight: 0,
+                    parent: None,
+                    children: Vec::new(),
+                    expanded: false,
+                },
+            );
+            nodes.push(node);
+        }
+        for node in &mut nodes {
+            node.parent = node.parent.map(|p| remap[p]).filter(|&p| p != usize::MAX);
+            for c in &mut node.children {
+                *c = remap[*c];
+            }
+        }
+        nodes[0].parent = None;
+        nodes[0].move_mask = 0;
+        nodes[0].p = 1.0;
+        Some(MctsSearch { nodes })
+    }
+
+    /// The position the search is about.
+    pub fn root(&self) -> (Board, bool) {
+        (self.nodes[0].board, self.nodes[0].is_black)
+    }
+
+    /// The root has been evaluated and has children with priors.
+    pub fn root_expanded(&self) -> bool {
+        self.nodes[0].expanded
+    }
+
     /// Move with the highest visit count (deterministic, no temperature).
     pub fn best_move(&self) -> Option<u64> {
         self.nodes[0]

@@ -312,3 +312,41 @@ fn root_value_is_from_the_side_to_move() {
         assert!((mcts.root_value() - expected).abs() < 1e-5, "{}", mcts.root_value());
     }
 }
+
+#[test]
+fn into_child_keeps_the_subtree() {
+    let board = starting_board();
+    let eval = StaticEval;
+    let mut mcts = MctsSearch::new(board, true);
+    for _ in 0..200 {
+        mcts.simulate(&eval);
+    }
+    let m = mcts.best_move().expect("a move");
+    // Root visits = 1 (its own expansion) + the visits of its children.
+    let child_visits = (mcts.policy_target()[m.trailing_zeros() as usize]
+        * (mcts.visits() - 1) as f32)
+        .round() as u32;
+    let child = mcts.into_child(m).expect("the best move was visited");
+    assert_eq!(child.root(), (board.apply_move(true, m), false));
+    assert_eq!(child.visits(), child_visits);
+    assert!(child.root_expanded());
+
+    let mut child = child;
+    for _ in 0..50 {
+        child.simulate(&eval);
+    }
+    assert_eq!(child.visits(), child_visits + 50);
+    let sum: f32 = child.policy_target().iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "policy sum = {sum}");
+}
+
+#[test]
+fn self_play_games_end_with_solved_moves() {
+    // The last moves are solved exactly: one-hot policy targets.
+    let mut pool = SelfPlayPool::new(4, 8);
+    for record in run_pool(&mut pool, 4) {
+        let last =
+            record.positions.iter().rev().find(|p| p.policy_weight > 0.0).expect("a policy sample");
+        assert_eq!(last.mcts_policy.iter().filter(|&&p| p == 1.0).count(), 1);
+    }
+}

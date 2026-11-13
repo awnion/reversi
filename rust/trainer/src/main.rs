@@ -63,6 +63,7 @@ self-play options (selfplay, bench):
   --batch-target N        positions per network call (8192)
   --min-batch N           wait up to --max-wait-ms for this many positions (0)
   --max-wait-ms N         (2)
+  --cache-entries N       network outputs kept per cache generation, 0 = off (500000)
   --no-stagger            start all games at once (default for bench)
   --stagger               spread game starts over one game length (default for selfplay)
   --positions-per-shard N (4096)
@@ -222,6 +223,7 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         batch_target: args.num("batch-target", 8192usize)?.max(1),
         min_batch: args.num("min-batch", 0usize)?,
         max_wait: Duration::from_millis(args.num("max-wait-ms", 2u64)?),
+        cache_entries: args.num("cache-entries", 500_000usize)?,
     };
     let process_index: usize = args.num("process-index", 0)?;
     let positions_per_shard: usize = args.num("positions-per-shard", 4096)?;
@@ -391,16 +393,19 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
             let now = stats.snapshot();
             let seconds = now.at.zip(last.at).map_or(1.0, |(a, b)| (a - b).as_secs_f64());
             let rate = (now.evals - last.evals) as f64 / seconds.max(1e-9);
+            let asked = (now.evals - last.evals) + (now.cache_hits - last.cache_hits);
+            let hits = (now.cache_hits - last.cache_hits) as f64 / asked.max(1) as f64;
             let temp = temps.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let temp = if thermal_available { format!(" temp={temp}") } else { String::new() };
             // `log_event` field order of the Python self-play processes.
             crate::log::event(
                 "selfplay",
                 &format!(
-                    "progress process={process_index} games={} positions={} batch={} evals_per_s={rate:.0}{temp}",
+                    "progress process={process_index} games={} positions={} batch={} evals_per_s={rate:.0} cache_hits={:.0}%{temp}",
                     now.games,
                     now.positions,
                     stats.last_batch.load(Ordering::Relaxed),
+                    hits * 100.0,
                 ),
                 &[],
             );
@@ -435,6 +440,15 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
             gpu_busy = format!("{:.0}%", (b.gpu_ns - a.gpu_ns) as f64 / 1e9 / seconds * 100.0),
             games_per_s = format!("{:.1}", (b.games - a.games) as f64 / seconds),
             positions_per_s = format!("{:.0}", (b.positions - a.positions) as f64 / seconds),
+            evals_per_position = format!(
+                "{:.1}",
+                (b.evals - a.evals) as f64 / (b.positions - a.positions).max(1) as f64
+            ),
+            cache_hits = format!(
+                "{:.0}%",
+                (b.cache_hits - a.cache_hits) as f64 * 100.0
+                    / ((b.evals - a.evals) + (b.cache_hits - a.cache_hits)).max(1) as f64
+            ),
             temp = temp,
         );
     }

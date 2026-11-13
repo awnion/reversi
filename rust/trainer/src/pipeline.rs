@@ -54,6 +54,8 @@ pub struct PipelineConfig {
     /// Wait up to `max_wait` for at least this many positions.
     pub min_batch: usize,
     pub max_wait: Duration,
+    /// Network outputs kept per [`EvalCache`] generation (0 = no cache).
+    pub cache_entries: usize,
 }
 
 /// Counters shared with the progress log and the benchmark.
@@ -67,6 +69,9 @@ pub struct Stats {
     pub gpu_ns: AtomicU64,
     pub games: AtomicU64,
     pub positions: AtomicU64,
+    /// Positions answered from the [`EvalCache`] or by a duplicate in the
+    /// same batch, without a network evaluation.
+    pub cache_hits: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,6 +83,7 @@ pub struct Snapshot {
     pub gpu_ns: u64,
     pub games: u64,
     pub positions: u64,
+    pub cache_hits: u64,
 }
 
 impl Stats {
@@ -90,6 +96,7 @@ impl Stats {
             gpu_ns: self.gpu_ns.load(Ordering::Relaxed),
             games: self.games.load(Ordering::Relaxed),
             positions: self.positions.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
         }
     }
 }
@@ -172,6 +179,71 @@ pub fn run_worker(
     }
 }
 
+// ── Evaluation cache ──────────────────────────────────────────────────────
+
+/// A position as the network sees it: own discs, opponent's discs (colour
+/// does not enter the input, and the rest of the planes follows from these).
+type CacheKey = (i64, i64);
+
+/// One network output row: 64 priors and the value.
+type Row = [f32; 65];
+
+/// Hasher for [`CacheKey`]: the discs are already well mixed bitboards.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only i64 keys are hashed")
+    }
+
+    fn write_i64(&mut self, n: i64) {
+        self.0 = (self.0.rotate_left(29) ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type KeyMap<V> = std::collections::HashMap<CacheKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
+
+/// Network outputs for positions seen recently. The same positions come up
+/// again and again: openings across games and transpositions inside a search.
+/// Two generations bound the memory: when the current one is full it becomes
+/// the previous one and the older entries are dropped. Cleared on every
+/// weights update, so answers always come from the current network.
+pub struct EvalCache {
+    current: KeyMap<Row>,
+    previous: KeyMap<Row>,
+    capacity: usize,
+}
+
+impl EvalCache {
+    pub fn new(capacity: usize) -> Self {
+        EvalCache { current: KeyMap::default(), previous: KeyMap::default(), capacity }
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<&Row> {
+        self.current.get(key).or_else(|| self.previous.get(key))
+    }
+
+    fn insert(&mut self, key: CacheKey, row: Row) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.current.len() >= self.capacity {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(key, row);
+    }
+
+    fn clear(&mut self) {
+        self.current.clear();
+        self.previous.clear();
+    }
+}
+
 // ── GPU thread ────────────────────────────────────────────────────────────
 
 /// Batch sizes are padded to a few buckets, so that cuDNN's autotuner sees a
@@ -217,6 +289,10 @@ impl GpuThread {
         let mut batch: Vec<Request> = Vec::new();
         let mut packed: Vec<i64> = Vec::new();
         let mut out: Vec<f32> = Vec::new();
+        let mut rows: Vec<f32> = Vec::new();
+        let mut cache = EvalCache::new(config.cache_entries);
+        let mut unique: KeyMap<usize> = KeyMap::default();
+        let mut pending: Vec<(usize, usize)> = Vec::new();
         let mut pacer = Pacer::default();
         let mut paused_since: Option<Instant> = None;
 
@@ -228,6 +304,7 @@ impl GpuThread {
             }
             if let Some(loaded) = newest {
                 net = TorchNet::new(&loaded.weights, self.options);
+                cache.clear();
                 log_selfplay!("weights-reloaded", process = 0, source = loaded.source);
             }
 
@@ -286,25 +363,56 @@ impl GpuThread {
                 batch.push(next);
             }
 
-            // Evaluate.
-            let padded = bucket(total);
+            // Answer what the cache knows, evaluate each other position once.
+            rows.clear();
+            rows.resize(total * 65, 0.0);
             packed.clear();
+            unique.clear();
+            pending.clear();
+            let mut row = 0;
             for request in &batch {
-                packed.extend_from_slice(&request.packed);
+                for position in request.packed.as_chunks::<4>().0 {
+                    let key = (position[0], position[1]);
+                    if let Some(cached) = cache.get(&key) {
+                        rows[row * 65..(row + 1) * 65].copy_from_slice(cached);
+                    } else {
+                        let next = unique.len();
+                        let slot = *unique.entry(key).or_insert(next);
+                        if slot == next {
+                            packed.extend_from_slice(position);
+                        }
+                        pending.push((row, slot));
+                    }
+                    row += 1;
+                }
             }
-            packed.resize(padded * 4, 0);
+            let evaluated = unique.len();
             let started = Instant::now();
-            let output = net.forward(&net.unpack(&packed));
-            out.resize(padded * 65, 0.0);
-            // Blocks until the batch has completed on the device.
-            output.copy_data(&mut out, padded * 65);
+            let mut padded = 0;
+            if evaluated > 0 {
+                padded = bucket(evaluated);
+                packed.resize(padded * 4, 0);
+                let output = net.forward(&net.unpack(&packed));
+                out.resize(padded * 65, 0.0);
+                // Blocks until the batch has completed on the device.
+                output.copy_data(&mut out, padded * 65);
+                for &(row, slot) in &pending {
+                    rows[row * 65..(row + 1) * 65]
+                        .copy_from_slice(&out[slot * 65..(slot + 1) * 65]);
+                }
+                for (key, slot) in unique.drain() {
+                    let mut entry = [0.0; 65];
+                    entry.copy_from_slice(&out[slot * 65..(slot + 1) * 65]);
+                    cache.insert(key, entry);
+                }
+            }
             let work = started.elapsed();
 
             // Hand every pool its slice.
             let mut offset = 0;
             for request in batch.drain(..) {
                 let n = request.len();
-                let rows = &out[offset * 65..(offset + n) * 65];
+                let rows = &rows[offset * 65..(offset + n) * 65];
                 let mut policies = Vec::with_capacity(n * 64);
                 let mut values = Vec::with_capacity(n);
                 for row in rows.as_chunks::<65>().0 {
@@ -322,10 +430,11 @@ impl GpuThread {
             }
 
             let stats = &self.stats;
-            stats.evals.fetch_add(total as u64, Ordering::Relaxed);
+            stats.evals.fetch_add(evaluated as u64, Ordering::Relaxed);
+            stats.cache_hits.fetch_add((total - evaluated) as u64, Ordering::Relaxed);
             stats.padded_evals.fetch_add(padded as u64, Ordering::Relaxed);
             stats.batches.fetch_add(1, Ordering::Relaxed);
-            stats.last_batch.store(total as u64, Ordering::Relaxed);
+            stats.last_batch.store(evaluated as u64, Ordering::Relaxed);
             stats.gpu_ns.fetch_add(work.as_nanos() as u64, Ordering::Relaxed);
 
             // Slow down while the machine is too hot, in proportion to the

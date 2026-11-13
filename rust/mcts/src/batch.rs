@@ -11,6 +11,7 @@
 
 use reversi_minimax::board::Board;
 
+use crate::endgame::solve;
 use crate::game::GameRecord;
 use crate::game::PositionRecord;
 use crate::game::SimpleRng;
@@ -22,6 +23,9 @@ use crate::search::MctsSearch;
 /// Moves sampled from the visit distribution at the start of each game.
 const SELF_PLAY_TEMPERATURE_MOVES: usize = 12;
 const ROOT_NOISE_EPSILON: f32 = 0.25;
+/// Positions with at most this many empty squares are solved exactly
+/// ([`crate::endgame::solve`]) instead of searched.
+pub const ENDGAME_SOLVE_EMPTIES: u32 = 12;
 
 /// Number of `f32`s per position in the network input (4 planes of 8×8).
 pub const PLANES_LEN: usize = 4 * 64;
@@ -70,6 +74,10 @@ struct Game {
     /// Search for the current move; `None` between moves.
     search: Option<MctsSearch>,
     sims_done: u32,
+    /// The subtree of the last move played, reused by the next search.
+    reuse: Option<MctsSearch>,
+    /// Root noise has been added to the current search.
+    noised: bool,
 }
 
 impl Game {
@@ -83,6 +91,8 @@ impl Game {
             rng: SimpleRng::new(),
             search: None,
             sims_done: 0,
+            reuse: None,
+            noised: false,
         }
     }
 
@@ -92,14 +102,42 @@ impl Game {
         loop {
             if self.search.is_none() {
                 // Skip forced passes; two in a row end the game.
-                if self.board.legal_moves(self.is_black) == 0 {
+                let mut legal = self.board.legal_moves(self.is_black);
+                if legal == 0 {
                     self.is_black = !self.is_black;
-                    if self.board.legal_moves(self.is_black) == 0 {
+                    self.reuse = self.reuse.take().and_then(|tree| tree.into_child(0));
+                    legal = self.board.legal_moves(self.is_black);
+                    if legal == 0 {
                         return Err(self.finish());
                     }
                 }
-                self.search = Some(MctsSearch::new(self.board, self.is_black));
-                self.sims_done = 0;
+                let empties = 64 - (self.board.black | self.board.white).count_ones();
+                if empties <= ENDGAME_SOLVE_EMPTIES {
+                    // Perfect play to the end, no network needed.
+                    self.reuse = None;
+                    let (best, _) = solve(self.board, self.is_black);
+                    let m = best.expect("the side to move has a move");
+                    let mut policy = [0.0; 64];
+                    policy[m.trailing_zeros() as usize] = 1.0;
+                    self.record_and_play(legal, policy, 1.0, m);
+                    continue;
+                }
+                if legal.count_ones() == 1 {
+                    // Nothing to search; the position still teaches the value.
+                    let mut policy = [0.0; 64];
+                    policy[legal.trailing_zeros() as usize] = 1.0;
+                    self.reuse = self.reuse.take().and_then(|tree| tree.into_child(legal));
+                    self.record_and_play(legal, policy, 0.0, legal);
+                    continue;
+                }
+                let search = match self.reuse.take() {
+                    Some(tree) if tree.root() == (self.board, self.is_black) => tree,
+                    _ => MctsSearch::new(self.board, self.is_black),
+                };
+                self.sims_done = search.visits();
+                self.noised = false;
+                self.search = Some(search);
+                self.add_noise_once(legal);
             }
 
             if self.sims_done >= simulations {
@@ -116,16 +154,23 @@ impl Game {
         }
     }
 
+    /// Perturb the root priors once they exist (after the first evaluation,
+    /// or right away for a reused tree).
+    fn add_noise_once(&mut self, legal: u64) {
+        let search = self.search.as_mut().expect("a search in progress");
+        if !self.noised && search.root_expanded() {
+            add_root_noise(search, legal, &mut self.rng, ROOT_NOISE_EPSILON);
+            self.noised = true;
+        }
+    }
+
     /// Feed the evaluation for the request returned by [`Game::advance`].
     fn apply(&mut self, request: &EvalRequest, policy: &[f32], value: f32) {
         let legal = self.board.legal_moves(self.is_black);
         let search = self.search.as_mut().expect("apply follows a pending request");
         search.apply_eval(request, policy, value);
         self.sims_done += 1;
-        if self.sims_done == 1 {
-            // The first simulation expands the root; perturb its priors.
-            add_root_noise(search, legal, &mut self.rng, ROOT_NOISE_EPSILON);
-        }
+        self.add_noise_once(legal);
     }
 
     /// Record the searched position and play the chosen move.
@@ -134,6 +179,19 @@ impl Game {
         let legal = self.board.legal_moves(self.is_black);
         let policy = search.policy_target();
 
+        // Sample from visit counts in the opening to keep self-play diverse.
+        let selected = if self.ply < SELF_PLAY_TEMPERATURE_MOVES {
+            sample_move_from_policy(policy, legal, &mut self.rng).or_else(|| search.best_move())
+        } else {
+            search.best_move()
+        };
+        let m = selected.expect("a searched position has a legal move");
+        self.reuse = search.into_child(m);
+        self.record_and_play(legal, policy, 1.0, m);
+    }
+
+    /// Add the training sample for the current position and play `m`.
+    fn record_and_play(&mut self, legal: u64, policy: [f32; 64], policy_weight: f32, m: u64) {
         let sample = |policy_weight, value_weight| Sample {
             board: self.board,
             is_black: self.is_black,
@@ -142,21 +200,12 @@ impl Game {
             policy_weight,
             value_weight,
         };
-        self.samples.push(sample(1.0, 1.0));
+        self.samples.push(sample(policy_weight, 1.0));
         if (self.board.black | self.board.white).count_ones() == 63 {
             // Forced last move: an extra value-only sample.
             self.samples.push(sample(0.0, 2.0));
         }
-
-        // Sample from visit counts in the opening to keep self-play diverse.
-        let selected = if self.ply < SELF_PLAY_TEMPERATURE_MOVES {
-            sample_move_from_policy(policy, legal, &mut self.rng).or_else(|| search.best_move())
-        } else {
-            search.best_move()
-        };
-        if let Some(m) = selected {
-            self.board = self.board.apply_move(self.is_black, m);
-        }
+        self.board = self.board.apply_move(self.is_black, m);
         self.is_black = !self.is_black;
         self.ply += 1;
     }
