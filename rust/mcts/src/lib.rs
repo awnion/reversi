@@ -1,3 +1,4 @@
+pub mod arena;
 pub mod batch;
 pub mod endgame;
 pub mod game;
@@ -6,6 +7,7 @@ pub mod parallel;
 pub mod py;
 pub mod search;
 
+pub use arena::MatchPool;
 pub use batch::Budget;
 pub use batch::PLANES_LEN;
 pub use batch::SelfPlayPool;

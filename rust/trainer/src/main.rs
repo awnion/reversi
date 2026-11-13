@@ -6,9 +6,11 @@
 //! reversi-selfplay selfplay --run-dir weights/<run> [options]   # replay shards
 //! reversi-selfplay bench --weights <file.bin> [options]         # throughput
 //! reversi-selfplay check [--weights <file.bin>] [--allow-cpu]   # libtorch + CUDA
+//! reversi-selfplay match --a <a.bin> --b <b.bin> [options]      # a against b
 //! reversi-selfplay infer --weights <file.bin> --input <f32> --output <f32>
 //! ```
 
+mod arena;
 mod control;
 mod log;
 mod net;
@@ -52,6 +54,14 @@ commands:
   bench     --weights FILE      self-play throughput, games discarded
   check     [--weights FILE]    libtorch loads, CUDA is available, one forward pass works
             [--allow-cpu]       succeed without CUDA
+  match     --a FILE --b FILE   pairs of games, a random opening each, each network black
+                                once; prints one JSON line: a's points per pair (0 to 2)
+            [--pairs N]         (100)
+            [--simulations N]   per move (800)
+            [--opening-plies N] random moves before the networks take over (4)
+            [--seed N]          pair i starts from opening seed + i (0)
+            [--workers N]       search threads (6)
+            [--leaves N]        leaves per game and round, apart by virtual loss (8)
   infer     --weights FILE --input PLANES.f32 --output OUT.f32
                                 (N, 4, 8, 8) float32 in, (N, 65) float32 out: 64 move
                                 probabilities and the value per position
@@ -179,6 +189,7 @@ fn main() -> ExitCode {
         "bench" => selfplay(&mut args, true),
         "check" => check(&mut args),
         "infer" => infer(&mut args),
+        "match" => play_match(&mut args),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -526,6 +537,35 @@ fn to_vec(t: &Tensor) -> Vec<f32> {
     let mut out = vec![0.0; t.numel()];
     t.copy_data(&mut out, t.numel());
     out
+}
+
+/// Two networks play pairs of games; one JSON line with a's points per pair.
+fn play_match(args: &mut Args) -> Result<ExitCode, String> {
+    let options = args.net_options()?;
+    let mut load = |name: &str| -> Result<FoldedWeights, String> {
+        let path = args.path(name)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        FoldedWeights::from_bin(&bytes)
+    };
+    let (a, b) = (load("a")?, load("b")?);
+    let config = arena::MatchConfig {
+        pairs: args.num("pairs", 100usize)?,
+        simulations: args.num("simulations", 800u32)?,
+        opening_plies: args.num("opening-plies", 4u32)?,
+        seed: args.num("seed", 0u64)?,
+        workers: args.num("workers", 6usize)?,
+        leaves_per_round: args.num("leaves", 8u32)?,
+    };
+    args.finish()?;
+    let started = Instant::now();
+    let points = arena::run_match(&a, &b, options, &config);
+    let points: Vec<String> = points.iter().map(|p| p.to_string()).collect();
+    println!(
+        "{{\"points\": [{}], \"seconds\": {:.1}}}",
+        points.join(", "),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Planes file in, policies and values out (for parity tests).

@@ -1,6 +1,7 @@
 use reversi_mcts::Budget;
 use reversi_mcts::EvalFn;
 use reversi_mcts::GameRecord;
+use reversi_mcts::MatchPool;
 use reversi_mcts::MctsSearch;
 use reversi_mcts::PLANES_LEN;
 use reversi_mcts::SelfPlayPool;
@@ -409,4 +410,56 @@ fn values_stay_exact_after_many_simulations() {
         assert!(mcts.select_leaf().is_none(), "a finished game needs no evaluation");
     }
     assert_eq!(mcts.root_value(), -1.0, "white has lost");
+}
+
+/// Plays a [`MatchPool`] to the end with `evals[net]` for each network.
+fn play_arena(pool: &mut MatchPool, evals: [&dyn EvalFn; 2]) {
+    loop {
+        let (requests, nets) = pool.collect();
+        if requests.is_empty() {
+            return;
+        }
+        let (requests, nets) = (requests.to_vec(), nets.to_vec());
+        let mut policies = Vec::new();
+        let mut values = Vec::new();
+        for (request, &net) in requests.iter().zip(&nets) {
+            let (policy, value) =
+                evals[net as usize].evaluate(request.board, request.is_black, request.legal);
+            policies.extend_from_slice(&policy);
+            values.push(value);
+        }
+        pool.apply(&policies, &values);
+    }
+}
+
+#[test]
+fn arena_pairs_of_equal_networks_split_the_points() {
+    let mut pool = MatchPool::new(3..7, 4, 11, 32, 4);
+    play_arena(&mut pool, [&StaticEval, &StaticEval]);
+    assert!(pool.done());
+    let points = pool.pair_points();
+    assert_eq!(points.iter().map(|&(pair, _)| pair).collect::<Vec<_>>(), vec![3, 4, 5, 6]);
+    // Same network on both sides, no noise: each pair is one game played
+    // twice with the colours swapped.
+    for (pair, p) in points {
+        assert_eq!(p, 1.0, "pair {pair}");
+    }
+}
+
+/// [`StaticEval`]'s hand-written score scaled to matter, optionally upside down.
+struct Scaled(f32);
+
+impl EvalFn for Scaled {
+    fn evaluate(&self, board: Board, is_black: bool, legal: u64) -> ([f32; 64], f32) {
+        let (policy, value) = StaticEval.evaluate(board, is_black, legal);
+        (policy, (self.0 * value).clamp(-1.0, 1.0))
+    }
+}
+
+#[test]
+fn arena_scores_the_stronger_network() {
+    let mut pool = MatchPool::new(0..8, 2, 5, 64, 8);
+    play_arena(&mut pool, [&Scaled(100.0), &Scaled(-100.0)]);
+    let total: f32 = pool.pair_points().iter().map(|&(_, p)| p).sum();
+    assert!(total >= 12.0, "the right way up scored {total} of 16");
 }

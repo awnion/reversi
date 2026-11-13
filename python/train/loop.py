@@ -19,6 +19,7 @@ import json
 import math
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -96,10 +97,13 @@ SELFPLAY_GAMES = 1024
 # SPRT match of 400 at 800 simulations took 30 minutes and stayed inconclusive.
 TOURNAMENT_EVERY_SECONDS = 30 * 60
 TOURNAMENT_MIN_STEPS = 5_000
-# Before the replacement, TOURNAMENT_PAIRS pairs of games against the old
-# champion, from one random opening each, each colour once: an Elo trend for
-# the log (±90 Elo at 50 games), not a decision.
-TOURNAMENT_PAIRS = 25
+# Before the replacement, pairs of games against a fixed reference
+# (reference.bin; the champion of the moment if missing), from one random
+# opening each, each colour once: an Elo trend for the log, not a decision.
+# On the GPU (`reversi-selfplay match`, with Rust self-play) 100 pairs, ±35
+# Elo, in about a minute; on the CPU (`run_pairs`) 25 pairs, ±90 Elo, in four.
+TOURNAMENT_PAIRS_GPU = 100
+TOURNAMENT_PAIRS_CPU = 25
 # Same search as the recorded self-play moves, so the match measures the
 # network that training produces.
 TOURNAMENT_SIMS = SIMULATIONS
@@ -129,13 +133,15 @@ LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
 CHAMPION_META = WEIGHTS_DIR / "champion.json"
 # The weight average (EMA_STEPS), saved with every checkpoint.
 EMA_PATH = WEIGHTS_DIR / "ema.npz"
+# The fixed opponent of the champion matches.
+REFERENCE_BIN = WEIGHTS_DIR / "reference.bin"
 
 
 def _apply_run_name(name: str) -> None:
     """Point all path globals at weights/<name>/."""
     global WEIGHTS_DIR, CHAMPION_BIN, REPLAY_PATH, PID_FILE
     global REPLAY_SPOOL_DIR, SELFPLAY_MODEL_BIN, COOLDOWN_FLAG, CHAMPION_META
-    global LR_ORIGIN_FILE, EMA_PATH
+    global LR_ORIGIN_FILE, EMA_PATH, REFERENCE_BIN
     WEIGHTS_DIR = _WEIGHTS_BASE / name
     CHAMPION_BIN = WEIGHTS_DIR / "champion.bin"
     REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
@@ -146,6 +152,7 @@ def _apply_run_name(name: str) -> None:
     CHAMPION_META = WEIGHTS_DIR / "champion.json"
     LR_ORIGIN_FILE = WEIGHTS_DIR / "lr_schedule.json"
     EMA_PATH = WEIGHTS_DIR / "ema.npz"
+    REFERENCE_BIN = WEIGHTS_DIR / "reference.bin"
 
 
 # A self-play process alternates between the search trees (one CPU core) and
@@ -481,45 +488,26 @@ async def _run_champion_match(
     current_loss: float = float("inf"),
     current_step: int = 0,
 ) -> None:
-    """Play the weight average against the champion for the log, then make it
-    the champion."""
-    import traceback
-
-    import reversi_mcts
-
+    """Play the weight average against the reference for the log, then make
+    it the champion."""
     if not CHAMPION_BIN.exists():
         log_event("tournament", "bootstrap-champion")
         weights_io.save_bin(challenger, CHAMPION_BIN)
         _record_champion(challenger, win_rate=1.0, loss=current_loss, step=current_step)
         log_event("tournament", "promoted", path=CHAMPION_BIN.name, mode="bootstrap")
         return
+    if not REFERENCE_BIN.exists():
+        shutil.copyfile(CHAMPION_BIN, REFERENCE_BIN)
+        log_event("tournament", "reference-set", source=CHAMPION_BIN.name)
 
-    try:
-        champion_blob = CHAMPION_BIN.read_bytes()
-    except OSError as e:
-        log_event("tournament", "load-failed", error=repr(e))
-        return
-    challenger_blob = weights_io.to_bytes(challenger)
-
-    log_event("tournament", "start", sims=TOURNAMENT_SIMS, games=2 * TOURNAMENT_PAIRS)
-    seed = time.time_ns() & 0xFFFF_FFFF
     started = time.monotonic()
-
-    def play():
-        return reversi_mcts.run_pairs(
-            challenger_blob,
-            champion_blob,
-            TOURNAMENT_PAIRS,
-            TOURNAMENT_SIMS,
-            opening_plies=TOURNAMENT_OPENING_PLIES,
-            seed=seed,
-            threads=TOURNAMENT_THREADS,
-        )
-
-    try:
-        points = await asyncio.get_running_loop().run_in_executor(None, play)
-    except Exception:
-        log_event("tournament", "run-error", error=traceback.format_exc().strip())
+    seed = time.time_ns() & 0xFFFF_FFFF
+    points = None
+    if _selfplay_implementation() != "python" and RUST_SELFPLAY_BIN.exists():
+        points = await _match_on_gpu(challenger, seed)
+    if points is None:
+        points = await _match_on_cpu(challenger, seed)
+    if points is None:
         log_event("tournament", "aborted")
         return
 
@@ -536,10 +524,93 @@ async def _run_champion_match(
         elo=f"{_score_to_elo(score):+.0f}",
         elo_range=f"[{low:+.0f},{high:+.0f}]",
         seconds=f"{time.monotonic() - started:.0f}",
+        opponent=REFERENCE_BIN.name,
     )
     weights_io.save_bin(challenger, CHAMPION_BIN)
     _record_champion(challenger, score, current_loss, step=current_step)
     log_event("tournament", "promoted", path=CHAMPION_BIN.name, step=current_step)
+
+
+async def _match_on_gpu(challenger: Weights, seed: int) -> list[float] | None:
+    """`reversi-selfplay match`: points of `challenger` per pair, or None."""
+    challenger_path = WEIGHTS_DIR / "challenger.tmp.bin"
+    weights_io.save_bin(challenger, challenger_path)
+    pairs = TOURNAMENT_PAIRS_GPU
+    log_event(
+        "tournament", "start", device="gpu", sims=TOURNAMENT_SIMS, games=2 * pairs
+    )
+    cmd = [
+        str(RUST_SELFPLAY_BIN),
+        "match",
+        "--a",
+        str(challenger_path),
+        "--b",
+        str(REFERENCE_BIN),
+        "--pairs",
+        str(pairs),
+        "--simulations",
+        str(TOURNAMENT_SIMS),
+        "--opening-plies",
+        str(TOURNAMENT_OPENING_PLIES),
+        "--seed",
+        str(seed),
+    ]
+    try:
+        child = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=_rust_selfplay_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await child.communicate()
+        if child.returncode != 0:
+            raise RuntimeError(
+                f"exit {child.returncode}: {err.decode().strip()[-500:]}"
+            )
+        points = json.loads(out.decode().strip().splitlines()[-1])["points"]
+        if len(points) != pairs:
+            raise RuntimeError(f"{len(points)} pairs instead of {pairs}")
+        return points
+    except Exception as e:  # noqa: BLE001 - fall back to the CPU match
+        log_event("tournament", "gpu-match-failed", error=repr(e))
+        return None
+    finally:
+        challenger_path.unlink(missing_ok=True)
+
+
+async def _match_on_cpu(challenger: Weights, seed: int) -> list[float] | None:
+    """`run_pairs` on CPU threads: points of `challenger` per pair, or None."""
+    import traceback
+
+    import reversi_mcts
+
+    try:
+        reference_blob = REFERENCE_BIN.read_bytes()
+    except OSError as e:
+        log_event("tournament", "load-failed", error=repr(e))
+        return None
+    challenger_blob = weights_io.to_bytes(challenger)
+    pairs = TOURNAMENT_PAIRS_CPU
+    log_event(
+        "tournament", "start", device="cpu", sims=TOURNAMENT_SIMS, games=2 * pairs
+    )
+
+    def play():
+        return reversi_mcts.run_pairs(
+            challenger_blob,
+            reference_blob,
+            pairs,
+            TOURNAMENT_SIMS,
+            opening_plies=TOURNAMENT_OPENING_PLIES,
+            seed=seed,
+            threads=TOURNAMENT_THREADS,
+        )
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, play)
+    except Exception:
+        log_event("tournament", "run-error", error=traceback.format_exc().strip())
+        return None
 
 
 def _score_to_elo(score: float) -> float:
