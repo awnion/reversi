@@ -75,8 +75,18 @@ LOG_EVERY = 100
 # counted from the step at which this schedule started for the run (kept in
 # LR_ORIGIN_FILE, so restarts continue it). The old step decay halved the
 # rate every 5k steps and sat at its floor for almost the whole run.
+# After 1.26 M steps at 3e-5 without getting stronger (zerorev, step 3.37 M),
+# the rate goes back up to 1e-4 and comes down in longer stages; the weight
+# average (EMA) that self-play and the champion use smooths the extra noise.
 LR_WARMUP_STEPS = 1_000
-LR_STAGES = ((0, BASE_LEARNING_RATE), (300_000, 1e-4), (800_000, 3e-5))
+LR_STAGES = (
+    (0, BASE_LEARNING_RATE),
+    (300_000, 1e-4),
+    (800_000, 3e-5),
+    (2_060_000, 1e-4),
+    (3_560_000, 5e-5),
+    (5_060_000, 3e-5),
+)
 _WEIGHTS_BASE = Path(__file__).parent.parent.parent / "weights"
 
 WEIGHTS_DIR = _WEIGHTS_BASE / "alphazero"  # replaced by _apply_run_name() before use

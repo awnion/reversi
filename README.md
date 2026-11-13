@@ -122,6 +122,7 @@ Where it differs from AlphaZero:
 | 2 109 942 | 1.66 | ●●●●●●●●●○ | current; beat 1 569 467 in both games |
 | | | | **800 simulations** |
 | | | | **Playout cap randomization**, weight average (EMA), value target 0.8 result + 0.2 search; champion = weight average every 30 min, no gating |
+| | | | **Learning rate back up** to 10⁻⁴ after 1.3 M steps at 3·10⁻⁵ without gains; longer stages down |
 
 ### Fixes
 
