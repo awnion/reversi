@@ -119,9 +119,10 @@ Where it differs from AlphaZero:
 | 1 633 050 | 1.68 | ●●●●●○○○○○ | |
 | | | | **400 simulations**, 2 M-position buffer |
 | 1 883 761 | 1.70 | ●●●●●●●●●○ | |
-| 2 109 942 | 1.66 | ●●●●●●●●●○ | current; beat 1 569 467 in both games |
+| 2 109 942 | 1.66 | ●●●●●●●●●○ | beat 1 569 467 in both games; reference for the matches since |
 | | | | **800 simulations** |
 | | | | **Playout cap randomization**, weight average (EMA), value target 0.8 result + 0.2 search; champion = weight average every 30 min, no gating |
+| 3 360 000 | 1.31 | ●●●●●●●●●● | current; 55.5 % against 2 109 942 (100 games, 2 000 simulations) |
 | | | | **Learning rate back up** to 10⁻⁴ after 1.3 M steps at 3·10⁻⁵ without gains; longer stages down |
 
 ### Fixes
