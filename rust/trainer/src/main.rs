@@ -71,9 +71,9 @@ self-play options (selfplay, bench):
   --fast-simulations N    playout cap randomization: simulations on the moves
                           that are only played, not recorded (= --simulations: off)
   --full-fraction F       share of moves searched with --simulations and recorded (1)
-  --workers N             search threads (6)
-  --pools-per-worker N    game pools per search thread (1)
-  --games-per-pool N      concurrent games per pool (1024)
+  --workers N             search threads (8)
+  --pools-per-worker N    game pools per search thread (2)
+  --games-per-pool N      concurrent games per pool (384)
   --batch-target N        positions per network call (8192)
   --min-batch N           wait up to --max-wait-ms for this many positions (0)
   --max-wait-ms N         (2)
@@ -230,12 +230,14 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
     let options = args.net_options()?;
     let stagger = if bench { args.flag("stagger") } else { !args.flag("no-stagger") };
     let config = PipelineConfig {
-        workers: args.num("workers", 6usize)?.max(1),
-        // One: at 800 simulations the search trees of 12k concurrent games
-        // took over 12 GB and the kernel killed the process; with ~60% of the
-        // evaluations answered by the cache, 6k games still fill the GPU.
-        pools_per_worker: args.num("pools-per-worker", 1usize)?.max(1),
-        games_per_pool: args.num("games-per-pool", 1024usize)?.max(1),
+        // 8 × 2 × 384 = 6 144 games: at 800 simulations the search trees of
+        // 12k concurrent games took over 12 GB and the kernel killed the
+        // process. Two pools per thread: one searches while the other waits
+        // for the GPU (one pool of 1 024 per thread on 6 threads: 105 games/s
+        // in `bench`, this: 161).
+        workers: args.num("workers", 8usize)?.max(1),
+        pools_per_worker: args.num("pools-per-worker", 2usize)?.max(1),
+        games_per_pool: args.num("games-per-pool", 384usize)?.max(1),
         budget: {
             let full = args.num("simulations", 800u32)?;
             let fast = args.num("fast-simulations", full)?;

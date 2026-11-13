@@ -140,8 +140,8 @@ What the old scheme did wrong, fixed at step 1 239 000:
 
 - Positions/s: training positions from self-play per second, on the laptop.
 - Bar label: row · simulations per move. Compare bars with equal simulations.
-- Row 13 records only a quarter of the moves: fewer positions per second, but
-  1.7 times more games (55 → 92 per second).
+- Rows 13–14 record only a quarter of the moves: fewer positions per second,
+  but more games (55 → 92 → 106 per second).
 - Steps/s: gradient steps (batch 512). From row 7 at 200 simulations the
   learner, sharing the GPU, sets the pace: 7 900 positions/s would allow 79.
 - Source: the training log over steady minutes; rows 1, 2, 4 are short runs.
@@ -149,9 +149,9 @@ What the old scheme did wrong, fixed at step 1 239 000:
 
 ```mermaid
 xychart-beta
-    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800", "13·800/150"]
+    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800", "13·800/150", "14·800/150"]
     y-axis "positions per second" 0 --> 8000
-    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500, 2540]
+    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500, 2540, 2870]
 ```
 
 | # | Change | Sims | Positions/s | Steps/s | GPU °C |
@@ -169,6 +169,7 @@ xychart-beta
 | 11 | Cache looked up by the search threads, not the GPU thread | 800 | 4 100 | 40 | 67 |
 | 12 | Half as many games at once (6 144): 12 k trees took > 12 GB and were OOM-killed | 800 | 3 500 | 35 | 65 |
 | 13 | Playout cap randomization: ¼ of the moves at 800 simulations and recorded, the rest at 150 | 800/150 | 2 540 | 25 | 66 |
+| 14 | 8 search threads with two game pools each: one searches while the other waits for the GPU. Alone +53 %; next to the learner the GPU is the limit | 800/150 | 2 870 | 29 | 68 |
 
 ## Running it
 
@@ -204,7 +205,7 @@ starting point:
 | | Hardware | Default |
 |---|---|---|
 | GPU | RTX 3080 Laptop | slows down at 70 / 74 °C (soft / hard limit); clock capped at 1 100 MHz |
-| CPU | Ryzen 9 5900HX, 16 threads | slows down at 85 / 90 °C; 6 search threads |
+| CPU | Ryzen 9 5900HX, 16 threads | slows down at 85 / 90 °C; 8 search threads |
 | RAM | 32 GB | 6 144 self-play games at once, ~6 GB |
 
 By hand:
