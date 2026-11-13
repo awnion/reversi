@@ -234,7 +234,10 @@ class ReplayBuffer:
                 self._policy_weights[:n] = data["policy_weights"][:n]
                 self._value_weights[:n] = data["value_weights"][:n]
                 self._size = n
-                self._ptr = int(data["ptr"]) % n if n else 0
+                # A buffer that is not full yet (also one loaded into a larger
+                # capacity) continues after its last entry; a full one at the
+                # oldest entry.
+                self._ptr = int(data["ptr"]) % n if n == self.max_size else n
         except (OSError, ValueError, BadZipFile, EOFError, RuntimeError, zlib.error):
             bad_path = path.with_suffix(path.suffix + ".bad")
             path.replace(bad_path)

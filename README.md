@@ -107,9 +107,11 @@ tail -f /tmp/reversi_train.log
 Training runs continuously and:
 
 - Waits until 30 000 positions are collected before starting gradient updates
-- Uses 200 MCTS simulations per move during self-play, always with the newest weights
+- Uses 400 MCTS simulations per move during self-play (reusing the subtree of the move played), always with the newest weights
 - Does 1 gradient step (batch 512) per 100 new positions, so each position is
   trained on about 5 times
+- Keeps the last 2 000 000 positions in the replay buffer
+- Solves the last 12 empty squares exactly instead of searching them
 - Turns every training position to a random one of the 8 symmetries of the board
 - Learns the move policy, the game result and the final disc margin
   (an auxiliary head, not used by the bots)

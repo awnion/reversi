@@ -39,7 +39,10 @@ from .weights import Weights
 
 # --- hyper-parameters --------------------------------------------------------
 
-SIMULATIONS = 200
+# Self-play search per move. 400 since the Rust self-play (with tree reuse,
+# endgame solver and eval cache) outran the learner at 200: the spare speed
+# buys sharper policy targets instead of positions nobody trains on.
+SIMULATIONS = 400
 BATCH_SIZE = 512
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
@@ -93,7 +96,12 @@ CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 
 # Replay persistence
 REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
-REPLAY_SAVE_EVERY = 1_000  # save replay buffer every N training steps
+# Positions kept for training: several minutes of self-play, so that the
+# network does not chase the last minute of games. ~1.3 KB each (2.6 GB).
+REPLAY_SIZE = 2_000_000
+# Save the replay buffer every N training steps. Saving blocks the learner
+# (about 20 s per million positions), so not too often.
+REPLAY_SAVE_EVERY = 20_000
 PID_FILE = WEIGHTS_DIR / "train.pid"
 REPLAY_SPOOL_DIR = WEIGHTS_DIR / "replay_spool"
 SELFPLAY_MODEL_BIN = WEIGHTS_DIR / "selfplay_latest.bin"
@@ -1050,7 +1058,7 @@ async def _run_learner(
     COOLDOWN_FLAG.unlink(missing_ok=True)
 
     model = create_model()
-    replay = ReplayBuffer(max_size=500_000)
+    replay = ReplayBuffer(max_size=REPLAY_SIZE)
     stop_event = asyncio.Event()
     lock = threading.Lock()
     children: list[subprocess.Popen] = []
