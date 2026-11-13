@@ -32,13 +32,13 @@ flowchart TD
         E -->|yes| X["Exact endgame solver"]
         S -->|"visit counts"| MV["Move: sampled for the first 12,<br/>then the most visited"]
         X --> MV
-        MV -->|"game over"| T["Positions of the 800-simulation<br/>moves labelled<br/>policy: share of visits<br/>value: ½ result + ½ search<br/>margin: disc difference"]
+        MV -->|"game over"| T["Positions of the 800-simulation<br/>moves labelled<br/>policy: share of visits<br/>value: 0.8 result + 0.2 search<br/>margin: disc difference"]
         MV -.->|"next position"| P
     end
     T --> R[("Replay buffer<br/>last 2 M positions")]
     R -->|"random batches of 512,<br/>one per 100 new positions"| L["Learner<br/>random board symmetry<br/>loss = policy + value + margin"]
     L -.->|"weight average,<br/>every 500 steps"| S
-    L -->|"weight average,<br/>every 30 min"| M["50 games against the old champion,<br/>800 simulations: Elo to the log"]
+    L -->|"weight average,<br/>every 30 min"| M["100 games against a fixed reference,<br/>2 000 simulations, on the GPU:<br/>Elo to the log"]
     M --> C["New champion.bin"]
     C -->|"bun run build:wasm"| B["ZeroRev in the browser"]
 ```
@@ -59,8 +59,8 @@ targets:
 
 1. *policy*: how the search spread its visits over the moves, so that the
    network suggests good moves without searching;
-2. *value*: half who won that game, half how the search rated the position,
-   so that the network judges a position at a glance;
+2. *value*: who won that game (80 %) and how the search rated the position
+   (20 %), so that the network judges a position at a glance;
 3. *margin*, auxiliary: by how many discs the game was won, e.g. 40:24 is +16
    for the winner (scaled to ±1). "Won" and "won big" are different
    positions, and the margin lets the network tell them apart. The bots do not
@@ -75,12 +75,14 @@ single step. A better network plays better games, and those make better
 examples.
 
 **Champion.** Every 30 minutes the weight average becomes the champion, the
-version the browser bot is built from. Before that it plays the old champion
-50 games at 800 simulations, in pairs from one random opening, each colour
-once. The result only goes to the log as an Elo trend: 50 games tell ±90 Elo,
-and seeing +10 Elo would take about 4 000. Gating by
+version the browser bot is built from. Before that it plays a fixed reference
+(the step 2 109 942 champion) 100 games at 2 000 simulations, closer to how the
+browser bot thinks, in pairs from one random opening, each colour once. All
+games run on the GPU at once, in under a minute. The result only goes to the
+log as an Elo trend: 100 games tell ±55 Elo, and seeing +10 Elo would take
+about 4 000. Gating by
 [SPRT](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) at
-400 games took 30 minutes and stayed inconclusive.
+400 games on the CPU took 30 minutes and stayed inconclusive.
 
 Where it differs from AlphaZero:
 
@@ -119,7 +121,7 @@ Where it differs from AlphaZero:
 | 1 883 761 | 1.70 | ●●●●●●●●●○ | |
 | 2 109 942 | 1.66 | ●●●●●●●●●○ | current; beat 1 569 467 in both games |
 | | | | **800 simulations** |
-| | | | **Playout cap randomization**, weight average (EMA), value target ½ result + ½ search; champion = weight average every 30 min, no gating |
+| | | | **Playout cap randomization**, weight average (EMA), value target 0.8 result + 0.2 search; champion = weight average every 30 min, no gating |
 
 ### Fixes
 

@@ -195,11 +195,11 @@ def _check_samples(s: dict[str, np.ndarray]) -> None:
     assert np.allclose(planes[:, 3, 0, 0], discs / 64.0)
     assert not np.any(planes[:, 0] * planes[:, 1]), "a square with both colours"
     # Value-only positions carry the game result, whose sign the margin has;
-    # searched ones are halfway between it and the search value (in [-1, 1]).
+    # searched ones are 0.8 of it plus 0.2 of the search value (in [-1, 1]).
     result = np.sign(s["margins"])
     value_only = s["policy_weights"] == 0
     assert np.all(s["outcomes"][value_only] == result[value_only])
-    assert np.all(np.abs(s["outcomes"] - 0.5 * result)[~value_only] <= 0.5 + 1e-6)
+    assert np.all(np.abs(s["outcomes"] - 0.8 * result)[~value_only] <= 0.2 + 1e-6)
     searched = s["policy_weights"] > 0
     legal = planes[:, 2].reshape(n, 64)
     sums = (s["policies"] * legal).sum(axis=1)

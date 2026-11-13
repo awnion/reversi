@@ -100,13 +100,15 @@ TOURNAMENT_MIN_STEPS = 5_000
 # Before the replacement, pairs of games against a fixed reference
 # (reference.bin; the champion of the moment if missing), from one random
 # opening each, each colour once: an Elo trend for the log, not a decision.
-# On the GPU (`reversi-selfplay match`, with Rust self-play) 100 pairs, ±35
-# Elo, in about a minute; on the CPU (`run_pairs`) 25 pairs, ±90 Elo, in four.
-TOURNAMENT_PAIRS_GPU = 100
+# On the GPU (`reversi-selfplay match`, with Rust self-play): 50 pairs at
+# 2 000 simulations, closer to how the browser bot plays (±55 Elo), each game
+# selecting TOURNAMENT_LEAVES leaves per round so that the batches stay large.
+# On the CPU (`run_pairs`): 25 pairs at the self-play 800 (±90 Elo, 4 min).
+TOURNAMENT_PAIRS_GPU = 50
+TOURNAMENT_SIMS_GPU = 2_000
+TOURNAMENT_LEAVES = 16
 TOURNAMENT_PAIRS_CPU = 25
-# Same search as the recorded self-play moves, so the match measures the
-# network that training produces.
-TOURNAMENT_SIMS = SIMULATIONS
+TOURNAMENT_SIMS_CPU = SIMULATIONS
 TOURNAMENT_OPENING_PLIES = 4  # random moves before the engines take over
 # Tournament games run on CPU threads; leave cores for self-play and training.
 TOURNAMENT_THREADS = max(1, (os.cpu_count() or 2) // 2)
@@ -537,7 +539,7 @@ async def _match_on_gpu(challenger: Weights, seed: int) -> list[float] | None:
     weights_io.save_bin(challenger, challenger_path)
     pairs = TOURNAMENT_PAIRS_GPU
     log_event(
-        "tournament", "start", device="gpu", sims=TOURNAMENT_SIMS, games=2 * pairs
+        "tournament", "start", device="gpu", sims=TOURNAMENT_SIMS_GPU, games=2 * pairs
     )
     cmd = [
         str(RUST_SELFPLAY_BIN),
@@ -549,7 +551,9 @@ async def _match_on_gpu(challenger: Weights, seed: int) -> list[float] | None:
         "--pairs",
         str(pairs),
         "--simulations",
-        str(TOURNAMENT_SIMS),
+        str(TOURNAMENT_SIMS_GPU),
+        "--leaves",
+        str(TOURNAMENT_LEAVES),
         "--opening-plies",
         str(TOURNAMENT_OPENING_PLIES),
         "--seed",
@@ -592,7 +596,7 @@ async def _match_on_cpu(challenger: Weights, seed: int) -> list[float] | None:
     challenger_blob = weights_io.to_bytes(challenger)
     pairs = TOURNAMENT_PAIRS_CPU
     log_event(
-        "tournament", "start", device="cpu", sims=TOURNAMENT_SIMS, games=2 * pairs
+        "tournament", "start", device="cpu", sims=TOURNAMENT_SIMS_CPU, games=2 * pairs
     )
 
     def play():
@@ -600,7 +604,7 @@ async def _match_on_cpu(challenger: Weights, seed: int) -> list[float] | None:
             challenger_blob,
             reference_blob,
             pairs,
-            TOURNAMENT_SIMS,
+            TOURNAMENT_SIMS_CPU,
             opening_plies=TOURNAMENT_OPENING_PLIES,
             seed=seed,
             threads=TOURNAMENT_THREADS,

@@ -27,7 +27,7 @@ const ROOT_NOISE_EPSILON: f32 = 0.25;
 /// `(1 - w) · z + w · q`, with `z` the game result and `q` the search value of
 /// the position. The result alone is noisy (sampled opening moves, root noise,
 /// later mistakes); the search value is less noisy but biased by the network.
-const VALUE_TARGET_SEARCH_WEIGHT: f32 = 0.5;
+const VALUE_TARGET_SEARCH_WEIGHT: f32 = 0.2;
 /// Positions with at most this many empty squares are solved exactly
 /// ([`crate::endgame::solve`]) instead of searched.
 pub const ENDGAME_SOLVE_EMPTIES: u32 = 12;

@@ -78,10 +78,10 @@ fn outcomes_are_consistent() {
         std::cmp::Ordering::Equal => 0.0_f32,
     };
     // The first position is always black's turn and searched: its value target
-    // is halfway between the final outcome and the search value (in [-1, 1]).
+    // is 0.8 of the final outcome plus 0.2 of the search value (in [-1, 1]).
     if let Some(first) = record.positions.first() {
         assert!(first.is_black);
-        assert!((first.outcome - 0.5 * final_outcome).abs() <= 0.5 + 1e-6, "{}", first.outcome);
+        assert!((first.outcome - 0.8 * final_outcome).abs() <= 0.2 + 1e-6, "{}", first.outcome);
     }
     // The terminal samples carry the outcome itself.
     let last = record.positions.last().expect("a finished game has positions");
@@ -147,9 +147,9 @@ fn pool_produces_valid_games() {
         for pos in &record.positions {
             let z = if pos.is_black { black_outcome } else { -black_outcome };
             if pos.policy_weight > 0.0 {
-                // Searched or solved: halfway between the result and the
+                // Searched or solved: 0.8 of the result plus 0.2 of the
                 // search value, which lies in [-1, 1].
-                assert!((pos.outcome - z).abs() <= 1.0 + 1e-6, "{} vs {z}", pos.outcome);
+                assert!((pos.outcome - 0.8 * z).abs() <= 0.2 + 1e-6, "{} vs {z}", pos.outcome);
                 assert!(pos.outcome.abs() <= 1.0);
             } else {
                 assert_eq!(pos.outcome, z);
