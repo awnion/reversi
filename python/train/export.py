@@ -3,7 +3,10 @@ Export a training checkpoint to the binary format read by the Rust inference
 code (browser bots, tournaments).
 
 Usage: uv run python -m train.export \
-    --checkpoint weights/iter_001000.npz --output weights/champion.bin
+    --checkpoint ../weights/<run>/iter_<step>_loss<loss>.npz \
+    --output ../weights/<run>/champion.bin
+
+Only the .bin is written; champion.json is left as it is.
 
 The format itself is described in `train/weights.py`.
 """

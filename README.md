@@ -1,181 +1,205 @@
 # Reversi
 
-A browser-based [Reversi](https://en.wikipedia.org/wiki/Reversi) (Othello) game built with TypeScript.
+[Reversi (Othello)](https://en.wikipedia.org/wiki/Reversi) in the browser, against
+bots. Three of them use networks that taught themselves the game.
 
-## Structure
+![ZeroRev (black) against Minimax, with analysis on](docs/screenshot.png)
 
-Rust is built by Bazel, TypeScript by Bun/Vite, and the Python training
-pipeline by uv:
+*ZeroRev (black) trails Minimax 13–21 in discs, yet rates its chances at 97 %.*
 
-- `rust/minimax`, `rust/mcts`, `rust/nn` — engine, search and inference crates
-- `rust/alphazero`, `rust/zerorev` — WASM bots with champion weights embedded
-- `packages/core` — game rules and logic
-- `packages/board-ui` — DOM-based board renderer
-- `packages/bot`, `packages/bot-*` — bot players (the `bot-*` ones wrap the WASM crates)
-- `apps/web` — playable web app (Vite)
-- `python/train` — self-play training (MLX on Apple Silicon, PyTorch on Linux/CUDA)
-- `weights/<bot>/` — checkpoints and `champion.bin` per bot
+The bots run in the browser as WebAssembly, with a time per move, on several
+threads where the page allows it:
 
-## Prerequisites
+| Bot | Plays by |
+|---|---|
+| Greedy | flipping the most discs |
+| Minimax | [alpha-beta search](https://en.wikipedia.org/wiki/Alpha%E2%80%93beta_pruning) over a hand-written score: mobility, corners, discs |
+| ZeroRev | tree search guided by a neural network trained by self-play |
+| Gladiator0 | ZeroRev's engine with frozen weights from step 1 239 000 |
+| AlphaZero | the same engine, weights of an earlier run |
 
-- [Bazelisk](https://github.com/bazelbuild/bazelisk) (installed as `bazel`) —
-  compiles Rust to WASM; it downloads the Rust toolchain and wasm-bindgen itself
-- [Bun](https://bun.sh) — package manager, test runner and script runner
-- Rust nightly with `rust-src` and the `wasm32-unknown-unknown` target — for
-  the multi-threaded bots:
-  `rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown`
-- optional: [`just`](https://github.com/casey/just) wraps the common commands
+## How ZeroRev learns
 
-## Quick start
+ZeroRev learns the way [AlphaZero](https://arxiv.org/abs/1712.01815) does: it
+starts knowing only the rules and gets better by playing against itself. No
+human games, no hand-written evaluation.
+
+```mermaid
+flowchart LR
+    S["Self-play<br/>6 144 games at once<br/>800 simulations per move"] -->|positions| R[("Replay buffer<br/>last 2 M positions")]
+    R -->|"batch of 512<br/>per 100 new positions"| L["Learner"]
+    L -->|"weights, every 500 steps"| S
+    L -->|"every 30 min"| M{"200 games against<br/>the champion,<br/>200 simulations"}
+    M -->|"≥ 55 %"| C["champion.bin"]
+    C -->|"embedded at build"| B["ZeroRev in the browser"]
+```
+
+**Self-play.** The current network plays against itself, 6 144 games at once
+so that the GPU always gets large batches. Before each move it runs a
+[Monte Carlo tree search](https://en.wikipedia.org/wiki/Monte_Carlo_tree_search)
+of 800 simulations: the network's *policy* head suggests which moves to try,
+its *value* head judges the positions the search reaches. The search plays
+noticeably better than the network alone, and that gap is what the network
+learns from.
+
+**What it learns.** Every position becomes a training example with three
+targets:
+
+1. *policy*: how the search spread its visits over the moves, so that the
+   network suggests good moves without searching;
+2. *value*: who won that game, so that the network judges a position at a
+   glance;
+3. *margin*, auxiliary: by how many discs the game was won, e.g. 40:24 is +16
+   for the winner (scaled to ±1). "Won" and "won big" are different
+   positions, and the margin lets the network tell them apart. The bots do not
+   use this output.
+
+**Training.** Positions go into a replay buffer that keeps the last 2 M of them
+(about 33 000 games). The learner draws batches of 512 from it, one step per
+100 new positions, so each position is used about 5 times before it ages out.
+Every 500 steps the new weights go back to self-play: a better network plays
+better games, and those make better examples.
+
+**Champion.** A lower loss does not guarantee stronger play, so the version
+that ships is picked by playing. Every 30 minutes the latest network plays the
+champion 200 games (at 200 simulations, to keep it quick); with 55 % of the
+points or more it takes the champion's place. The browser bot is built from
+the champion.
+
+Where it differs from AlphaZero:
+
+| | AlphaZero (chess) | ZeroRev |
+|---|---|---|
+| Network | 19 residual blocks × 256 channels | 4 × 32 |
+| Simulations per move | 800 | 800 |
+| Targets | move, result | move, result, final disc margin |
+| Board symmetries | none | each position in a random one of 8 |
+| Endgame | searched | solved exactly from 12 empty squares |
+| New network | used at once | only if it beats the champion, as in [AlphaGo Zero](https://www.nature.com/articles/nature24270) |
+| Self-play hardware | 5 000 TPUs | one laptop: RTX 3080, Ryzen 9 5900HX |
+
+## Progress
+
+### Strength
+
+- Rows: champions in order; bold rows: what changed in between.
+- vs Minimax: games against the Minimax bot at 300 ms per move, both colours.
+- ● win, ○ loss.
+- Loss compares only within one scheme: the fixes changed what it measures.
+
+| Step | Loss | vs Minimax | Change / note |
+|---:|---:|---|---|
+| | | | **Old scheme**: learning rate halved every 5 000 steps to 10⁻⁵, each position trained on ~50 times, champion by 18-game matches |
+| 522 000 | 2.02 | ●○ | |
+| 624 000 | 2.03 | ●○ | |
+| 639 000 | 1.93 | ●● | |
+| 1 239 000 | 1.85 | ●○ | Gladiator0 |
+| | | | **Training fixed** (table below); Rust self-play; 200-game matches |
+| 1 354 500 | 1.73 | — | |
+| | | | **Faster self-play**: tree reuse, endgame solver, evaluation cache |
+| 1 569 467 | 1.68 | ●●●●●●●●●● | |
+| 1 633 050 | 1.68 | ●●●●●○○○○○ | |
+| | | | **400 simulations**, 2 M-position buffer |
+| 1 883 761 | 1.70 | ●●●●●●●●●○ | |
+| 2 109 942 | 1.66 | ●●●●●●●●●○ | current; beat 1 569 467 in both games |
+| | | | **800 simulations** |
+
+### Fixes
+
+What the old scheme did wrong, fixed at step 1 239 000:
+
+| Problem | Fix |
+|---|---|
+| Learning rate at its 10⁻⁵ floor for 1.2 M steps | Warmup, 3·10⁻⁴; 10⁻⁴ from 300 k steps; 3·10⁻⁵ from 800 k |
+| One step per 10 new positions: each trained on ~50 times | One per 100: ~5 times |
+| A champion every minute from 18 games: noise | 200 games every 30 minutes, 55 % to win |
+| Total loss looked stuck: its floor is the entropy of the search's move choice | `policy_kl`, `value`, `margin` logged separately |
+| Board symmetries unused | Each position in a random one of 8 |
+| Value learned only win / draw / loss | Auxiliary head for the final disc margin |
+
+### Speed
+
+- Positions/s: training positions from self-play per second, on the laptop.
+- Bar label: row · simulations per move. Compare bars with equal simulations.
+- Steps/s: gradient steps (batch 512). From row 7 at 200 simulations the
+  learner, sharing the GPU, sets the pace: 7 900 positions/s would allow 79.
+- Source: the training log over steady minutes; rows 1, 2, 4 are short runs.
+  Rough figures, not benchmarks.
+
+```mermaid
+xychart-beta
+    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800"]
+    y-axis "positions per second" 0 --> 8000
+    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500]
+```
+
+| # | Change | Sims | Positions/s | Steps/s | GPU °C |
+|---:|---|---:|---:|---:|---:|
+| 1 | Python self-play, 1 process | 200 | 830 | 8 | 66 |
+| 2 | 4 processes | 200 | 1 860 | 19 | 80 |
+| 3 | Rust self-play: one process, one GPU thread | 200 | 2 120 | 21 | 77 |
+| 4 | GPU limit lowered to 70/74 °C: paused 20–65 % of the time | 200 | 1 120 | 16 | 75 |
+| 5 | GPU clock capped at 1 300 MHz | 200 | 3 030 | 29 | 74 |
+| 6 | Capped at 1 100 MHz: lower voltage, almost no pauses | 200 | 3 320 | 28 | 74 |
+| 7 | Tree reuse, no search for single moves, endgame solver, evaluation cache | 200 | 7 900 | 36 | 68 |
+| 8 | 400 simulations, 2 M-position buffer | 400 | 4 100 | 41 | 67 |
+| 9 | 800 simulations; the CPU becomes the bottleneck | 800 | 2 160 | 22 | 60 |
+| 10 | Search tree in contiguous arrays, PUCT once per node: +45 % per thread | 800 | 3 100 | 32 | 66 |
+| 11 | Cache looked up by the search threads, not the GPU thread | 800 | 4 100 | 40 | 67 |
+| 12 | Half as many games at once (6 144): 12 k trees took > 12 GB and were OOM-killed | 800 | 3 500 | 35 | 65 |
+
+## Running it
+
+Give this prompt to your AI coding agent:
+
+```text
+Set up this repository (browser Reversi with AlphaZero-style bots) on this
+machine. Read AGENTS.md and the Justfile first.
+
+1. The game: install Bazelisk (as `bazel`), Bun, and Rust nightly with
+   rust-src and the wasm32-unknown-unknown target; run `bun install && bun dev`
+   and open http://localhost:5173.
+2. Training, only if I ask for it. Install just and uv, then
+   `cd python && uv sync && uv run maturin develop --release --features python`
+   and `uv run python -m train.test_smoke`. The backend follows the machine:
+   - Apple Silicon Mac: MLX, self-play in Python.
+   - Linux with an NVIDIA GPU: PyTorch on CUDA; build the Rust self-play with
+     `just build-selfplay` and train with `REVERSI_SELFPLAY=rust`.
+   Start with `just train <run>`, follow with `just logs <run>`, stop with
+   `just stop <run>`. The run `zerorev` continues the shipped ZeroRev weights;
+   a new name starts from scratch.
+3. The training defaults fit the author's laptop (see the README). Fit them
+   to my hardware before a long run (REVERSI_*_TEMP_*, REVERSI_GPU_CLOCK,
+   REVERSI_SELFPLAY_RUST_ARGS) and watch memory, temperatures and throughput
+   in the log for the first minutes.
+4. A new champion reaches the browser after `bun run build:wasm`;
+   `just vs-minimax 300 10 0.2` plays it against Minimax.
+```
+
+The training defaults are tuned for my laptop; on other hardware they are a
+starting point:
+
+| | Hardware | Default |
+|---|---|---|
+| GPU | RTX 3080 Laptop | slows down at 70 / 74 °C (soft / hard limit); clock capped at 1 100 MHz |
+| CPU | Ryzen 9 5900HX, 16 threads | slows down at 85 / 90 °C; 6 search threads |
+| RAM | 32 GB | 6 144 self-play games at once, ~6 GB |
+
+By hand:
+
+- Requirements as in step 1 of the prompt.
+- Threads in the browser need the page served with
+  `Cross-Origin-Opener-Policy: same-origin` and
+  `Cross-Origin-Embedder-Policy: require-corp`. Vite sends both.
 
 ```sh
-bun install
-bun dev
-```
-
-`bun dev` first runs `bun run build:wasm` (Bazel builds the bots and the output
-is copied to `packages/bot-*/wasm/`), then starts Vite. Open
-`http://localhost:5173` in your browser.
-
-## Build
-
-```sh
-bun run build
-```
-
-Minimax, AlphaZero and ZeroRev search on several threads when the page is cross-origin
-isolated. The dev and preview servers send the required headers; a production
-host has to send them too, otherwise the bots fall back to one thread:
-
-```
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
-```
-
-## Test
-
-```sh
-# Rust tests
-bazel test //...
-
-# unit tests (bun test; builds the WASM bots first)
-bun run test:unit
-
-# e2e tests (requires browsers: bun run install:browsers)
-bun run test:e2e
-```
-
-## Lint and format
-
-```sh
-just lint
-just fmt
-```
-
-Rust dependencies: edit `Cargo.toml`, then `cargo update` — Bazel reads
-`Cargo.lock`. `wasm-bindgen` is pinned to the version of the CLI bundled with
-`rules_rust_wasm_bindgen`; bump both together.
-
-## AlphaZero training
-
-The AlphaZero bot is trained via self-play: Rust MCTS plus a neural network in Python (MLX on
-Apple Silicon, PyTorch on Linux/CUDA; checkpoints are interchangeable).
-All training commands run from `python/`:
-
-```sh
-cd python
-```
-
-### Prerequisites
-
-```sh
-# Install Python deps + build Rust extension
-uv sync
-uv run maturin develop --release --features python
-```
-
-### Run training
-
-```sh
-# Start in background, append to log
-nohup uv run python -u -m train.loop >> /tmp/reversi_train.log 2>&1 &
-
-# Watch the log
-tail -f /tmp/reversi_train.log
-```
-
-Training runs continuously and:
-
-- Waits until 30 000 positions are collected before starting gradient updates
-- Uses 400 MCTS simulations per move during self-play (reusing the subtree of the move played), always with the newest weights
-- Does 1 gradient step (batch 512) per 100 new positions, so each position is
-  trained on about 5 times
-- Keeps the last 2 000 000 positions in the replay buffer
-- Solves the last 12 empty squares exactly instead of searching them
-- Turns every training position to a random one of the 8 symmetries of the board
-- Learns the move policy, the game result and the final disc margin
-  (an auxiliary head, not used by the bots)
-- Uses AdamW with a learning-rate schedule of a short warmup and three long
-  constant stages (`LR_STAGES` in `train/loop.py`); the schedule's start is
-  kept in `weights/<run>/lr_schedule.json`, so restarts continue it
-- Logs the loss and its parts: `policy_kl` (the part of the policy loss that
-  can still go down), `value` and `margin`
-- Self-play uses stochastic openings (root noise + sampling from visit counts in the early game)
-- Every 30 minutes (and at least 5 000 steps) plays the current network against `champion.bin` (200 games);
-  it becomes the new champion with at least 55 % of the points
-- Keeps the last 5 champions with date and win-rate in `weights/<run>/champions/history.json`
-
-### Run tournament (manual)
-
-Run a round-robin tournament over the top N checkpoints to find the true champion
-(loss alone doesn't reflect playing strength):
-
-```sh
-# Top 10 checkpoints by loss + current champion as baseline, 4 games/pair, 100 sims/move
-uv run python -m train.tournament --top 10 --games 4 --sims 100
-
-# Exclude the current champion from the bracket
-uv run python -m train.tournament --top 10 --games 4 --sims 100 --no-champion
-```
-
-The tournament automatically:
-
-1. Loads all candidates (including `champion.bin` as reference baseline)
-2. Plays every pair against each other, alternating colours
-3. Ranks by win points
-4. If the winner is not the current champion: exports it to `weights/champion.bin`,
-   rebuilds the WASM bot, and records it in `weights/champions/history.json`
-
-### Export champion manually
-
-```sh
-uv run python -m train.export \
-  --checkpoint weights/iter_<step>_loss<value>.npz \
-  --output weights/champion.bin
-```
-
-### Rebuild WASM bot
-
-After exporting a new `champion.bin`, rebuild the browser bots:
-
-```sh
-bun run build:wasm
-```
-
-The WASM bots embed `weights/<bot>/champion.bin` at compile time — the files
-must exist before building.
-
-### Champion history
-
-Past champions are stored in `weights/champions/` (last 5 kept):
-
-```
-weights/champions/
-  history.json                              # date, loss, win_rate for each
-  champion_20260324_142030_loss0.0938.npz   # model weights snapshot
-  ...
+bun install && bun dev            # the game at http://localhost:5173
+bun run build                     # production bundle in apps/web/dist
+bun run install:browsers          # once, for the e2e tests
+bazel test //... && bun run test:unit && bun run test:e2e
+just fmt && just lint
 ```
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

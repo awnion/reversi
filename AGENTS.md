@@ -94,7 +94,7 @@ just lint / just fmt                   # biome, tsc, ruff, rustfmt, taplo
 
 ```sh
 cd python && uv sync && uv run maturin develop --release --features python
-just train <bot> / just logs <bot> / just stop <bot> / just tournament <bot>
+just train <run> / just logs <run> / just stop <run> / just tournament <run>
 ```
 
 - **Two ML backends, one loop.** `python/train/backend/` implements the same
@@ -108,8 +108,9 @@ just train <bot> / just logs <bot> / just stop <bot> / just tournament <bot>
   (`rust/nn`, browser bots) reads the same `.bin`. `train.test_smoke` checks
   the backend against the Rust inference; run it on each machine after
   touching a backend or the format.
-- **Remote machine:** `just setup-remote <host>`, `just push-run <host> <bot>`,
-  `just train-remote <host> <bot>`, `just pull-run <host> <bot>`.
+- **Remote machine:** `just setup-remote <host>`, `just push-run <host> <run>`,
+  `just train-remote <host> <run>` (forwards the local `REVERSI_SELFPLAY`),
+  `just pull-run <host> <run>`.
 - **Rust self-play (CUDA only, opt-in).** `rust/trainer` builds
   `reversi-selfplay`, which replaces the Python self-play processes with one
   process: search threads over `rust/mcts` pools and one GPU thread running
@@ -128,6 +129,9 @@ just train <bot> / just logs <bot> / just stop <bot> / just tournament <bot>
   needs no password. Under the thermal limits a capped laptop GPU runs
   self-play about twice as fast as an uncapped one that keeps getting paused.
 
-Training writes to `weights/<bot>/`. Do not delete or rewrite files there
-(checkpoints, replay buffers, `champion.bin`) unless asked; a training run may
-be in progress (`weights/<bot>/train.pid`).
+A run is named by the `just train` argument and writes to `weights/<run>/`; a
+run named after a bot (`zerorev`, `alphazero`) trains the weights that bot
+embeds. `weights/gladiator0/` holds the frozen Gladiator0 opponent. Do not
+delete or rewrite files under `weights/` (checkpoints, replay buffers,
+`champion.bin`) unless asked; a training run may be in progress
+(`weights/<run>/train.pid`).

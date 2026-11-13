@@ -4,7 +4,8 @@ Tournament to select the true champion from saved checkpoints.
 After the tournament:
   - exports the winner to weights/<run>/champion.bin
   - rebuilds the WASM bots
-  - the next training run resumes from the new champion
+  - training is not affected: it resumes from the newest checkpoint
+    (iter_*.npz), and from champion.bin only when that is newer
 
 The current champion (champion.bin) is always included as a reference
 baseline. If it wins, no export/rebuild is done (nothing changed).
@@ -141,8 +142,7 @@ def main():
     )
     print("WASM rebuilt.")
 
-    # Next training run will pick up winner via _load_best_checkpoint
-    print(f"Next training will resume from {winner_path.name}")
+    print(f"Exported {winner_path.name} as champion.bin; training is not affected.")
 
 
 if __name__ == "__main__":
