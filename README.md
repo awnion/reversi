@@ -205,7 +205,7 @@ starting point:
 | | Hardware | Default |
 |---|---|---|
 | GPU | RTX 3080 Laptop | slows down at 70 / 74 °C (soft / hard limit); clock capped at 1 100 MHz |
-| CPU | Ryzen 9 5900HX, 16 threads | slows down at 85 / 90 °C; 8 search threads |
+| CPU | Ryzen 9 5900HX, 16 threads | slows down at 85 / 90 °C; 12 search threads |
 | RAM | 32 GB | 6 144 self-play games at once, ~6 GB |
 
 By hand:

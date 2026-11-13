@@ -284,8 +284,14 @@ impl TorchNet {
     /// of discs on the board. Same planes as `write_position_planes`.
     pub fn unpack(&self, packed: &[i64]) -> Tensor {
         let n = (packed.len() / 4) as i64;
+        self.unpack_device(&Tensor::from_slice(packed).to_device(self.options.device).view([n, 4]))
+    }
+
+    /// [`TorchNet::unpack`] from packed positions `(N, 4)` already on the
+    /// device.
+    pub fn unpack_device(&self, packed: &Tensor) -> Tensor {
+        let n = packed.size()[0];
         let kind = self.options.kind();
-        let packed = Tensor::from_slice(packed).to_device(self.options.device).view([n, 4]);
         // (N, 1, 3) >> (1, 64, 1) → (N, 64, 3): square-major, i.e. NHWC.
         // Arithmetic shifts are fine: only the lowest bit is kept.
         let bits = packed
@@ -315,6 +321,45 @@ impl TorchNet {
         } else {
             x
         }
+    }
+
+    pub fn device(&self) -> tch::Device {
+        self.options.device
+    }
+
+    fn tensors_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut tensors = vec![&mut self.stem.weight, &mut self.stem.bias];
+        for (a, b) in &mut self.blocks {
+            tensors.extend([&mut a.weight, &mut a.bias, &mut b.weight, &mut b.bias]);
+        }
+        tensors.extend([
+            &mut self.policy_conv.weight,
+            &mut self.policy_conv.bias,
+            &mut self.policy_fc.weight,
+            &mut self.policy_fc.bias,
+            &mut self.value_conv.weight,
+            &mut self.value_conv.bias,
+            &mut self.value_fc1.weight,
+            &mut self.value_fc1.bias,
+            &mut self.value_fc2.weight,
+            &mut self.value_fc2.bias,
+        ]);
+        tensors
+    }
+
+    /// Copy `other`'s weights into this network's tensors, which keep their
+    /// addresses (CUDA graphs captured with them stay valid). False, and
+    /// nothing copied, when the shapes differ.
+    pub fn copy_weights_from(&mut self, other: &mut TorchNet) -> bool {
+        let mut dst = self.tensors_mut();
+        let src = other.tensors_mut();
+        if dst.len() != src.len() || dst.iter().zip(&src).any(|(d, s)| d.size() != s.size()) {
+            return false;
+        }
+        for (d, s) in dst.iter_mut().zip(src) {
+            d.copy_(s);
+        }
+        true
     }
 
     fn layout(&self, x: Tensor) -> Tensor {

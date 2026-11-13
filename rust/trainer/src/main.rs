@@ -12,6 +12,7 @@
 
 mod arena;
 mod control;
+mod graph;
 mod log;
 mod net;
 mod pipeline;
@@ -71,13 +72,14 @@ self-play options (selfplay, bench):
   --fast-simulations N    playout cap randomization: simulations on the moves
                           that are only played, not recorded (= --simulations: off)
   --full-fraction F       share of moves searched with --simulations and recorded (1)
-  --workers N             search threads (8)
+  --workers N             search threads (12)
   --pools-per-worker N    game pools per search thread (2)
-  --games-per-pool N      concurrent games per pool (384)
+  --games-per-pool N      concurrent games per pool (256)
   --batch-target N        positions per network call (8192)
   --min-batch N           wait up to --max-wait-ms for this many positions (0)
   --max-wait-ms N         (2)
   --cache-entries N       network outputs kept in the cache, 0 = off (1000000)
+  --no-cuda-graphs        run the network without CUDA graphs
   --no-stagger            start all games at once (default for bench)
   --stagger               spread game starts over one game length (default for selfplay)
   --positions-per-shard N (4096)
@@ -102,7 +104,8 @@ struct Args {
     flags: Vec<String>,
 }
 
-const FLAGS: &[&str] = &["fp32", "nchw", "no-stagger", "stagger", "allow-cpu", "help"];
+const FLAGS: &[&str] =
+    &["fp32", "nchw", "no-stagger", "stagger", "allow-cpu", "no-cuda-graphs", "help"];
 
 impl Args {
     fn parse() -> Result<Args, String> {
@@ -230,14 +233,15 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
     let options = args.net_options()?;
     let stagger = if bench { args.flag("stagger") } else { !args.flag("no-stagger") };
     let config = PipelineConfig {
-        // 8 × 2 × 384 = 6 144 games: at 800 simulations the search trees of
+        // 12 × 2 × 256 = 6 144 games: at 800 simulations the search trees of
         // 12k concurrent games took over 12 GB and the kernel killed the
         // process. Two pools per thread: one searches while the other waits
-        // for the GPU (one pool of 1 024 per thread on 6 threads: 105 games/s
-        // in `bench`, this: 161).
-        workers: args.num("workers", 8usize)?.max(1),
+        // for the GPU. `bench` on the laptop: 6 threads with one pool of 1 024
+        // 105 games/s; 8 × 2 × 384 174; with CUDA graphs, which make the GPU
+        // thread wait for the searches, 182; 12 threads 195.
+        workers: args.num("workers", 12usize)?.max(1),
         pools_per_worker: args.num("pools-per-worker", 2usize)?.max(1),
-        games_per_pool: args.num("games-per-pool", 384usize)?.max(1),
+        games_per_pool: args.num("games-per-pool", 256usize)?.max(1),
         budget: {
             let full = args.num("simulations", 800u32)?;
             let fast = args.num("fast-simulations", full)?;
@@ -248,6 +252,7 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         min_batch: args.num("min-batch", 0usize)?,
         max_wait: Duration::from_millis(args.num("max-wait-ms", 2u64)?),
         cache_entries: args.num("cache-entries", 1_000_000usize)?,
+        cuda_graphs: !args.flag("no-cuda-graphs"),
     };
     let process_index: usize = args.num("process-index", 0)?;
     let positions_per_shard: usize = args.num("positions-per-shard", 4096)?;
@@ -302,6 +307,7 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         full_fraction = config.budget.full_fraction,
         batch_target = config.batch_target,
         stagger = config.stagger,
+        cuda_graphs = config.cuda_graphs && options.device.is_cuda(),
     );
 
     let stats = Arc::new(Stats::default());
@@ -519,10 +525,19 @@ fn check(args: &mut Args) -> Result<ExitCode, String> {
     };
     let folded = FoldedWeights::from_bin(&bytes)?;
     let _guard = tch::no_grad_guard();
-    let net = TorchNet::new(&folded, options);
-    let board = reversi_minimax::board::Board::new((1 << 28) | (1 << 35), (1 << 27) | (1 << 36));
-    let legal = board.legal_moves(true);
-    let packed: Vec<i64> = (0..64).flat_map(|_| net::pack(board, true, legal)).collect();
+    let mut net = TorchNet::new(&folded, options);
+    // 64 different positions: random openings of 0 to 31 plies.
+    let packed: Vec<i64> = (0..64u64)
+        .flat_map(|i| {
+            let (board, mut is_black) = reversi_mcts::random_opening((i % 32) as u32, i);
+            let mut legal = board.legal_moves(is_black);
+            if legal == 0 {
+                is_black = !is_black;
+                legal = board.legal_moves(is_black);
+            }
+            net::pack(board, is_black, legal)
+        })
+        .collect();
     let out = to_vec(&net.forward(&net.unpack(&packed)));
     for row in out.as_chunks::<65>().0 {
         let sum: f32 = row[..64].iter().sum();
@@ -532,6 +547,33 @@ fn check(args: &mut Args) -> Result<ExitCode, String> {
         }
     }
     println!("forward ok: value={:.4}", out[64]);
+    if options.device.is_cuda() {
+        // The same positions through a CUDA graph: same outputs.
+        let mut graphed = graph::GraphedForward::new(true);
+        let mut via_graph = vec![0.0f32; out.len()];
+        for _ in 0..2 {
+            graphed.run(&net, &packed, &mut via_graph);
+        }
+        let diff = out.iter().zip(&via_graph).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        if diff > 1e-3 {
+            eprintln!("error: CUDA graph output differs by {diff}");
+            return Ok(ExitCode::FAILURE);
+        }
+        // New weights copied into the captured tensors: the graph follows.
+        let mut other = TorchNet::new(&FoldedWeights::from_bin(&net::random_bin(2))?, options);
+        let expected = to_vec(&other.forward(&other.unpack(&packed)));
+        if !net.copy_weights_from(&mut other) {
+            eprintln!("error: weights of the same network do not fit");
+            return Ok(ExitCode::FAILURE);
+        }
+        graphed.run(&net, &packed, &mut via_graph);
+        let after = expected.iter().zip(&via_graph).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        if after > 1e-3 {
+            eprintln!("error: CUDA graph kept the old weights (difference {after})");
+            return Ok(ExitCode::FAILURE);
+        }
+        println!("cuda graph ok: max difference {diff:.1e}, after new weights {after:.1e}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

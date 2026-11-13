@@ -34,6 +34,7 @@ use reversi_mcts::SelfPlayPool;
 use crate::control::LoadedWeights;
 use crate::control::PanicGuard;
 use crate::control::Stop;
+use crate::graph::GraphedForward;
 use crate::log_selfplay;
 use crate::net::NetOptions;
 use crate::net::TorchNet;
@@ -59,6 +60,8 @@ pub struct PipelineConfig {
     pub max_wait: Duration,
     /// Network outputs the [`SharedCache`] keeps (twice that at most; 0 = off).
     pub cache_entries: usize,
+    /// Run the network through CUDA graphs ([`GraphedForward`]).
+    pub cuda_graphs: bool,
 }
 
 /// Counters shared with the progress log and the benchmark.
@@ -451,6 +454,7 @@ impl GpuThread {
         };
 
         let config = &self.config;
+        let mut graphed = GraphedForward::new(config.cuda_graphs && self.options.device.is_cuda());
         let mut carry: Option<Request> = None;
         let mut batch: Vec<Request> = Vec::new();
         let mut packed: Vec<i64> = Vec::new();
@@ -465,7 +469,12 @@ impl GpuThread {
                 newest = Some(loaded);
             }
             if let Some(loaded) = newest {
-                net = TorchNet::new(&loaded.weights, self.options);
+                // Into the same tensors, so that the CUDA graphs stay valid.
+                let mut fresh = TorchNet::new(&loaded.weights, self.options);
+                if !net.copy_weights_from(&mut fresh) {
+                    net = fresh;
+                    graphed.reset();
+                }
                 generation = self.cache.invalidate();
                 log_selfplay!("weights-reloaded", process = 0, source = loaded.source);
             }
@@ -533,10 +542,9 @@ impl GpuThread {
             }
             packed.resize(padded * 4, 0);
             let started = Instant::now();
-            let output = net.forward(&net.unpack(&packed));
             out.resize(padded * 65, 0.0);
             // Blocks until the batch has completed on the device.
-            output.copy_data(&mut out, padded * 65);
+            graphed.run(&net, &packed, &mut out);
             let work = started.elapsed();
 
             // Hand every pool its rows.

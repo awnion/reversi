@@ -27,5 +27,9 @@ tch = "=0.27.0"
 # see build.rs); the version must match tch's.
 torch-sys = "=0.27.0"
 
+[build-dependencies]
+# Compiles src/cuda_graph.cpp against libtorch (see build.rs).
+cc = "1"
+
 [profile.release]
 debug = "line-tables-only"
