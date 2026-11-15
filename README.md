@@ -140,40 +140,46 @@ What the old scheme did wrong, fixed at step 1 239 000:
 
 ### Speed
 
-- Positions/s: training positions from self-play per second, on the laptop.
+- Games/s: finished self-play games per second, on the laptop; from row 12
+  measured, before that positions ÷ 64 (every move was recorded).
+- Positions/s: training positions per second. From row 13 only a quarter of
+  the searched moves is recorded, the rest is played after a 150-simulation
+  search: each position then costs about twice the search, and the speed-ups
+  of rows 14–16 show in games and network evaluations, not in positions.
+- Network evals/s: positions the GPU evaluated per second for the search
+  (self-play log; — where the log does not tell the rows apart).
+- Steps/s: gradient steps (batch 512; row 16: 1 024). From row 7 at 200
+  simulations the learner, sharing the GPU, sets the pace: 7 900 positions/s
+  would allow 79.
 - Bar label: row · simulations per move. Compare bars with equal simulations.
-- Rows 13–16 record only a quarter of the moves: fewer positions per second,
-  but more games (55 → 92 → 106 → 127 → 134 per second).
-- Steps/s: gradient steps (batch 512; row 16: 1 024). From row 7 at 200 simulations the
-  learner, sharing the GPU, sets the pace: 7 900 positions/s would allow 79.
 - Source: the training log over steady minutes; rows 1, 2, 4 are short runs.
   Rough figures, not benchmarks.
 
 ```mermaid
 xychart-beta
     x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800", "13·800/150", "14·800/150", "15·800/150", "16·800/150"]
-    y-axis "positions per second" 0 --> 8000
-    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500, 2540, 2870, 3420, 3570]
+    y-axis "games per second" 0 --> 140
+    bar [13, 29, 33, 18, 47, 52, 123, 64, 34, 48, 64, 55, 92, 106, 127, 134]
 ```
 
-| # | Change | Sims | Positions/s | Steps/s | GPU °C |
-|---:|---|---:|---:|---:|---:|
-| 1 | Python self-play, 1 process | 200 | 830 | 8 | 66 |
-| 2 | 4 processes | 200 | 1 860 | 19 | 80 |
-| 3 | Rust self-play: one process, one GPU thread | 200 | 2 120 | 21 | 77 |
-| 4 | GPU limit lowered to 70/74 °C: paused 20–65 % of the time | 200 | 1 120 | 16 | 75 |
-| 5 | GPU clock capped at 1 300 MHz | 200 | 3 030 | 29 | 74 |
-| 6 | Capped at 1 100 MHz: lower voltage, almost no pauses | 200 | 3 320 | 28 | 74 |
-| 7 | Tree reuse, no search for single moves, endgame solver, evaluation cache | 200 | 7 900 | 36 | 68 |
-| 8 | 400 simulations, 2 M-position buffer | 400 | 4 100 | 41 | 67 |
-| 9 | 800 simulations; the CPU becomes the bottleneck | 800 | 2 160 | 22 | 60 |
-| 10 | Search tree in contiguous arrays, PUCT once per node: +45 % per thread | 800 | 3 100 | 32 | 66 |
-| 11 | Cache looked up by the search threads, not the GPU thread | 800 | 4 100 | 40 | 67 |
-| 12 | Half as many games at once (6 144): 12 k trees took > 12 GB and were OOM-killed | 800 | 3 500 | 35 | 65 |
-| 13 | Playout cap randomization: ¼ of the moves at 800 simulations and recorded, the rest at 150 | 800/150 | 2 540 | 25 | 66 |
-| 14 | 8 search threads with two game pools each: one searches while the other waits for the GPU. Alone +53 %; next to the learner the GPU is the limit | 800/150 | 2 870 | 29 | 68 |
-| 15 | CUDA graphs: the network's ~30 kernels launched with one call, 1.07 ms instead of 1.55 per 768 positions; 12 search threads to keep up | 800/150 | 3 420 | 34 | 70 |
-| 16 | Learner: batch 1 024 at one step per 200 positions (same reuse), fused AdamW, batches and replay saves on background threads; half the learner's GPU time per position | 800/150 | 3 570 | 18 | 70 |
+| # | Change | Sims | Games/s | Positions/s | Network evals/s | Steps/s | GPU °C |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | Python self-play, 1 process | 200 | ~13 | 830 | — | 8 | 66 |
+| 2 | 4 processes | 200 | ~29 | 1 860 | — | 19 | 80 |
+| 3 | Rust self-play: one process, one GPU thread | 200 | ~33 | 2 120 | — | 21 | 77 |
+| 4 | GPU limit lowered to 70/74 °C: paused 20–65 % of the time | 200 | ~18 | 1 120 | — | 16 | 75 |
+| 5 | GPU clock capped at 1 300 MHz | 200 | ~47 | 3 030 | — | 29 | 74 |
+| 6 | Capped at 1 100 MHz: lower voltage, almost no pauses | 200 | ~52 | 3 320 | — | 28 | 74 |
+| 7 | Tree reuse, no search for single moves, endgame solver, evaluation cache | 200 | ~123 | 7 900 | 553 k | 36 | 68 |
+| 8 | 400 simulations, 2 M-position buffer | 400 | ~64 | 4 100 | 231 k | 41 | 67 |
+| 9 | 800 simulations; the CPU becomes the bottleneck | 800 | ~34 | 2 160 | — | 22 | 60 |
+| 10 | Search tree in contiguous arrays, PUCT once per node: +45 % per thread | 800 | ~48 | 3 100 | — | 32 | 66 |
+| 11 | Cache looked up by the search threads, not the GPU thread | 800 | ~64 | 4 100 | 231 k | 40 | 67 |
+| 12 | Half as many games at once (6 144): 12 k trees took > 12 GB and were OOM-killed | 800 | 55 | 3 500 | 198 k | 35 | 65 |
+| 13 | Playout cap randomization: ¼ of the moves at 800 simulations and recorded, the rest at 150 | 800/150 | 92 | 2 540 | ~290 k | 25 | 66 |
+| 14 | 8 search threads with two game pools each: one searches while the other waits for the GPU. Alone +53 %; next to the learner the GPU is the limit | 800/150 | 106 | 2 870 | — | 29 | 68 |
+| 15 | CUDA graphs: the network's ~30 kernels launched with one call, 1.07 ms instead of 1.55 per 768 positions; 12 search threads to keep up | 800/150 | 127 | 3 420 | 334 k | 34 | 70 |
+| 16 | Learner: batch 1 024 at one step per 200 positions (same reuse), fused AdamW, batches and replay saves on background threads; half the learner's GPU time per position | 800/150 | 134 | 3 570 | 402 k | 18 | 70 |
 
 ## Running it
 
