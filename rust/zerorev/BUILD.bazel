@@ -1,7 +1,8 @@
 load("@rules_rust//rust:defs.bzl", "rust_shared_library")
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
 
-# cdylib for wasm32 with the champion and Gladiator0 weights embedded; see :wasm.
+# cdylib for wasm32 with the champion, Gladiator0 and Ramo0 weights embedded;
+# see :wasm.
 rust_shared_library(
     name = "zerorev_cdylib",
     srcs = glob(["src/**/*.rs"]),
@@ -10,6 +11,8 @@ rust_shared_library(
         "//weights:zerorev/champion.json",
         "//weights:gladiator0/gladiator0.bin",
         "//weights:gladiator0/gladiator0.json",
+        "//weights:ramo0/champion.bin",
+        "//weights:ramo0/champion.json",
     ],
     crate_name = "reversi_zerorev",
     rustc_env_files = ["//tools:build_env"],

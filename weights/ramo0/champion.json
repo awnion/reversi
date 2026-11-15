@@ -1,0 +1,8 @@
+{
+  "run": "ramo0",
+  "date": "2026-11-15",
+  "loss": 1.1612,
+  "win_rate": 0.42,
+  "step": 3642123,
+  "backend": "torch"
+}

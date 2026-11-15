@@ -234,10 +234,10 @@ snapshot host=_train_host run="zerorev" bot="zerorev" which="champion":
     tr -d '\n' < "$target/champion.json"; echo
     echo "Reload the page to play it; \`just vs-minimax\` checks it against Minimax."
 
-# Play ZeroRev against Minimax, alternating colours:
-# just vs-minimax [ms per move] [games] [jitter, e.g. 0.2 = ±20 % per move]
-vs-minimax ms="300" games="2" jitter="0":
-    bun apps/web/scripts/vs-minimax.ts {{ ms }} {{ games }} {{ jitter }}
+# Play a ZeroRev-engine network against Minimax, alternating colours:
+# just vs-minimax [ms per move] [games] [jitter, e.g. 0.2 = ±20 % per move] [champion|gladiator0|ramo0]
+vs-minimax ms="300" games="2" jitter="0" network="champion":
+    bun apps/web/scripts/vs-minimax.ts {{ ms }} {{ games }} {{ jitter }} {{ network }}
 
 # --- per-bot shortcuts (for tab completion) ---
 train-alphazero:  (train "alphazero")

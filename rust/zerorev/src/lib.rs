@@ -16,11 +16,16 @@ static CHAMPION_META: &str = include_str!("../../../weights/zerorev/champion.jso
 static GLADIATOR0_WEIGHTS: &[u8] = include_bytes!("../../../weights/gladiator0/gladiator0.bin");
 static GLADIATOR0_META: &str = include_str!("../../../weights/gladiator0/gladiator0.json");
 
-/// The embedded network called `network`: `"gladiator0"`, or the champion for
-/// any other name. Returns its weights and the facts about them.
+/// Ramo0: the same architecture, trained on another machine (run `ramo0`).
+static RAMO0_WEIGHTS: &[u8] = include_bytes!("../../../weights/ramo0/champion.bin");
+static RAMO0_META: &str = include_str!("../../../weights/ramo0/champion.json");
+
+/// The embedded network called `network`: `"gladiator0"`, `"ramo0"`, or the
+/// champion for any other name. Returns its weights and the facts about them.
 fn network(network: &str) -> (&'static [u8], &'static str) {
     match network {
         "gladiator0" => (GLADIATOR0_WEIGHTS, GLADIATOR0_META),
+        "ramo0" => (RAMO0_WEIGHTS, RAMO0_META),
         _ => (CHAMPION_WEIGHTS, CHAMPION_META),
     }
 }
@@ -144,7 +149,7 @@ pub struct ZeroRevBot {
 #[wasm_bindgen]
 impl ZeroRevBot {
     /// A bot playing with the embedded network called `network`:
-    /// `"gladiator0"`, or the champion for any other name.
+    /// `"gladiator0"`, `"ramo0"`, or the champion for any other name.
     #[wasm_bindgen(constructor)]
     pub fn new(network: &str) -> ZeroRevBot {
         let (weights, _) = self::network(network);

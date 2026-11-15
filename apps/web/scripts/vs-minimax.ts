@@ -1,14 +1,15 @@
 /**
- * Play the ZeroRev bot against Minimax with alternating colours, using the
- * same WASM engines as the browser:
+ * Play a ZeroRev-engine bot against Minimax with alternating colours, using
+ * the same WASM engines as the browser:
  *
  *   bun apps/web/scripts/vs-minimax.ts [ms per move = 300] [games = 2] [jitter = 0]
+ *     [network = champion | gladiator0 | ramo0]
  *
  * Jitter varies each move's time by up to ±jitter (0.2 = ±20 %), so that
  * repeated games between the two deterministic engines differ.
  */
 import { createMinimaxBot } from '@reversi/bot-minimax';
-import { createZeroRevBot } from '@reversi/bot-zerorev';
+import { createZeroRevBot, type ZeroRevNetwork } from '@reversi/bot-zerorev';
 import {
   applyMove,
   type BotPlayer,
@@ -20,8 +21,10 @@ import {
 const thinkMs = Number(process.argv[2] ?? 300);
 const games = Number(process.argv[3] ?? 2);
 const jitter = Number(process.argv[4] ?? 0);
+const network = (process.argv[5] ?? 'champion') as ZeroRevNetwork;
 const minimax = await createMinimaxBot('Minimax');
-const zerorev = await createZeroRevBot();
+const zerorev = await createZeroRevBot(undefined, { network });
+const name = zerorev.name;
 
 async function play(black: BotPlayer, white: BotPlayer) {
   let state = createInitialState();
@@ -39,12 +42,12 @@ async function play(black: BotPlayer, white: BotPlayer) {
 
 function verdict(mine: number, theirs: number): string {
   if (mine === theirs) return 'draw';
-  return mine > theirs ? 'ZeroRev wins' : 'Minimax wins';
+  return mine > theirs ? `${name} wins` : 'Minimax wins';
 }
 
 const { meta } = zerorev;
 console.log(
-  `ZeroRev: run ${meta.run}, ${meta.trainedOn}, loss ${meta.loss ?? 'n/a'} — ${thinkMs} ms per move` +
+  `${name}: run ${meta.run}, ${meta.trainedOn}, loss ${meta.loss ?? 'n/a'} — ${thinkMs} ms per move` +
     (jitter ? ` ±${Math.round(jitter * 100)} %` : ''),
 );
 const score = { zerorev: 0, minimax: 0, draws: 0 };
@@ -65,7 +68,7 @@ for (let game = 0; game < games; game++) {
 }
 if (games > 2) {
   console.log(
-    `ZeroRev ${score.zerorev} – Minimax ${score.minimax}` +
+    `${name} ${score.zerorev} – Minimax ${score.minimax}` +
       (score.draws ? `, ${score.draws} drawn` : ''),
   );
 }
