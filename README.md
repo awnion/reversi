@@ -142,18 +142,18 @@ What the old scheme did wrong, fixed at step 1 239 000:
 
 - Positions/s: training positions from self-play per second, on the laptop.
 - Bar label: row · simulations per move. Compare bars with equal simulations.
-- Rows 13–15 record only a quarter of the moves: fewer positions per second,
-  but more games (55 → 92 → 106 → 127 per second).
-- Steps/s: gradient steps (batch 512). From row 7 at 200 simulations the
+- Rows 13–16 record only a quarter of the moves: fewer positions per second,
+  but more games (55 → 92 → 106 → 127 → 134 per second).
+- Steps/s: gradient steps (batch 512; row 16: 1 024). From row 7 at 200 simulations the
   learner, sharing the GPU, sets the pace: 7 900 positions/s would allow 79.
 - Source: the training log over steady minutes; rows 1, 2, 4 are short runs.
   Rough figures, not benchmarks.
 
 ```mermaid
 xychart-beta
-    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800", "13·800/150", "14·800/150", "15·800/150"]
+    x-axis ["1·200", "2·200", "3·200", "4·200", "5·200", "6·200", "7·200", "8·400", "9·800", "10·800", "11·800", "12·800", "13·800/150", "14·800/150", "15·800/150", "16·800/150"]
     y-axis "positions per second" 0 --> 8000
-    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500, 2540, 2870, 3420]
+    bar [830, 1860, 2120, 1120, 3030, 3320, 7900, 4100, 2160, 3100, 4100, 3500, 2540, 2870, 3420, 3570]
 ```
 
 | # | Change | Sims | Positions/s | Steps/s | GPU °C |
@@ -173,6 +173,7 @@ xychart-beta
 | 13 | Playout cap randomization: ¼ of the moves at 800 simulations and recorded, the rest at 150 | 800/150 | 2 540 | 25 | 66 |
 | 14 | 8 search threads with two game pools each: one searches while the other waits for the GPU. Alone +53 %; next to the learner the GPU is the limit | 800/150 | 2 870 | 29 | 68 |
 | 15 | CUDA graphs: the network's ~30 kernels launched with one call, 1.07 ms instead of 1.55 per 768 positions; 12 search threads to keep up | 800/150 | 3 420 | 34 | 70 |
+| 16 | Learner: batch 1 024 at one step per 200 positions (same reuse), fused AdamW, batches and replay saves on background threads; half the learner's GPU time per position | 800/150 | 3 570 | 18 | 70 |
 
 ## Running it
 
