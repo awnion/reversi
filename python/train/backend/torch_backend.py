@@ -83,12 +83,20 @@ class TorchModel:
     def __init__(self) -> None:
         self.device = _device()
         self._cuda = self.device.type == "cuda"
-        # Leave cudnn.benchmark off: the self-play batch size changes from
-        # round to round while games start, and every new shape would trigger
-        # a fresh (slow) algorithm search.
+        # cudnn.benchmark stays off here: the self-play batch size changes
+        # from round to round while games start, and every new shape would
+        # trigger a fresh (slow) algorithm search. The learner's batch never
+        # changes shape: train_step turns it on in that process.
         self.net = _Net().to(self.device).to(memory_format=torch.channels_last)
+        # Fused: one kernel for the whole update instead of one per tensor
+        # group. A step of this small network is kernel launches, not
+        # arithmetic: with cudnn.benchmark and one host sync per step, 83 →
+        # 126 steps/s at batch 1024 on a 4070 Ti SUPER.
         self._optimizer = torch.optim.AdamW(
-            self.net.parameters(), lr=BASE_LEARNING_RATE, weight_decay=WEIGHT_DECAY
+            self.net.parameters(),
+            lr=BASE_LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+            fused=self._cuda,
         )
 
     def _state(self) -> dict[str, torch.Tensor]:
@@ -149,6 +157,11 @@ class TorchModel:
         policy_weights: np.ndarray,
         value_weights: np.ndarray,
     ) -> dict[str, float]:
+        if self._cuda and not torch.backends.cudnn.benchmark:
+            # Training batches all have one shape: let cuDNN pick its fastest
+            # kernels once. Only in the process that trains; self-play
+            # batches change size from round to round.
+            torch.backends.cudnn.benchmark = True
         self.net.train()
 
         def tensor(a: np.ndarray) -> torch.Tensor:
@@ -189,13 +202,12 @@ class TorchModel:
         with torch.no_grad():
             target_entropy = -(policy_targets * policy_targets.log()).sum(dim=-1)
             policy_kl = policy_loss - mean(target_entropy, policy_w)
-        return {
-            "loss": float(loss.item()),
-            "policy": float(policy_loss.item()),
-            "policy_kl": float(policy_kl.item()),
-            "value": float(value_loss.item()),
-            "margin": float(margin_loss.item()),
-        }
+            # One host sync for all five numbers instead of one each.
+            values_out = torch.stack(
+                [loss, policy_loss, policy_kl, value_loss, margin_loss]
+            ).tolist()
+        names = ("loss", "policy", "policy_kl", "value", "margin")
+        return dict(zip(names, values_out, strict=True))
 
     def set_learning_rate(self, learning_rate: float) -> None:
         for group in self._optimizer.param_groups:

@@ -128,10 +128,20 @@ just train <run> / just logs <run> / just stop <run> / just tournament <run>
   `REVERSI_GPU_CLOCK` MHz (default 1100, `0` removes the cap) when sudo
   needs no password. Under the thermal limits a capped laptop GPU runs
   self-play about twice as fast as an uncapped one that keeps getting paused.
+- **Per-machine settings are environment variables; the code is the same
+  everywhere.** `REVERSI_BATCH_SIZE` / `REVERSI_TRAIN_RATIO` /
+  `REVERSI_LR_SCALE` (default 512 / 100 / 1; 1024 / 200 / 1.41 keeps the
+  sample reuse and halves the learner's cost per position),
+  `REVERSI_SELFPLAY_GPUS` (e.g. `1,2`: one Rust self-play process per GPU,
+  the learner keeps GPU 0), `REVERSI_LEARNER_CPUS` /
+  `REVERSI_SELFPLAY_CPUS` (Linux CPU pinning, e.g. `0,1,24,25` and
+  `2-23,26-47` on a 24-core server where the search threads slowed the
+  learner down).
 
 A run is named by the `just train` argument and writes to `weights/<run>/`; a
 run named after a bot (`zerorev`, `alphazero`) trains the weights that bot
-embeds. `weights/gladiator0/` holds the frozen Gladiator0 opponent. Do not
+embeds; the run `ramo0` trains the Ramo0 network that the ZeroRev engine
+also embeds. `weights/gladiator0/` holds the frozen Gladiator0 opponent. Do not
 delete or rewrite files under `weights/` (checkpoints, replay buffers,
 `champion.bin`) unless asked; a training run may be in progress
 (`weights/<run>/train.pid`).

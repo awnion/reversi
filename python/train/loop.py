@@ -18,6 +18,7 @@ import importlib.util
 import json
 import math
 import os
+import queue
 import shlex
 import shutil
 import signal
@@ -51,7 +52,7 @@ SIMULATIONS = 800
 # same search work, which is what the value head is short of.
 FAST_SIMULATIONS = 150
 FULL_FRACTION = 0.25
-BATCH_SIZE = 512
+BATCH_SIZE = int(os.environ.get("REVERSI_BATCH_SIZE", "512"))
 # Require this many positions before training starts.
 # Prevents overfitting to a tiny replay buffer.
 MIN_REPLAY = 30_000
@@ -59,7 +60,14 @@ MIN_REPLAY = 30_000
 # of BATCH_SIZE this is the sample reuse: each position is trained on about
 # BATCH_SIZE / TRAIN_RATIO times (512 / 100 ≈ 5). Far more, and the network
 # memorises the latest games instead of learning from them.
-TRAIN_RATIO = 100
+# A step of this small network costs about the same at 512 and 1 024
+# positions (kernel launches, not arithmetic): where the learner cannot keep
+# up with self-play, REVERSI_BATCH_SIZE=1024 REVERSI_TRAIN_RATIO=200 trains
+# on twice the positions per second with the same reuse.
+TRAIN_RATIO = int(os.environ.get("REVERSI_TRAIN_RATIO", "100"))
+# Multiplies every rate of the schedule below; with a larger batch, about
+# sqrt(batch / 512).
+LR_SCALE = float(os.environ.get("REVERSI_LR_SCALE", "1"))
 # Cap on training steps owed to already-ingested positions.
 MAX_PENDING_STEPS = 1_000
 CHECKPOINT_EVERY = 500
@@ -184,6 +192,9 @@ SELFPLAY_LOG_SECONDS = 30.0
 # - "auto": the same as "rust" (a separate name for scripts that opt in).
 # Extra arguments for the binary: REVERSI_SELFPLAY_RUST_ARGS, e.g.
 # "--workers 8 --batch-target 8192".
+# REVERSI_SELFPLAY_GPUS, e.g. "1,2": one Rust process per listed GPU
+# (CUDA_VISIBLE_DEVICES), the learner keeps the default one. Unset: one
+# process on the default GPU.
 SELFPLAY_IMPLEMENTATIONS = ("python", "rust", "auto")
 RUST_SELFPLAY_BIN = Path(
     os.environ.get(
@@ -217,7 +228,83 @@ def _learning_rate_at(steps: int) -> float:
             rate = stage_rate
     if steps < LR_WARMUP_STEPS:
         rate *= 0.1 + 0.9 * steps / LR_WARMUP_STEPS
-    return rate
+    return rate * LR_SCALE
+
+
+class BatchPrefetcher:
+    """Ingests new replay shards and samples the next batches on a thread of
+    its own, so that the learner's thread only runs training steps. Reading
+    shards and sampling took a quarter of a step on a slow CPU; numpy and file
+    reads release the GIL for most of it.
+
+    Saving the buffer (`save`) runs on a third thread and only holds up the
+    ingestion: batches keep coming from the buffer as it is, and the learner
+    trains on the steps it is owed meanwhile."""
+
+    def __init__(self, replay: ReplayBuffer, spool_dir: Path, batch_size: int):
+        self._replay = replay
+        self._spool_dir = spool_dir
+        self._batch_size = batch_size
+        self._batches: queue.Queue = queue.Queue(maxsize=2)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="prefetch", daemon=True)
+        # Held while the buffer is written to (ingestion) or saved.
+        self._writing = threading.Lock()
+        self._saver: threading.Thread | None = None
+
+    def __enter__(self) -> BatchPrefetcher:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+        if self._saver is not None:
+            self._saver.join()
+
+    def save(self, path: Path) -> None:
+        """Save the buffer in the background, unless a save is still running."""
+        if self._saver is not None and self._saver.is_alive():
+            return
+
+        def run() -> None:
+            with self._writing:
+                self._replay.save(path)
+
+        self._saver = threading.Thread(target=run, name="replay-save", daemon=True)
+        self._saver.start()
+
+    def _ingest(self) -> None:
+        if self._writing.acquire(blocking=False):
+            try:
+                ingest_replay_shards(self._replay, self._spool_dir)
+            finally:
+                self._writing.release()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._ingest()
+            if len(self._replay) < MIN_REPLAY:
+                self._stop.wait(0.05)
+                continue
+            batch = self._replay.sample(self._batch_size)
+            # Keep ingesting while the learner has batches in hand: the
+            # learner paces its steps by the positions added.
+            while not self._stop.is_set():
+                try:
+                    self._batches.put(batch, timeout=0.02)
+                    break
+                except queue.Full:
+                    self._ingest()
+
+    def get(self):
+        """The next batch, waiting for it if needed."""
+        while True:
+            try:
+                return self._batches.get(timeout=1.0)
+            except queue.Empty:
+                if not self._thread.is_alive():
+                    raise RuntimeError("batch prefetch thread died") from None
 
 
 def _lr_origin(step: int) -> int:
@@ -351,145 +438,150 @@ async def train_loop(
     warmup_pos0 = len(replay)
     step_log_t = time.monotonic()
 
-    while not stop_event.is_set():
-        ingest_replay_shards(replay, REPLAY_SPOOL_DIR)
+    with BatchPrefetcher(replay, REPLAY_SPOOL_DIR, BATCH_SIZE) as prefetcher:
+        while not stop_event.is_set():
+            # Wait for enough data before starting (the prefetcher ingests)
+            if len(replay) < MIN_REPLAY:
+                now = time.monotonic()
+                if now - warmup_log_t >= 10.0:
+                    elapsed = now - warmup_log_t
+                    gained = len(replay) - warmup_pos0
+                    rate = gained / elapsed if elapsed > 0 else 0
+                    remaining = MIN_REPLAY - len(replay)
+                    eta = int(remaining / rate) if rate > 0 else 0
+                    log_event(
+                        "train",
+                        "warmup",
+                        positions=len(replay),
+                        needed=MIN_REPLAY,
+                        pct=f"{len(replay) / MIN_REPLAY * 100:.0f}%",
+                        rate=f"{rate:.0f}/s",
+                        eta=f"{eta}s",
+                    )
+                    warmup_log_t = now
+                    warmup_pos0 = len(replay)
 
-        # Wait for enough data before starting
-        if len(replay) < MIN_REPLAY:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Rate-limit: one step per TRAIN_RATIO new positions. Data arrives in
+            # shards of thousands of positions, so spend the allowance one step at
+            # a time instead of once per shard.
+            new_positions = replay.total_added - replay_at_last_step
+            if new_positions < TRAIN_RATIO:
+                await asyncio.sleep(0.005)
+                continue
+            replay_at_last_step += TRAIN_RATIO
+            # If self-play outruns the learner, drop the excess allowance rather
+            # than letting it grow without bound.
+            max_backlog = TRAIN_RATIO * MAX_PENDING_STEPS
+            if replay.total_added - replay_at_last_step > max_backlog:
+                replay_at_last_step = replay.total_added - max_backlog
+
+            step_started = time.monotonic()
+            batch = prefetcher.get()
+            with lock:
+                metrics = model.train_step(*batch)
+            loss_val = metrics["loss"]
+            step += 1
+            step_seconds = time.monotonic() - step_started
+
+            new_lr = _learning_rate_at(step - lr_origin)
+            if new_lr != learning_rate:
+                learning_rate = new_lr
+                model.set_learning_rate(learning_rate)
+                if step - lr_origin >= LR_WARMUP_STEPS:
+                    log_event("train", "lr", step=step, lr=f"{learning_rate:.2e}")
+
+            if math.isnan(loss_val):
+                log_event("train", "nan-loss", step=step)
+                continue
+
+            if step % EMA_EVERY == 0:
+                with lock:
+                    raw = model.weights()
+                ema.update(raw, EMA_EVERY)
+
             now = time.monotonic()
-            if now - warmup_log_t >= 10.0:
-                elapsed = now - warmup_log_t
-                gained = len(replay) - warmup_pos0
-                rate = gained / elapsed if elapsed > 0 else 0
-                remaining = MIN_REPLAY - len(replay)
-                eta = int(remaining / rate) if rate > 0 else 0
+            if step % LOG_EVERY == 0 or now - step_log_t >= 30.0:
+                elapsed = now - step_log_t
+                sps = (
+                    LOG_EVERY / elapsed
+                    if elapsed > 0 and step % LOG_EVERY == 0
+                    else None
+                )
                 log_event(
                     "train",
-                    "warmup",
-                    positions=len(replay),
-                    needed=MIN_REPLAY,
-                    pct=f"{len(replay) / MIN_REPLAY * 100:.0f}%",
-                    rate=f"{rate:.0f}/s",
-                    eta=f"{eta}s",
+                    "step",
+                    step=step,
+                    loss=f"{loss_val:.4f}",
+                    # The part of the policy loss that can still go down.
+                    policy_kl=f"{metrics['policy_kl']:.4f}",
+                    value=f"{metrics['value']:.4f}",
+                    margin=f"{metrics['margin']:.4f}",
+                    lr=f"{learning_rate:.1e}",
+                    replay=len(replay),
+                    **({"sps": f"{sps:.1f}"} if sps is not None else {}),
+                    **({"temp": governor.describe()} if governor.available else {}),
                 )
-                warmup_log_t = now
-                warmup_pos0 = len(replay)
+                step_log_t = now
 
-            await asyncio.sleep(0.1)
-            continue
+            save = step % CHECKPOINT_EVERY == 0
+            if loss_val < best_loss:
+                best_loss = loss_val
+                save = True
 
-        # Rate-limit: one step per TRAIN_RATIO new positions. Data arrives in
-        # shards of thousands of positions, so spend the allowance one step at
-        # a time instead of once per shard.
-        new_positions = replay.total_added - replay_at_last_step
-        if new_positions < TRAIN_RATIO:
-            await asyncio.sleep(0.005)
-            continue
-        replay_at_last_step += TRAIN_RATIO
-        # If self-play outruns the learner, drop the excess allowance rather
-        # than letting it grow without bound.
-        max_backlog = TRAIN_RATIO * MAX_PENDING_STEPS
-        if replay.total_added - replay_at_last_step > max_backlog:
-            replay_at_last_step = replay.total_added - max_backlog
+            if save:
+                path = WEIGHTS_DIR / f"iter_{step:06d}_loss{loss_val:.4f}.npz"
+                with lock:
+                    current = model.weights()
+                _save_checkpoint(current, path)
+                ema.save()
+                _publish_selfplay_weights(ema.weights)
+                log_event("train", "checkpoint", step=step, path=path.name)
+                _prune_checkpoints()
 
-        step_started = time.monotonic()
-        batch = replay.sample(BATCH_SIZE)
-        with lock:
-            metrics = model.train_step(*batch)
-        loss_val = metrics["loss"]
-        step += 1
-        step_seconds = time.monotonic() - step_started
+            # Periodically persist replay buffer so restarts don't lose data
+            if step % REPLAY_SAVE_EVERY == 0:
+                prefetcher.save(REPLAY_PATH)
 
-        new_lr = _learning_rate_at(step - lr_origin)
-        if new_lr != learning_rate:
-            learning_rate = new_lr
-            model.set_learning_rate(learning_rate)
-            if step - lr_origin >= LR_WARMUP_STEPS:
-                log_event("train", "lr", step=step, lr=f"{learning_rate:.2e}")
+            # A finished tournament may have heated the machine: rest before
+            # going on.
+            if tournament_task is not None and tournament_task.done():
+                tournament_task = None
+                await _cool_down(governor, stop_event)
 
-        if math.isnan(loss_val):
-            log_event("train", "nan-loss", step=step)
-            continue
+            # Slow down while the machine is too hot.
+            if governor.poll():
+                _log_throttle("train", governor)
+            pause = governor.pause_after(step_seconds)
+            if pause > 0:
+                await asyncio.sleep(pause)
 
-        if step % EMA_EVERY == 0:
-            with lock:
-                raw = model.weights()
-            ema.update(raw, EMA_EVERY)
-
-        now = time.monotonic()
-        if step % LOG_EVERY == 0 or now - step_log_t >= 30.0:
-            elapsed = now - step_log_t
-            sps = LOG_EVERY / elapsed if elapsed > 0 and step % LOG_EVERY == 0 else None
-            log_event(
-                "train",
-                "step",
-                step=step,
-                loss=f"{loss_val:.4f}",
-                # The part of the policy loss that can still go down.
-                policy_kl=f"{metrics['policy_kl']:.4f}",
-                value=f"{metrics['value']:.4f}",
-                margin=f"{metrics['margin']:.4f}",
-                lr=f"{learning_rate:.1e}",
-                replay=len(replay),
-                **({"sps": f"{sps:.1f}"} if sps is not None else {}),
-                **({"temp": governor.describe()} if governor.available else {}),
-            )
-            step_log_t = now
-
-        save = step % CHECKPOINT_EVERY == 0
-        if loss_val < best_loss:
-            best_loss = loss_val
-            save = True
-
-        if save:
-            path = WEIGHTS_DIR / f"iter_{step:06d}_loss{loss_val:.4f}.npz"
-            with lock:
-                current = model.weights()
-            _save_checkpoint(current, path)
-            ema.save()
-            _publish_selfplay_weights(ema.weights)
-            log_event("train", "checkpoint", step=step, path=path.name)
-            _prune_checkpoints()
-
-        # Periodically persist replay buffer so restarts don't lose data
-        if step % REPLAY_SAVE_EVERY == 0:
-            replay.save(REPLAY_PATH)
-
-        # A finished tournament may have heated the machine: rest before
-        # going on.
-        if tournament_task is not None and tournament_task.done():
-            tournament_task = None
-            await _cool_down(governor, stop_event)
-
-        # Slow down while the machine is too hot.
-        if governor.poll():
-            _log_throttle("train", governor)
-        pause = governor.pause_after(step_seconds)
-        if pause > 0:
-            await asyncio.sleep(pause)
-
-        # Trigger tournament when step crosses the next scheduled boundary.
-        # A tournament can outlast the interval; never run two at once.
-        tournament_idle = tournament_task is None
-        if (
-            tournament_idle
-            and step >= next_tournament_step[0]
-            and time.monotonic() >= next_tournament_at
-        ):
-            next_tournament_step[0] = step + TOURNAMENT_MIN_STEPS
-            next_tournament_at = time.monotonic() + TOURNAMENT_EVERY_SECONDS
-            tournament_task = asyncio.create_task(
-                _run_champion_match(ema.snapshot(), best_loss, step)
-            )
-            tournament_task.add_done_callback(
-                lambda t: (
-                    not t.cancelled()
-                    and t.exception()
-                    and log_event("tournament", "task-error", error=repr(t.exception()))
+            # Trigger tournament when step crosses the next scheduled boundary.
+            # A tournament can outlast the interval; never run two at once.
+            tournament_idle = tournament_task is None
+            if (
+                tournament_idle
+                and step >= next_tournament_step[0]
+                and time.monotonic() >= next_tournament_at
+            ):
+                next_tournament_step[0] = step + TOURNAMENT_MIN_STEPS
+                next_tournament_at = time.monotonic() + TOURNAMENT_EVERY_SECONDS
+                tournament_task = asyncio.create_task(
+                    _run_champion_match(ema.snapshot(), best_loss, step)
                 )
-            )
+                tournament_task.add_done_callback(
+                    lambda t: (
+                        not t.cancelled()
+                        and t.exception()
+                        and log_event(
+                            "tournament", "task-error", error=repr(t.exception())
+                        )
+                    )
+                )
 
-        await asyncio.sleep(0)
+            await asyncio.sleep(0)
 
 
 # --- tournament --------------------------------------------------------------
@@ -912,12 +1004,45 @@ def _rust_selfplay_works(env: dict[str, str]) -> bool:
     return True
 
 
+def _cpu_set(name: str) -> set[int] | None:
+    """The CPUs listed in environment variable `name` ("0,1,24-25"), or None
+    when it is unset or the platform cannot pin (macOS).
+
+    REVERSI_LEARNER_CPUS / REVERSI_SELFPLAY_CPUS keep the learner off the
+    cores the search threads use: on the 24-core EPYC server the learner's
+    step took 13.7 ms next to 32 search threads and 8 ms alone; two cores of
+    its own (both SMT threads) raised it from 73 to 93 steps/s."""
+    raw = os.environ.get(name, "").strip()
+    if not raw or not hasattr(os, "sched_setaffinity"):
+        return None
+    cpus: set[int] = set()
+    for part in raw.split(","):
+        first, _, last = part.strip().partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return cpus
+
+
+def _selfplay_gpus() -> list[str | None]:
+    """GPUs for the Rust self-play processes: REVERSI_SELFPLAY_GPUS, or one
+    process on the default GPU."""
+    raw = os.environ.get("REVERSI_SELFPLAY_GPUS", "").split(",")
+    gpus: list[str | None] = [g.strip() for g in raw if g.strip()]
+    return gpus or [None]
+
+
 def _spawn_rust_selfplay(
-    positions_per_shard: int, env: dict[str, str]
+    positions_per_shard: int,
+    env: dict[str, str],
+    process_index: int = 0,
+    gpu: str | None = None,
 ) -> subprocess.Popen:
+    if gpu is not None:
+        env = {**env, "CUDA_VISIBLE_DEVICES": gpu}
     cmd = [
         str(RUST_SELFPLAY_BIN),
         "selfplay",
+        "--process-index",
+        str(process_index),
         "--run-dir",
         str(WEIGHTS_DIR.resolve()),
         "--simulations",
@@ -932,8 +1057,18 @@ def _spawn_rust_selfplay(
         str(os.getpid()),
         *shlex.split(os.environ.get("REVERSI_SELFPLAY_RUST_ARGS", "")),
     ]
-    child = subprocess.Popen(cmd, env=env)
-    log_event("system", "spawn-selfplay-rust", pid=child.pid, args=repr(cmd[2:]))
+    cpus = _cpu_set("REVERSI_SELFPLAY_CPUS")
+    # Set in the child before exec, so that all of its threads inherit it.
+    pin = (lambda: os.sched_setaffinity(0, cpus)) if cpus else None
+    child = subprocess.Popen(cmd, env=env, preexec_fn=pin)
+    log_event(
+        "system",
+        "spawn-selfplay-rust",
+        pid=child.pid,
+        gpu=gpu if gpu is not None else "default",
+        cpus=len(cpus) if cpus else "all",
+        args=repr(cmd[2:]),
+    )
     return child
 
 
@@ -1171,21 +1306,26 @@ async def _run_learner(
             selfplay_processes, selfplay_workers, positions_per_shard, run_name
         )
 
-    supervisor: asyncio.Task | None = None
+    supervisors: list[asyncio.Task] = []
     if selfplay_processes > 0:
         rust_env = _rust_selfplay_env()
         if selfplay != "python" and _rust_selfplay_works(rust_env):
-            child = _spawn_rust_selfplay(positions_per_shard, rust_env)
-            children.append(child)
-            supervisor = asyncio.create_task(
-                _supervise_rust_selfplay(
-                    children,
-                    child,
-                    lambda: _spawn_rust_selfplay(positions_per_shard, rust_env),
-                    spawn_python,
-                    stop_event,
+            for index, gpu in enumerate(_selfplay_gpus()):
+
+                def spawn_rust(index=index, gpu=gpu) -> subprocess.Popen:
+                    return _spawn_rust_selfplay(
+                        positions_per_shard, rust_env, index, gpu
+                    )
+
+                child = spawn_rust()
+                children.append(child)
+                supervisors.append(
+                    asyncio.create_task(
+                        _supervise_rust_selfplay(
+                            children, child, spawn_rust, spawn_python, stop_event
+                        )
+                    )
                 )
-            )
         else:
             children.extend(spawn_python())
 
@@ -1196,7 +1336,7 @@ async def _run_learner(
         replay.save(REPLAY_PATH)
     finally:
         stop_event.set()
-        if supervisor is not None:
+        for supervisor in supervisors:
             supervisor.cancel()
         ingest_replay_shards(replay, REPLAY_SPOOL_DIR, limit=10_000)
         replay.save(REPLAY_PATH)
@@ -1258,6 +1398,11 @@ async def main() -> None:
             positions_per_shard=args.positions_per_shard,
         )
         return
+    cpus = _cpu_set("REVERSI_LEARNER_CPUS")
+    if cpus:
+        # Before any thread starts: threads inherit it.
+        os.sched_setaffinity(0, cpus)
+        log_event("system", "learner-cpus", cpus=sorted(cpus))
     await _run_learner(
         selfplay_processes=args.selfplay_processes,
         selfplay_workers=workers,

@@ -280,7 +280,12 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
     let _pid_file = match &run_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            Some(PidFile::create(dir.join("selfplay-rs.pid"))?)
+            // One file per process: several may run, one per GPU.
+            let name = match process_index {
+                0 => "selfplay-rs.pid".to_string(),
+                i => format!("selfplay-rs{i}.pid"),
+            };
+            Some(PidFile::create(dir.join(name))?)
         }
         None => None,
     };

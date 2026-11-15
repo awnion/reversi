@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+import zipfile
 import zlib
 from datetime import datetime
 from pathlib import Path
@@ -172,23 +174,39 @@ class ReplayBuffer:
         )
 
     def save(self, path: Path) -> None:
-        """Persist buffer to disk (npz). Safe to call while workers are adding."""
+        """Persist buffer to disk (npz). Nothing may add to the buffer
+        meanwhile: rows written during the save would be torn.
+
+        Deflate level 1 instead of np.savez_compressed's default: 2 M
+        positions take 7 s instead of 26 (on an M-series Mac) for a file
+        1.8x larger (175 MB); the learner waits for it."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        with tmp.open("wb") as f:
-            np.savez_compressed(
-                f,
-                policies=self._policies[: self._size],
-                outcomes=self._outcomes[: self._size],
-                margins=self._margins[: self._size],
-                policy_weights=self._policy_weights[: self._size],
-                value_weights=self._value_weights[: self._size],
-                planes=self._planes[: self._size],
-                ptr=np.array(self._ptr % self._size if self._size else 0),
-            )
+        arrays = {
+            "policies": self._policies[: self._size],
+            "outcomes": self._outcomes[: self._size],
+            "margins": self._margins[: self._size],
+            "policy_weights": self._policy_weights[: self._size],
+            "value_weights": self._value_weights[: self._size],
+            "planes": self._planes[: self._size],
+            "ptr": np.array(self._ptr % self._size if self._size else 0),
+        }
+        started = time.monotonic()
+        with zipfile.ZipFile(
+            tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
+        ) as archive:
+            for name, array in arrays.items():
+                with archive.open(f"{name}.npy", "w", force_zip64=True) as f:
+                    np.lib.format.write_array(f, array, allow_pickle=False)
         tmp.replace(path)
-        log_event("replay", "saved", positions=self._size, path=path.name)
+        log_event(
+            "replay",
+            "saved",
+            positions=self._size,
+            path=path.name,
+            seconds=f"{time.monotonic() - started:.1f}",
+        )
 
     def load(self, path: Path) -> None:
         """Restore buffer from disk. Called once at startup before workers start."""
