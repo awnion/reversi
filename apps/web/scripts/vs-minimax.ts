@@ -3,7 +3,7 @@
  * the same WASM engines as the browser:
  *
  *   bun apps/web/scripts/vs-minimax.ts [ms per move = 300] [games = 2] [jitter = 0]
- *     [network = champion | gladiator0 | ramo0]
+ *     [network = champion | gladiator0 | ramo0 | zerorev6x48]
  *
  * Jitter varies each move's time by up to ±jitter (0.2 = ±20 %), so that
  * repeated games between the two deterministic engines differ.

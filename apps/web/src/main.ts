@@ -31,12 +31,12 @@ const THREADED_BOTS: ReadonlySet<string> = new Set([
   'minimax',
   'gladiator0',
   'zerorev',
-  'ramo0',
+  'zerorev6x48',
 ]);
 
 const pool = new BotWorkerPool(BOT_THREADS);
 
-type BotId = 'greedy' | 'minimax' | 'gladiator0' | 'zerorev' | 'ramo0';
+type BotId = 'greedy' | 'minimax' | 'gladiator0' | 'zerorev' | 'zerorev6x48';
 
 /**
  * The bots a side can be handed to. A side without a bot is played by hand.
@@ -81,11 +81,11 @@ const BOTS: {
     player: createWorkerBot(pool, 'zerorev', 'ZeroRev'),
   },
   {
-    id: 'ramo0',
-    name: 'Ramo0',
+    id: 'zerorev6x48',
+    name: 'ZeroRev6x48',
     detail: '',
     timed: true,
-    player: createWorkerBot(pool, 'ramo0', 'Ramo0'),
+    player: createWorkerBot(pool, 'zerorev6x48', 'ZeroRev6x48'),
   },
 ];
 

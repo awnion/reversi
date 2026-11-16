@@ -13,6 +13,8 @@ rust_shared_library(
         "//weights:gladiator0/gladiator0.json",
         "//weights:ramo0/champion.bin",
         "//weights:ramo0/champion.json",
+        "//weights:zerorev6x48/champion.bin",
+        "//weights:zerorev6x48/champion.json",
     ],
     crate_name = "reversi_zerorev",
     rustc_env_files = ["//tools:build_env"],

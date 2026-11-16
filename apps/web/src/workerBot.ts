@@ -11,11 +11,11 @@ import botWorkerUrl from './botWorker.ts?worker&url';
 export type BotsReady = {
   gladiator0: NetworkBotMeta;
   zerorev: NetworkBotMeta;
-  ramo0: NetworkBotMeta;
+  zerorev6x48: NetworkBotMeta;
 };
 
 /** The bots the worker runs. */
-export type WorkerBotId = 'minimax' | 'gladiator0' | 'zerorev' | 'ramo0';
+export type WorkerBotId = 'minimax' | 'gladiator0' | 'zerorev' | 'zerorev6x48';
 
 type PendingEntry = {
   resolve: (value: unknown) => void;
@@ -48,7 +48,7 @@ export class BotWorkerPool {
         resolveReady({
           gladiator0: e.data.gladiator0 as NetworkBotMeta,
           zerorev: e.data.zerorev as NetworkBotMeta,
-          ramo0: e.data.ramo0 as NetworkBotMeta,
+          zerorev6x48: e.data.zerorev6x48 as NetworkBotMeta,
         });
         return;
       }

@@ -11,19 +11,19 @@ import type { WorkerBotId } from './workerBot';
 let minimax: BotPlayer;
 let gladiator0: BotPlayer & { meta: NetworkBotMeta };
 let zerorev: BotPlayer & { meta: NetworkBotMeta };
-let ramo0: BotPlayer & { meta: NetworkBotMeta };
+let zerorev6x48: BotPlayer & { meta: NetworkBotMeta };
 
 // The page says how many threads this worker's searches may use.
 const threads = Number(self.name) || 1;
 
 void (async () => {
   try {
-    [minimax, gladiator0, zerorev, ramo0] = await Promise.all([
+    [minimax, gladiator0, zerorev, zerorev6x48] = await Promise.all([
       createMinimaxBot('Minimax', { threads }),
       // Same engine as ZeroRev, other weights; they share its threads.
       createZeroRevBot(undefined, { threads, network: 'gladiator0' }),
       createZeroRevBot(undefined, { threads }),
-      createZeroRevBot(undefined, { threads, network: 'ramo0' }),
+      createZeroRevBot(undefined, { threads, network: 'zerorev6x48' }),
     ]);
   } catch (err) {
     // Without this the page would wait for the bots forever.
@@ -34,7 +34,7 @@ void (async () => {
     type: 'ready',
     gladiator0: gladiator0.meta,
     zerorev: zerorev.meta,
-    ramo0: ramo0.meta,
+    zerorev6x48: zerorev6x48.meta,
   });
 })();
 
@@ -48,7 +48,7 @@ export type WorkerRequest = {
 
 self.addEventListener('message', async (e: MessageEvent<WorkerRequest>) => {
   const { id, bot, action, state, thinkMs } = e.data;
-  const player = { minimax, gladiator0, zerorev, ramo0 }[bot];
+  const player = { minimax, gladiator0, zerorev, zerorev6x48 }[bot];
   try {
     if (action === 'chooseMove') {
       const position = await player.chooseMove(state, thinkMs);

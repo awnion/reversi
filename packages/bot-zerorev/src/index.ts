@@ -43,7 +43,11 @@ function toBitboards(state: GameState) {
 }
 
 /** The networks embedded in the engine. */
-export type ZeroRevNetwork = 'champion' | 'gladiator0' | 'ramo0';
+export type ZeroRevNetwork =
+  | 'champion'
+  | 'gladiator0'
+  | 'ramo0'
+  | 'zerorev6x48';
 
 export interface ZeroRevOptions {
   /** Threads to search on, where the page allows it. Default: one. */
@@ -56,6 +60,7 @@ const DEFAULT_NAMES: Record<ZeroRevNetwork, string> = {
   champion: 'ZeroRev',
   gladiator0: 'Gladiator0',
   ramo0: 'Ramo0',
+  zerorev6x48: 'ZeroRev6x48',
 };
 
 /**
