@@ -303,6 +303,21 @@ impl MctsSearch {
         self.nodes[0].children().max_by_key(|&c| self.nodes[c].n).map(|c| self.nodes[c].move_mask)
     }
 
+    /// Whether `remaining` more simulations could no longer change
+    /// [`MctsSearch::best_move`]: the most visited move leads the runner-up by
+    /// more visits than that.
+    pub fn settled(&self, remaining: u32) -> bool {
+        let (mut first, mut second) = (0, 0);
+        for child in &self.nodes[self.nodes[0].children()] {
+            if child.n > first {
+                (first, second) = (child.n, first);
+            } else if child.n > second {
+                second = child.n;
+            }
+        }
+        self.nodes[0].expanded && first - second > remaining
+    }
+
     /// Normalised visit-count distribution over all 64 squares.
     /// Used as the policy target when building training records.
     pub fn policy_target(&self) -> [f32; 64] {

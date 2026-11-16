@@ -32,6 +32,22 @@ impl SharedSearch {
         }
     }
 
+    /// Whether a timed search of a fresh tree may stop early, `elapsed_ms`
+    /// into it with `left_ms` to go: at the pace so far, the simulations still
+    /// to come could not make another move the most visited one.
+    pub fn settled(&self, elapsed_ms: f64, left_ms: f64) -> bool {
+        /// Too few simulations say little about the pace.
+        const MIN_VISITS: u32 = 32;
+        self.with(|tree| {
+            let visits = tree.visits();
+            if visits < MIN_VISITS || elapsed_ms <= 0.0 {
+                return false;
+            }
+            let to_come = (f64::from(visits) * left_ms.max(0.0) / elapsed_ms).ceil() as u32;
+            tree.settled(to_come.saturating_add(tree.in_flight()))
+        })
+    }
+
     /// Read the tree, e.g. for `best_move()` once the threads are done.
     pub fn with<R>(&self, read: impl FnOnce(&MctsSearch) -> R) -> R {
         read(&self.lock())

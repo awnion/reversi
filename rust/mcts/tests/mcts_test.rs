@@ -463,3 +463,47 @@ fn arena_scores_the_stronger_network() {
     let total: f32 = pool.pair_points().iter().map(|&(_, p)| p).sum();
     assert!(total >= 12.0, "the right way up scored {total} of 16");
 }
+
+#[test]
+fn settled_move_survives_the_remaining_simulations() {
+    let mut checked = 0;
+    for seed in 0..20u64 {
+        let (board, is_black) = random_opening(10 + (seed % 30) as u32, seed + 1);
+        if board.legal_moves(is_black).count_ones() < 2 {
+            continue;
+        }
+        let mut search = MctsSearch::new(board, is_black);
+        assert!(!search.settled(0), "nothing is settled before the first simulation");
+        for _ in 0..400 {
+            search.simulate(&Scaled(100.0));
+        }
+        let remaining = 20;
+        if !search.settled(remaining) {
+            continue;
+        }
+        checked += 1;
+        let best = search.best_move();
+        for _ in 0..remaining {
+            search.simulate(&Scaled(100.0));
+        }
+        assert_eq!(search.best_move(), best, "seed {seed}");
+    }
+    assert!(checked >= 3, "only {checked} settled searches checked");
+}
+
+#[test]
+fn timed_search_settles_once_the_lead_outgrows_the_time_left() {
+    let search = SharedSearch::new(starting_board(), true);
+    for _ in 0..16 {
+        search.simulate(&StaticEval);
+    }
+    assert!(!search.settled(50.0, 0.0), "too few simulations to judge the pace");
+    for _ in 0..400 {
+        search.simulate(&StaticEval);
+    }
+    // At this pace 10 000 ms would bring far more simulations than any lead.
+    assert!(!search.settled(1.0, 10_000.0));
+    // With no time left, any lead decides.
+    let lead = search.with(|tree| tree.settled(0));
+    assert_eq!(search.settled(100.0, 0.0), lead);
+}

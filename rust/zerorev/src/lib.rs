@@ -1,6 +1,8 @@
 use reversi_mcts::EvalFn;
 use reversi_mcts::MctsSearch;
 use reversi_mcts::SharedSearch;
+use reversi_mcts::batch::ENDGAME_SOLVE_EMPTIES;
+use reversi_mcts::endgame::solve;
 use reversi_minimax::board::Board;
 use reversi_nn::AlphaZeroNet;
 use wasm_bindgen::prelude::*;
@@ -74,34 +76,54 @@ fn make_eval(weights: &[u8]) -> Box<dyn EvalFn + Sync> {
     Box::new(NnEval { net })
 }
 
-/// Simulate on this thread until the deadline (milliseconds, `Date.now()`).
-fn simulate_until(search: &SharedSearch, eval: &dyn EvalFn, deadline: f64) {
+/// When to stop a timed search.
+#[derive(Clone, Copy)]
+struct Limit {
+    /// `Date.now()` milliseconds.
+    started: f64,
+    deadline: f64,
+    /// Stop before the deadline once the move can no longer change.
+    stop_when_settled: bool,
+}
+
+impl Limit {
+    fn new(time_ms: f64, stop_when_settled: bool) -> Self {
+        let started = js_sys::Date::now();
+        Limit { started, deadline: started + time_ms, stop_when_settled }
+    }
+}
+
+/// Simulate on this thread until the limit.
+fn simulate_until(search: &SharedSearch, eval: &dyn EvalFn, limit: Limit) {
     loop {
         for _ in 0..4 {
             search.simulate(eval);
         }
-        if js_sys::Date::now() >= deadline {
+        let now = js_sys::Date::now();
+        if now >= limit.deadline {
+            break;
+        }
+        if limit.stop_when_settled && search.settled(now - limit.started, limit.deadline - now) {
             break;
         }
     }
 }
 
-/// Search for `time_ms` milliseconds on every thread of the pool, all working
-/// on the same tree.
+/// Search up to the limit on every thread of the pool, all working on the
+/// same tree.
 #[cfg(feature = "threads")]
-fn run_mcts_timed(search: &SharedSearch, eval: &(dyn EvalFn + Sync), time_ms: f64) {
-    let deadline = js_sys::Date::now() + time_ms;
+fn run_mcts_timed(search: &SharedSearch, eval: &(dyn EvalFn + Sync), limit: Limit) {
     rayon::scope(|scope| {
         for _ in 0..rayon::current_num_threads() {
-            scope.spawn(|_| simulate_until(search, eval, deadline));
+            scope.spawn(|_| simulate_until(search, eval, limit));
         }
     });
 }
 
-/// Search for `time_ms` milliseconds on the calling thread.
+/// Search up to the limit on the calling thread.
 #[cfg(not(feature = "threads"))]
-fn run_mcts_timed(search: &SharedSearch, eval: &(dyn EvalFn + Sync), time_ms: f64) {
-    simulate_until(search, eval, js_sys::Date::now() + time_ms);
+fn run_mcts_timed(search: &SharedSearch, eval: &(dyn EvalFn + Sync), limit: Limit) {
+    simulate_until(search, eval, limit);
 }
 
 /// Start the worker threads of the search; resolves once they are running.
@@ -186,8 +208,16 @@ impl ZeroRevBot {
             return legal.trailing_zeros() as i32;
         }
 
+        // The last moves are played exactly, and at once.
+        if (!(black | white)).count_ones() <= ENDGAME_SOLVE_EMPTIES
+            && let (Some(best), _) = solve(board, is_black)
+        {
+            self.last_simulations.set(0);
+            return best.trailing_zeros() as i32;
+        }
+
         let search = SharedSearch::new(board, is_black);
-        run_mcts_timed(&search, self.eval.as_ref(), think_ms);
+        run_mcts_timed(&search, self.eval.as_ref(), Limit::new(think_ms, true));
 
         let tree = search.into_inner();
         self.last_simulations.set(tree.visits());
@@ -239,7 +269,7 @@ impl ZeroRevBot {
             tree.nodes() >= ANALYSIS_MAX_NODES || tree.visits() >= ANALYSIS_MAX_SIMULATIONS
         };
         if !search.with(done) {
-            run_mcts_timed(search, self.eval.as_ref(), think_ms);
+            run_mcts_timed(search, self.eval.as_ref(), Limit::new(think_ms, false));
         }
         let (mut policy, visits, value, complete) = search
             .with(|tree| (tree.policy_target(), tree.visits(), tree.root_value(), done(tree)));
