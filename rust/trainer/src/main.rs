@@ -61,6 +61,8 @@ commands:
             [--simulations N]   per move (800)
             [--opening-plies N] random moves before the networks take over (4)
             [--seed N]          pair i starts from opening seed + i (0)
+            [--all-openings]    one pair per distinct position after --opening-plies
+                                moves (236 after 4), instead of --pairs random ones
             [--workers N]       search threads (6)
             [--leaves N]        leaves per game and round, apart by virtual loss (8)
   infer     --weights FILE --input PLANES.f32 --output OUT.f32
@@ -104,8 +106,16 @@ struct Args {
     flags: Vec<String>,
 }
 
-const FLAGS: &[&str] =
-    &["fp32", "nchw", "no-stagger", "stagger", "allow-cpu", "no-cuda-graphs", "help"];
+const FLAGS: &[&str] = &[
+    "fp32",
+    "nchw",
+    "no-stagger",
+    "stagger",
+    "allow-cpu",
+    "no-cuda-graphs",
+    "all-openings",
+    "help",
+];
 
 impl Args {
     fn parse() -> Result<Args, String> {
@@ -602,6 +612,7 @@ fn play_match(args: &mut Args) -> Result<ExitCode, String> {
         simulations: args.num("simulations", 800u32)?,
         opening_plies: args.num("opening-plies", 4u32)?,
         seed: args.num("seed", 0u64)?,
+        all_openings: args.flag("all-openings"),
         workers: args.num("workers", 6usize)?,
         leaves_per_round: args.num("leaves", 8u32)?,
     };

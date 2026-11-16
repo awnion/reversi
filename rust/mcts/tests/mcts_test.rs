@@ -7,6 +7,7 @@ use reversi_mcts::PLANES_LEN;
 use reversi_mcts::SelfPlayPool;
 use reversi_mcts::SharedSearch;
 use reversi_mcts::StaticEval;
+use reversi_mcts::all_openings;
 use reversi_mcts::batch::ENDGAME_SOLVE_EMPTIES;
 use reversi_mcts::play_game;
 use reversi_mcts::play_match_from;
@@ -278,6 +279,17 @@ fn random_openings_are_reproducible_and_varied() {
         })
         .collect();
     assert!(distinct.len() > 8, "only {} distinct openings from 32 seeds", distinct.len());
+}
+
+#[test]
+fn all_openings_cover_the_random_ones() {
+    let openings = all_openings(4);
+    assert_eq!(openings.len(), 236);
+    assert_eq!(all_openings(1).len(), 4);
+    for seed in 0..200 {
+        let (b, t) = random_opening(4, seed);
+        assert!(openings.contains(&(b, t)), "seed {seed} gives an opening not in the list");
+    }
 }
 
 #[test]

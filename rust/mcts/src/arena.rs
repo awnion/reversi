@@ -116,9 +116,20 @@ impl MatchPool {
         simulations: u32,
         leaves_per_round: u32,
     ) -> Self {
-        let mut games = Vec::with_capacity(2 * pairs.len());
-        for pair in pairs {
-            let (board, is_black) = random_opening(opening_plies, seed.wrapping_add(pair as u64));
+        let openings = pairs
+            .map(|pair| (pair, random_opening(opening_plies, seed.wrapping_add(pair as u64))))
+            .collect();
+        Self::from_openings(openings, simulations, leaves_per_round)
+    }
+
+    /// Both games of every pair `(pair, (board, black_to_move))`.
+    pub fn from_openings(
+        openings: Vec<(usize, (Board, bool))>,
+        simulations: u32,
+        leaves_per_round: u32,
+    ) -> Self {
+        let mut games = Vec::with_capacity(2 * openings.len());
+        for (pair, (board, is_black)) in openings {
             for first_is_black in [true, false] {
                 games.push(ArenaGame {
                     pair,

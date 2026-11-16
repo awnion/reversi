@@ -77,6 +77,35 @@ pub fn random_opening(plies: u32, seed: u64) -> (Board, bool) {
     (board, is_black)
 }
 
+/// Every distinct position reached by `plies` legal moves from the start
+/// (passes as in [`random_opening`]), as `(board, black_to_move)`, sorted.
+pub fn all_openings(plies: u32) -> Vec<(Board, bool)> {
+    let mut positions = vec![(starting_board(), true)];
+    for _ in 0..plies {
+        let mut next = Vec::new();
+        for (board, mut is_black) in positions {
+            let mut legal = board.legal_moves(is_black);
+            if legal == 0 {
+                is_black = !is_black;
+                legal = board.legal_moves(is_black);
+                if legal == 0 {
+                    next.push((board, is_black));
+                    continue;
+                }
+            }
+            while legal != 0 {
+                let m = 1u64 << legal.trailing_zeros();
+                legal &= legal - 1;
+                next.push((board.apply_move(is_black, m), !is_black));
+            }
+        }
+        next.sort_unstable_by_key(|(b, t)| (b.black, b.white, *t));
+        next.dedup();
+        positions = next;
+    }
+    positions
+}
+
 /// Play a game from an arbitrary position, deterministically (no noise, the
 /// most visited move is always played).
 /// Returns +1 if black wins, -1 if white wins, 0 if draw.

@@ -15,6 +15,7 @@ pub use batch::write_planes;
 pub use batch::write_position_planes;
 pub use game::GameRecord;
 pub use game::PositionRecord;
+pub use game::all_openings;
 pub use game::play_game;
 pub use game::play_match_from;
 pub use game::random_opening;

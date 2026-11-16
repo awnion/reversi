@@ -14,6 +14,9 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::Sender;
 use reversi_mcts::MatchPool;
+use reversi_mcts::all_openings;
+use reversi_mcts::random_opening;
+use reversi_minimax::board::Board;
 
 use crate::net::FoldedWeights;
 use crate::net::NetOptions;
@@ -29,6 +32,9 @@ pub struct MatchConfig {
     pub simulations: u32,
     pub opening_plies: u32,
     pub seed: u64,
+    /// Play every distinct position after `opening_plies` moves once (both
+    /// colours) instead of `pairs` random openings.
+    pub all_openings: bool,
     pub workers: usize,
     pub leaves_per_round: u32,
 }
@@ -80,7 +86,8 @@ fn run_worker(
     }
 }
 
-/// Points of `a` per pair (0 to 2), pair `i` from opening `seed + i`.
+/// Points of `a` per pair (0 to 2): pair `i` from opening `seed + i`, or from
+/// the `i`-th of [`all_openings`] with `config.all_openings`.
 pub fn run_match(
     a: &FoldedWeights,
     b: &FoldedWeights,
@@ -92,23 +99,25 @@ pub fn run_match(
         tch::Cuda::cudnn_set_benchmark(true);
     }
     let nets = [TorchNet::new(a, options), TorchNet::new(b, options)];
-    let workers = config.workers.clamp(1, config.pairs.max(1));
+    let openings: Vec<(usize, (Board, bool))> = if config.all_openings {
+        all_openings(config.opening_plies).into_iter().enumerate().collect()
+    } else {
+        (0..config.pairs)
+            .map(|i| (i, random_opening(config.opening_plies, config.seed.wrapping_add(i as u64))))
+            .collect()
+    };
+    let pairs = openings.len();
+    let workers = config.workers.clamp(1, pairs.max(1));
     let (request_tx, request_rx) = crossbeam_channel::unbounded();
-    let mut points = vec![0.0f32; config.pairs];
+    let mut points = vec![0.0f32; pairs];
 
     std::thread::scope(|scope| {
         let mut reply_txs = Vec::new();
         for id in 0..workers {
             let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
             reply_txs.push(reply_tx);
-            let pairs = config.pairs * id / workers..config.pairs * (id + 1) / workers;
-            let pool = MatchPool::new(
-                pairs,
-                config.opening_plies,
-                config.seed,
-                config.simulations,
-                config.leaves_per_round,
-            );
+            let share = openings[pairs * id / workers..pairs * (id + 1) / workers].to_vec();
+            let pool = MatchPool::from_openings(share, config.simulations, config.leaves_per_round);
             let requests = request_tx.clone();
             scope.spawn(move || run_worker(id, pool, &requests, &reply_rx));
         }
