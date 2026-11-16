@@ -16,6 +16,7 @@ use crate::game::GameRecord;
 use crate::game::PositionRecord;
 use crate::game::SimpleRng;
 use crate::game::add_root_noise;
+use crate::game::random_moves;
 use crate::game::sample_move_from_policy;
 use crate::search::EvalRequest;
 use crate::search::MctsSearch;
@@ -31,6 +32,14 @@ const VALUE_TARGET_SEARCH_WEIGHT: f32 = 0.2;
 /// Positions with at most this many empty squares are solved exactly
 /// ([`crate::endgame::solve`]) instead of searched.
 pub const ENDGAME_SOLVE_EMPTIES: u32 = 12;
+/// Each game starts with a uniformly random number of uniformly random legal
+/// moves in this range, not recorded: without them most games repeat earlier
+/// ones move for move.
+const RANDOM_OPENING_PLIES: std::ops::RangeInclusive<u32> = 4..=8;
+/// Share of solved positions (at most [`ENDGAME_SOLVE_EMPTIES`] empty squares,
+/// the final board included) that become training samples; recording all of
+/// them filled half of the replay buffer with endgames.
+const SOLVED_RECORD_FRACTION: f32 = 0.25;
 
 /// Search budget per move: playout cap randomization (KataGo). A random
 /// `full_fraction` of the moves get `full` simulations, root noise and a
@@ -142,13 +151,18 @@ struct Game {
 
 impl Game {
     fn new() -> Self {
+        let mut rng = SimpleRng::new();
+        let (low, high) = (*RANDOM_OPENING_PLIES.start(), *RANDOM_OPENING_PLIES.end());
+        let plies = low + ((rng.next_f32() * (high - low + 1) as f32) as u32).min(high - low);
+        // Standard Reversi start: black on d5(35) and e4(28), white on d4(27) and e5(36).
+        let start = Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36));
+        let (board, is_black) = random_moves(start, true, plies, &mut rng);
         Game {
-            // Standard Reversi start: black on d5(35) and e4(28), white on d4(27) and e5(36).
-            board: Board::new((1u64 << 28) | (1u64 << 35), (1u64 << 27) | (1u64 << 36)),
-            is_black: true,
-            ply: 0,
+            board,
+            is_black,
+            ply: plies as usize,
             samples: Vec::new(),
-            rng: SimpleRng::new(),
+            rng,
             search: None,
             sims_done: 0,
             target: 0,
@@ -179,9 +193,13 @@ impl Game {
                     self.reuse = None;
                     let (best, score) = solve(self.board, self.is_black);
                     let m = best.expect("the side to move has a move");
-                    let mut policy = [0.0; 64];
-                    policy[m.trailing_zeros() as usize] = 1.0;
-                    self.record_and_play(legal, policy, 1.0, Some(score.signum() as f32), m);
+                    if self.rng.next_f32() < SOLVED_RECORD_FRACTION {
+                        let mut policy = [0.0; 64];
+                        policy[m.trailing_zeros() as usize] = 1.0;
+                        self.record_and_play(legal, policy, 1.0, Some(score.signum() as f32), m);
+                    } else {
+                        self.play(m);
+                    }
                     continue;
                 }
                 if legal.count_ones() == 1 {
@@ -314,6 +332,10 @@ impl Game {
             policy_weight: 0.0,
             value_weight: 2.0,
         };
+        let keep_terminal = [
+            self.rng.next_f32() < SOLVED_RECORD_FRACTION,
+            self.rng.next_f32() < SOLVED_RECORD_FRACTION,
+        ];
         let positions = std::mem::take(&mut self.samples)
             .into_iter()
             .map(|s| {
@@ -332,7 +354,13 @@ impl Game {
                 policy_weight: s.policy_weight,
                 value_weight: s.value_weight,
             })
-            .chain([terminal(true), terminal(false)])
+            .chain(
+                [true, false]
+                    .into_iter()
+                    .zip(keep_terminal)
+                    .filter(|(_, k)| *k)
+                    .map(|(b, _)| terminal(b)),
+            )
             .collect();
 
         GameRecord { positions, black_discs, white_discs }

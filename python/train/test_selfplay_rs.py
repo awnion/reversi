@@ -260,19 +260,16 @@ def test_shards_and_shutdown(tmp: Path, bin_path: Path) -> None:
     print("✓ shards round-trip and shutdown")
 
 
-def _stats(s: dict[str, np.ndarray]) -> dict[str, float]:
+def _stats(s: dict[str, np.ndarray], games: int) -> dict[str, float]:
     searched = s["policy_weights"] == 1
-    legal = s["planes"][:, 2].reshape(len(s["planes"]), 64)
-    terminal = (s["policy_weights"] == 0) & (legal.sum(axis=1) == 0)
-    # Terminal samples come in pairs, black's view first.
-    first = np.flatnonzero(terminal)[::2]
-    games = len(first)
+    empties = 64 - s["planes"][:, :2].reshape(len(s["planes"]), -1).sum(axis=1)
     p = s["policies"][searched]
     entropy = -(p * np.log(np.where(p > 0, p, 1.0))).sum(axis=1)
     return {
         "games": games,
         "moves_per_game": float(searched.sum() / games),
-        "black_win_rate": float((s["outcomes"][first] > 0).mean()),
+        "solved_share": float((empties <= 12).mean()),
+        "abs_margin": float(np.abs(s["margins"]).mean()),
         "policy_entropy": float(entropy.mean()),
     }
 
@@ -325,12 +322,13 @@ def test_statistics(
     )  # fmt: skip
     output, _ = proc.communicate(timeout=600)
     assert proc.returncode == 0, output
-    rust = _stats(_load_shards(run / "replay_spool"))
-    python = _stats(_python_selfplay(bin_path, games, sims))
-    for key in ("games", "moves_per_game", "black_win_rate", "policy_entropy"):
+    rust = _stats(_load_shards(run / "replay_spool"), games)
+    python = _stats(_python_selfplay(bin_path, games, sims), games)
+    for key in rust:
         print(f"  {key:15s} rust {rust[key]:8.3f}   python {python[key]:8.3f}")
     assert abs(rust["moves_per_game"] - python["moves_per_game"]) < 1.5
-    assert abs(rust["black_win_rate"] - python["black_win_rate"]) < 0.1
+    assert abs(rust["solved_share"] - python["solved_share"]) < 0.03
+    assert abs(rust["abs_margin"] - python["abs_margin"]) < 0.05
     assert abs(rust["policy_entropy"] - python["policy_entropy"]) < 0.1
     print("✓ game statistics match Python self-play")
 

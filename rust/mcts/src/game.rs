@@ -54,9 +54,17 @@ pub fn play_match(eval_black: &dyn EvalFn, eval_white: &dyn EvalFn, simulations:
 /// as `(board, black_to_move)`. The same `seed` always gives the same
 /// position, so both colour assignments of a pairing can share an opening.
 pub fn random_opening(plies: u32, seed: u64) -> (Board, bool) {
-    let mut rng = SimpleRng::from_seed(seed);
-    let mut board = starting_board();
-    let mut is_black = true;
+    random_moves(starting_board(), true, plies, &mut SimpleRng::from_seed(seed))
+}
+
+/// Play up to `plies` uniformly random legal moves (forced passes skipped,
+/// not counted); stops early if the game ends.
+pub(crate) fn random_moves(
+    mut board: Board,
+    mut is_black: bool,
+    plies: u32,
+    rng: &mut SimpleRng,
+) -> (Board, bool) {
     for _ in 0..plies {
         let mut legal = board.legal_moves(is_black);
         if legal == 0 {

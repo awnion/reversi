@@ -78,15 +78,37 @@ fn outcomes_are_consistent() {
         std::cmp::Ordering::Less => -1.0_f32,
         std::cmp::Ordering::Equal => 0.0_f32,
     };
-    // The first position is always black's turn and searched: its value target
-    // is 0.8 of the final outcome plus 0.2 of the search value (in [-1, 1]).
+    // The first recorded position follows the random opening and is searched:
+    // its value target is 0.8 of the final outcome plus 0.2 of the search
+    // value (in [-1, 1]).
     if let Some(first) = record.positions.first() {
-        assert!(first.is_black);
-        assert!((first.outcome - 0.8 * final_outcome).abs() <= 0.2 + 1e-6, "{}", first.outcome);
+        let z = if first.is_black { final_outcome } else { -final_outcome };
+        assert!((first.outcome - 0.8 * z).abs() <= 0.2 + 1e-6, "{}", first.outcome);
     }
-    // The terminal samples carry the outcome itself.
-    let last = record.positions.last().expect("a finished game has positions");
-    assert_eq!(last.outcome, if last.is_black { final_outcome } else { -final_outcome });
+    // Terminal samples, when kept, carry the outcome itself.
+    for p in record.positions.iter().filter(|p| p.legal == 0) {
+        assert_eq!(p.outcome, if p.is_black { final_outcome } else { -final_outcome });
+    }
+}
+
+#[test]
+fn games_start_randomly_and_record_few_solved_positions() {
+    let records = run_pool(&mut SelfPlayPool::new(16, 8), 200);
+    let positions: Vec<_> = records.iter().flat_map(|r| &r.positions).collect();
+    // Four to eight unrecorded random moves: at least 4 + 4 discs, and the
+    // openings differ.
+    assert!(positions.iter().all(|p| (p.board.black | p.board.white).count_ones() >= 8));
+    let starts: std::collections::HashSet<_> =
+        records.iter().map(|r| (r.positions[0].board.black, r.positions[0].board.white)).collect();
+    assert!(starts.len() > 150, "{} distinct first positions in 200 games", starts.len());
+    // About a quarter of the solved positions (13 searched + 2 terminal per
+    // game at most) are kept.
+    let solved = positions
+        .iter()
+        .filter(|p| 64 - (p.board.black | p.board.white).count_ones() <= ENDGAME_SOLVE_EMPTIES)
+        .count() as f32;
+    let per_game = solved / records.len() as f32;
+    assert!((2.0..5.5).contains(&per_game), "{per_game} solved positions per game");
 }
 
 // ── split select/apply API ────────────────────────────────────────────────

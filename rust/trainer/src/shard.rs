@@ -176,13 +176,13 @@ mod tests {
         let policy_weights: Array1<f32> = npz.by_name("policy_weights").unwrap();
         let value_weights: Array1<f32> = npz.by_name("value_weights").unwrap();
         assert_eq!(planes.shape(), [positions, 4, 8, 8]);
-        // Every game ends with two value-only samples: no legal moves, no policy.
+        // Terminal value-only samples (kept with some probability): no legal
+        // moves, no policy.
         let terminal: Vec<usize> = (0..positions)
             .filter(|&i| {
                 policy_weights[i] == 0.0 && planes.slice(ndarray::s![i, 2, .., ..]).sum() == 0.0
             })
             .collect();
-        assert!(terminal.len() >= 2 * games, "terminal samples: {}", terminal.len());
         for &i in &terminal {
             assert_eq!(value_weights[i], 2.0);
             assert_eq!(policies.row(i).sum(), 0.0);
