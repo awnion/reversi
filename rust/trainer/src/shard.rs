@@ -33,6 +33,7 @@ pub struct Samples {
     margins: Vec<f32>,
     policy_weights: Vec<f32>,
     value_weights: Vec<f32>,
+    search_values: Vec<f32>,
 }
 
 impl Samples {
@@ -55,6 +56,7 @@ impl Samples {
             self.margins.push(pos.margin);
             self.policy_weights.push(pos.policy_weight);
             self.value_weights.push(pos.value_weight);
+            self.search_values.push(pos.search_value);
         }
         record.positions.len()
     }
@@ -75,6 +77,7 @@ impl Samples {
             ("margins", self.margins),
             ("policy_weights", self.policy_weights),
             ("value_weights", self.value_weights),
+            ("search_values", self.search_values),
         ] {
             npz.add_array(name, &Array1::from_vec(values)).map_err(npz_err)?;
         }
@@ -169,7 +172,15 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["margins", "outcomes", "planes", "policies", "policy_weights", "value_weights"]
+            [
+                "margins",
+                "outcomes",
+                "planes",
+                "policies",
+                "policy_weights",
+                "search_values",
+                "value_weights"
+            ]
         );
         let planes: Array4<f32> = npz.by_name("planes").unwrap();
         let policies: Array2<f32> = npz.by_name("policies").unwrap();

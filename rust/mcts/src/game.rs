@@ -26,6 +26,9 @@ pub struct PositionRecord {
     pub margin: f32,
     pub policy_weight: f32,
     pub value_weight: f32,
+    /// The search's value of the position for the side to move (NaN when
+    /// not searched): with it the outcome can be remixed after the fact.
+    pub search_value: f32,
 }
 
 /// Full record of one self-play game.

@@ -331,6 +331,7 @@ impl Game {
             margin: if is_black { black_margin } else { -black_margin },
             policy_weight: 0.0,
             value_weight: 2.0,
+            search_value: f32::NAN,
         };
         let keep_terminal = [
             self.rng.next_f32() < SOLVED_RECORD_FRACTION,
@@ -353,6 +354,7 @@ impl Game {
                 margin: if s.is_black { black_margin } else { -black_margin },
                 policy_weight: s.policy_weight,
                 value_weight: s.value_weight,
+                search_value: s.q.unwrap_or(f32::NAN),
             })
             .chain(
                 [true, false]
