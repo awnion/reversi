@@ -196,7 +196,7 @@ pull-run host botname:
 # REVERSI_SELFPLAY and REVERSI_SELFPLAY_RUST_ARGS are taken from this shell
 # (default python), not from the remote's environment.
 train-remote host botname: (sync-code host)
-    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && REVERSI_SELFPLAY="{{ env_var_or_default("REVERSI_SELFPLAY", "python") }}" REVERSI_SELFPLAY_RUST_ARGS="{{ env_var_or_default("REVERSI_SELFPLAY_RUST_ARGS", "") }}" just train {{ botname }}'
+    ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && REVERSI_SELFPLAY="{{ env_var_or_default("REVERSI_SELFPLAY", "auto") }}" REVERSI_SELFPLAY_RUST_ARGS="{{ env_var_or_default("REVERSI_SELFPLAY_RUST_ARGS", "") }}" just train {{ botname }}'
 
 stop-remote host botname:
     ssh {{ host }} '{{ _remote_path }}; cd {{ _remote_dir }} && just stop {{ botname }}'

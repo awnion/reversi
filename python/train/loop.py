@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import math
@@ -31,7 +32,9 @@ from pathlib import Path
 
 import numpy as np
 
+from . import hardware
 from . import weights as weights_io
+from .autotune import Tuner
 from .backend import Model, backend_name, create_model
 from .replay import ReplayBuffer
 from .replay_spool import ReplayShardWriter, ingest_replay_shards
@@ -130,8 +133,9 @@ CHAMPION_HISTORY = 5  # keep this many past champion snapshots
 # Replay persistence
 REPLAY_PATH = WEIGHTS_DIR / "replay_buffer.npz"
 # Positions kept for training: enough self-play that the network does not
-# chase the last games. ~1.3 KB each (10.4 GB).
-REPLAY_SIZE = 8_000_000
+# chase the last games. ~1.3 KB each; set from the machine's memory by the
+# plan (hardware.make_plan, at most 8M = 10.4 GB).
+REPLAY_SIZE = 2_000_000
 # Save the replay buffer every N training steps. Saving blocks the learner
 # (about 20 s per million positions), so not too often.
 REPLAY_SAVE_EVERY = 20_000
@@ -177,26 +181,18 @@ def _apply_run_name(name: str) -> None:
     SNAPSHOT_DIR = WEIGHTS_DIR / "snapshots"
 
 
-# A self-play process alternates between the search trees (one CPU core) and
-# the network (GPU), so one process leaves the GPU idle most of the time.
-# Several processes, each with its own full batch, keep it busy. On Apple
-# Silicon the CPU and GPU share one chip and one process is enough.
-DEFAULT_SELFPLAY_PROCESSES = 1 if backend_name() == "mlx" else 4
 DEFAULT_SHARD_POSITIONS = 4_096
 WEIGHT_REFRESH_SECONDS = 5.0  # self-play: poll for new weights
 SELFPLAY_LOG_SECONDS = 30.0
 
 # Self-play implementation, from REVERSI_SELFPLAY:
-# - "python" (default): the self-play processes below;
-# - "rust": one `reversi-selfplay` process (rust/trainer, `just build-selfplay`),
-#   libtorch on CUDA with all CPU cores searching. Falls back to Python when
-#   its `check` fails or it keeps crashing;
-# - "auto": the same as "rust" (a separate name for scripts that opt in).
-# Extra arguments for the binary: REVERSI_SELFPLAY_RUST_ARGS, e.g.
-# "--workers 8 --batch-target 8192".
-# REVERSI_SELFPLAY_GPUS, e.g. "1,2": one Rust process per listed GPU
-# (CUDA_VISIBLE_DEVICES), the learner keeps the default one. Unset: one
-# process on the default GPU.
+# - "auto" (default): `reversi-selfplay` (rust/trainer, `just build-selfplay`)
+#   where it is built and CUDA works, else the Python self-play processes
+#   below (always on Apple Silicon);
+# - "rust": the same; "python": the Python processes only.
+# The processes follow the plan of train/hardware.py: one per accelerator,
+# the learner's included, each with its own CPUs. Extra arguments for the
+# binary: REVERSI_SELFPLAY_RUST_ARGS, e.g. "--batch-target 8192".
 SELFPLAY_IMPLEMENTATIONS = ("python", "rust", "auto")
 RUST_SELFPLAY_BIN = Path(
     os.environ.get(
@@ -307,6 +303,10 @@ class BatchPrefetcher:
         self._thread.join(timeout=10)
         if self._saver is not None:
             self._saver.join()
+
+    def saving(self) -> bool:
+        """A background save is running (it holds up ingestion)."""
+        return self._saver is not None and self._saver.is_alive()
 
     def save(self, path: Path) -> None:
         """Save the buffer in the background, unless a save is still running."""
@@ -448,6 +448,7 @@ async def train_loop(
     stop_event: asyncio.Event,
     lock: threading.Lock,
     next_tournament_step: list,
+    tuner: Tuner | None = None,
 ) -> None:
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     step, best_loss = _load_best_checkpoint(model)
@@ -477,8 +478,19 @@ async def train_loop(
     warmup_pos0 = len(replay)
     step_log_t = time.monotonic()
 
+    busy_seconds = 0.0  # time spent in training steps, for the tuner
     with BatchPrefetcher(replay, REPLAY_SPOOL_DIR, BATCH_SIZE) as prefetcher:
         while not stop_event.is_set():
+            if tuner is not None:
+                tuner.tick(
+                    step=step,
+                    added=replay.total_added,
+                    backlog=(replay.total_added - replay_at_last_step) / TRAIN_RATIO,
+                    busy_seconds=busy_seconds,
+                    hot=governor.throttle > 0,
+                    match_running=tournament_task is not None,
+                    saving=prefetcher.saving(),
+                )
             # Wait for enough data before starting (the prefetcher ingests)
             if len(replay) < MIN_REPLAY:
                 now = time.monotonic()
@@ -524,6 +536,7 @@ async def train_loop(
             loss_val = metrics["loss"]
             step += 1
             step_seconds = time.monotonic() - step_started
+            busy_seconds += step_seconds
 
             new_lr = schedule.at(step)
             if new_lr != learning_rate:
@@ -599,6 +612,8 @@ async def train_loop(
                     and tournament_task.result()
                 )
                 tournament_task = None
+                if tuner is not None:
+                    tuner.note_hot()
                 if played and schedule.after_match(step):
                     log_event(
                         "train", "lr-drop", step=step, rate=f"{schedule.rate:.2e}"
@@ -1012,13 +1027,13 @@ def _load_weights_into_model(model: Model, path: Path) -> None:
 
 
 def _spawn_selfplay_processes(
-    count: int,
+    slots: list[hardware.SelfPlaySlot],
     workers_per_process: int,
     positions_per_shard: int,
     run_name: str,
 ) -> list[subprocess.Popen]:
     children: list[subprocess.Popen] = []
-    for process_index in range(count):
+    for slot in slots:
         cmd = [
             sys.executable,
             "-m",
@@ -1026,7 +1041,7 @@ def _spawn_selfplay_processes(
             "--role",
             "selfplay",
             "--process-index",
-            str(process_index),
+            str(slot.index),
             "--selfplay-workers",
             str(workers_per_process),
             "--positions-per-shard",
@@ -1034,20 +1049,27 @@ def _spawn_selfplay_processes(
             "--run-name",
             run_name,
         ]
-        child = subprocess.Popen(cmd)
+        env = dict(os.environ)
+        if slot.gpu is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(slot.gpu)
+        cpus = slot.cpus
+        pin = (lambda cpus=cpus: os.sched_setaffinity(0, cpus)) if cpus else None
+        child = subprocess.Popen(cmd, env=env, preexec_fn=pin)
         children.append(child)
         log_event(
             "system",
             "spawn-selfplay",
-            process=process_index,
+            process=slot.index,
             pid=child.pid,
-            workers=workers_per_process,
+            gpu=slot.gpu if slot.gpu is not None else "default",
+            cpus=len(cpus) if cpus else "all",
+            games=workers_per_process,
         )
     return children
 
 
 def _selfplay_implementation() -> str:
-    name = os.environ.get("REVERSI_SELFPLAY", "python")
+    name = os.environ.get("REVERSI_SELFPLAY", "auto")
     if name not in SELFPLAY_IMPLEMENTATIONS:
         raise ValueError(
             f"REVERSI_SELFPLAY must be one of {SELFPLAY_IMPLEMENTATIONS}, got {name!r}"
@@ -1102,45 +1124,20 @@ def _rust_selfplay_works(env: dict[str, str]) -> bool:
     return True
 
 
-def _cpu_set(name: str) -> set[int] | None:
-    """The CPUs listed in environment variable `name` ("0,1,24-25"), or None
-    when it is unset or the platform cannot pin (macOS).
-
-    REVERSI_LEARNER_CPUS / REVERSI_SELFPLAY_CPUS keep the learner off the
-    cores the search threads use: on the 24-core EPYC server the learner's
-    step took 13.7 ms next to 32 search threads and 8 ms alone; two cores of
-    its own (both SMT threads) raised it from 73 to 93 steps/s."""
-    raw = os.environ.get(name, "").strip()
-    if not raw or not hasattr(os, "sched_setaffinity"):
-        return None
-    cpus: set[int] = set()
-    for part in raw.split(","):
-        first, _, last = part.strip().partition("-")
-        cpus.update(range(int(first), int(last or first) + 1))
-    return cpus
-
-
-def _selfplay_gpus() -> list[str | None]:
-    """GPUs for the Rust self-play processes: REVERSI_SELFPLAY_GPUS, or one
-    process on the default GPU."""
-    raw = os.environ.get("REVERSI_SELFPLAY_GPUS", "").split(",")
-    gpus: list[str | None] = [g.strip() for g in raw if g.strip()]
-    return gpus or [None]
-
-
 def _spawn_rust_selfplay(
     positions_per_shard: int,
     env: dict[str, str],
-    process_index: int = 0,
-    gpu: str | None = None,
+    slot: hardware.SelfPlaySlot,
+    games: int,
 ) -> subprocess.Popen:
-    if gpu is not None:
-        env = {**env, "CUDA_VISIBLE_DEVICES": gpu}
+    if slot.gpu is not None:
+        env = {**env, "CUDA_VISIBLE_DEVICES": str(slot.gpu)}
+    pools = 2
     cmd = [
         str(RUST_SELFPLAY_BIN),
         "selfplay",
         "--process-index",
-        str(process_index),
+        str(slot.index),
         "--run-dir",
         str(WEIGHTS_DIR.resolve()),
         "--simulations",
@@ -1149,13 +1146,19 @@ def _spawn_rust_selfplay(
         str(FAST_SIMULATIONS),
         "--full-fraction",
         str(FULL_FRACTION),
+        "--workers",
+        str(slot.workers),
+        "--pools-per-worker",
+        str(pools),
+        "--games-per-pool",
+        str(max(1, games // (slot.workers * pools))),
         "--positions-per-shard",
         str(positions_per_shard),
         "--parent-pid",
         str(os.getpid()),
         *shlex.split(os.environ.get("REVERSI_SELFPLAY_RUST_ARGS", "")),
     ]
-    cpus = _cpu_set("REVERSI_SELFPLAY_CPUS")
+    cpus = slot.cpus
     # Set in the child before exec, so that all of its threads inherit it.
     pin = (lambda: os.sched_setaffinity(0, cpus)) if cpus else None
     child = subprocess.Popen(cmd, env=env, preexec_fn=pin)
@@ -1163,7 +1166,9 @@ def _spawn_rust_selfplay(
         "system",
         "spawn-selfplay-rust",
         pid=child.pid,
-        gpu=gpu if gpu is not None else "default",
+        process=slot.index,
+        gpu=slot.gpu if slot.gpu is not None else "default",
+        shared=slot.shared,
         cpus=len(cpus) if cpus else "all",
         args=repr(cmd[2:]),
     )
@@ -1281,8 +1286,12 @@ async def _run_selfplay_process(
 
     games = positions = evals = 0
     evals_at_log = 0
-    last_refresh = last_log = time.monotonic()
+    last_refresh = last_log = last_control = time.monotonic()
     governor = ThermalGovernor()
+    # The learner's settings for this process (autotune.Tuner).
+    control_file = WEIGHTS_DIR / f"selfplay{process_index}.control"
+    control_mtime = None
+    duty, duty_owed = 0.0, 0.0
     try:
         while not stop_flag[0]:
             round_started = time.monotonic()
@@ -1307,8 +1316,30 @@ async def _run_selfplay_process(
             if governor.poll():
                 _log_throttle("selfplay", governor)
             pause = governor.pause_after(now - round_started)
+            # The learner on the same accelerator goes first.
+            if duty > 0:
+                duty_owed += (now - round_started) * duty / (1.0 - duty)
+            else:
+                duty_owed = 0.0
+            if duty_owed >= 0.02:
+                pause, duty_owed = max(pause, duty_owed), 0.0
             if pause > 0:
                 time.sleep(pause)
+
+            if now - last_control >= 1.0:
+                last_control = now
+                try:
+                    mtime = control_file.stat().st_mtime_ns
+                    if mtime != control_mtime:
+                        control_mtime = mtime
+                        fields = dict(
+                            f.split("=", 1) for f in control_file.read_text().split()
+                        )
+                        if "games" in fields:
+                            pool.set_games(max(1, int(fields["games"])))
+                        duty = min(0.95, max(0.0, float(fields.get("duty", 0))))
+                except (OSError, ValueError):
+                    pass
 
             if now - last_refresh >= WEIGHT_REFRESH_SECONDS:
                 last_refresh = now
@@ -1337,6 +1368,8 @@ async def _run_selfplay_process(
                     positions=positions,
                     batch=batch,
                     evals_per_s=f"{rate:.0f}",
+                    in_play=pool.games,
+                    duty=f"{duty:.0%}",
                     **({"temp": governor.describe()} if governor.available else {}),
                 )
                 last_log = now
@@ -1346,7 +1379,9 @@ async def _run_selfplay_process(
 
 
 async def _run_learner(
-    selfplay_processes: int,
+    hw: hardware.Hardware,
+    plan: hardware.Plan,
+    selfplay_processes: int | None,
     selfplay_workers: int,
     positions_per_shard: int,
     run_name: str,
@@ -1364,6 +1399,8 @@ async def _run_learner(
     PID_FILE.write_text(str(os.getpid()))
     COOLDOWN_FLAG.unlink(missing_ok=True)
 
+    global REPLAY_SIZE
+    REPLAY_SIZE = plan.replay_size
     channels, blocks = _net_size()
     model = create_model(channels, blocks)
     replay = ReplayBuffer(max_size=REPLAY_SIZE)
@@ -1380,7 +1417,6 @@ async def _run_learner(
         "startup",
         backend=backend_name(),
         selfplay=selfplay,
-        selfplay_processes=selfplay_processes,
         simulations=SIMULATIONS,
         fast_simulations=FAST_SIMULATIONS,
         full_fraction=FULL_FRACTION,
@@ -1402,20 +1438,40 @@ async def _run_learner(
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    slots = plan.slots
+    if selfplay_processes is not None:
+        # --selfplay-processes N: N processes over the planned accelerators.
+        slots = [
+            dataclasses.replace(plan.slots[i % len(plan.slots)], index=i)
+            for i in range(selfplay_processes)
+        ]
+        plan = dataclasses.replace(plan, slots=slots)
+    rust_env = _rust_selfplay_env()
+    use_rust = bool(slots) and selfplay != "python" and _rust_selfplay_works(rust_env)
+    tuner = Tuner(
+        WEIGHTS_DIR,
+        hw,
+        plan,
+        f"{blocks}x{channels}",
+        TRAIN_RATIO,
+        log_event,
+        children,
+        default_games=SELFPLAY_GAMES if not use_rust else 6_144,
+    )
+
     def spawn_python() -> list[subprocess.Popen]:
         return _spawn_selfplay_processes(
-            selfplay_processes, selfplay_workers, positions_per_shard, run_name
+            slots, selfplay_workers, positions_per_shard, run_name
         )
 
     supervisors: list[asyncio.Task] = []
-    if selfplay_processes > 0:
-        rust_env = _rust_selfplay_env()
-        if selfplay != "python" and _rust_selfplay_works(rust_env):
-            for index, gpu in enumerate(_selfplay_gpus()):
+    if slots:
+        if use_rust:
+            for slot in slots:
 
-                def spawn_rust(index=index, gpu=gpu) -> subprocess.Popen:
+                def spawn_rust(slot=slot) -> subprocess.Popen:
                     return _spawn_rust_selfplay(
-                        positions_per_shard, rust_env, index, gpu
+                        positions_per_shard, rust_env, slot, tuner.games
                     )
 
                 child = spawn_rust()
@@ -1431,7 +1487,7 @@ async def _run_learner(
             children.extend(spawn_python())
 
     try:
-        await train_loop(model, replay, stop_event, lock, next_tournament_step)
+        await train_loop(model, replay, stop_event, lock, next_tournament_step, tuner)
     except KeyboardInterrupt:
         log_event("system", "keyboard-interrupt")
         replay.save(REPLAY_PATH)
@@ -1447,12 +1503,6 @@ async def _run_learner(
             PID_FILE.unlink(missing_ok=True)
 
 
-def _default_selfplay_workers(processes: int) -> int:
-    """Concurrent games per self-play process: a full batch each, so that
-    more processes add GPU work instead of splitting it into small batches."""
-    return SELFPLAY_GAMES
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1463,7 +1513,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--selfplay-processes",
         type=int,
-        default=DEFAULT_SELFPLAY_PROCESSES,
+        default=None,
+        help="Override the plan: this many self-play processes",
     )
     parser.add_argument(
         "--selfplay-workers",
@@ -1489,9 +1540,7 @@ def _parse_args() -> argparse.Namespace:
 async def main() -> None:
     args = _parse_args()
     _apply_run_name(args.run_name)
-    workers = args.selfplay_workers
-    if workers is None:
-        workers = _default_selfplay_workers(args.selfplay_processes)
+    workers = args.selfplay_workers or SELFPLAY_GAMES
     if args.role == "selfplay":
         await _run_selfplay_process(
             process_index=args.process_index,
@@ -1499,12 +1548,25 @@ async def main() -> None:
             positions_per_shard=args.positions_per_shard,
         )
         return
-    cpus = _cpu_set("REVERSI_LEARNER_CPUS")
-    if cpus:
+    # CUDA numbers GPUs fastest first, NVML by PCI bus: make CUDA follow NVML,
+    # so that a plan's GPU index means the same to both.
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    hw = hardware.probe(backend_name(), ThermalGovernor().sensors())
+    plan = hardware.make_plan(hw)
+    log_event("system", "hardware", info=hw.describe())
+    log_event("system", "plan", info=plan.describe())
+    if plan.learner_gpu is not None:
+        # The learner's framework takes the first visible GPU.
+        visible = [plan.learner_gpu] + [
+            g for g in hw.gpu_indices if g != plan.learner_gpu
+        ]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, visible))
+    if plan.learner_cpus:
         # Before any thread starts: threads inherit it.
-        os.sched_setaffinity(0, cpus)
-        log_event("system", "learner-cpus", cpus=sorted(cpus))
+        os.sched_setaffinity(0, plan.learner_cpus)
     await _run_learner(
+        hw=hw,
+        plan=plan,
         selfplay_processes=args.selfplay_processes,
         selfplay_workers=workers,
         positions_per_shard=args.positions_per_shard,

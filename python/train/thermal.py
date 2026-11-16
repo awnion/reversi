@@ -11,9 +11,11 @@ The GPU is kept cool (70/74 °C). Laptop CPUs run hot under load, so the CPU
 limits are higher (85/90 °C); tournaments are not throttled at all and may push
 the CPU further for a short while.
 
-Sensors (Linux): `nvidia-smi` for the GPU, hwmon (`k10temp`, `coretemp`, ...)
-for the CPU. Where no sensor is available — e.g. macOS, which needs root to
-read temperatures — the governor is a no-op.
+Sensors (Linux): `nvidia-smi` for the GPU, or NVML where `nvidia-smi` is not
+installed; hwmon (`k10temp`, `coretemp`, ...) for the CPU. macOS needs root to
+read temperatures, but reports its thermal pressure level to anyone
+(`notifyutil`): the "pressure" sensor, held at moderate (1) and slowed down
+from heavy (2) on. Where no sensor is available the governor is a no-op.
 
 Limits are in °C and can be overridden with `REVERSI_GPU_TEMP_SOFT`,
 `REVERSI_GPU_TEMP_HARD`, `REVERSI_CPU_TEMP_SOFT` and `REVERSI_CPU_TEMP_HARD`.
@@ -24,8 +26,11 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+from . import hardware
 
 
 def _limit(name: str, default: float) -> float:
@@ -36,6 +41,8 @@ def _limit(name: str, default: float) -> float:
 LIMITS: dict[str, tuple[float, float]] = {
     "gpu": (_limit("REVERSI_GPU_TEMP_SOFT", 70), _limit("REVERSI_GPU_TEMP_HARD", 74)),
     "cpu": (_limit("REVERSI_CPU_TEMP_SOFT", 85), _limit("REVERSI_CPU_TEMP_HARD", 90)),
+    # macOS thermal pressure: 0 nominal, 1 moderate, 2 heavy, 3 trapping.
+    "pressure": (1, 2),
 }
 POLL_SECONDS = 5.0
 # Throttle = share of wall time spent sleeping.
@@ -85,6 +92,13 @@ def _read_gpu() -> float | None:
         return None
 
 
+def _read_gpu_nvml() -> float | None:
+    lib = hardware.nvml()
+    if lib is None or lib.count() == 0:
+        return None
+    return float(max(lib.temperature(i) for i in range(lib.count())))
+
+
 class ThermalGovernor:
     def __init__(self, limits: dict[str, tuple[float, float]] | None = None) -> None:
         self.limits = dict(limits or LIMITS)
@@ -92,7 +106,17 @@ class ThermalGovernor:
         self.temperatures: dict[str, float] = {}
         self._cpu_dirs = _cpu_hwmon_dirs()
         self._has_gpu = shutil.which("nvidia-smi") is not None
-        self.available = bool(self._cpu_dirs) or self._has_gpu
+        nvml = hardware.nvml()
+        self._has_nvml = not self._has_gpu and nvml is not None and nvml.count() > 0
+        self._has_pressure = (
+            sys.platform == "darwin" and hardware.mac_thermal_pressure() is not None
+        )
+        self.available = (
+            bool(self._cpu_dirs)
+            or self._has_gpu
+            or self._has_nvml
+            or self._has_pressure
+        )
         self._last_poll = float("-inf")
         self._owed = 0.0
 
@@ -103,6 +127,13 @@ class ThermalGovernor:
             temperatures["cpu"] = cpu
         if self._has_gpu and (gpu := _read_gpu()) is not None:
             temperatures["gpu"] = gpu
+        if self._has_nvml and (gpu := _read_gpu_nvml()) is not None:
+            temperatures["gpu"] = gpu
+        if (
+            self._has_pressure
+            and (level := hardware.mac_thermal_pressure()) is not None
+        ):
+            temperatures["pressure"] = float(level)
         self.temperatures = temperatures
         return temperatures
 
@@ -111,6 +142,12 @@ class ThermalGovernor:
 
     def _all_below_soft_limit(self) -> bool:
         return all(t < self.limits[k][0] for k, t in self.temperatures.items())
+
+    def sensors(self) -> list[str]:
+        """Names of the sensors this machine has."""
+        names = ["cpu"] if self._cpu_dirs else []
+        names += ["gpu"] if self._has_gpu or self._has_nvml else []
+        return names + (["pressure"] if self._has_pressure else [])
 
     def describe(self) -> str:
         """Current readings, e.g. ``cpu82/gpu71``."""

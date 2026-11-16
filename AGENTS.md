@@ -113,14 +113,15 @@ just train <run> / just logs <run> / just stop <run> / just tournament <run>
 - **Remote machine:** `just setup-remote <host>`, `just push-run <host> <run>`,
   `just train-remote <host> <run>` (forwards the local `REVERSI_SELFPLAY`),
   `just pull-run <host> <run>`.
-- **Rust self-play (CUDA only, opt-in).** `rust/trainer` builds
+- **Rust self-play (CUDA only).** `rust/trainer` builds
   `reversi-selfplay`, which replaces the Python self-play processes with one
   process: search threads over `rust/mcts` pools and one GPU thread running
   the network on libtorch (tch, BatchNorm folded, half precision). It writes
   the same replay shards and follows the same weights, cooldown and thermal
   rules. It is outside Bazel and the Cargo workspace and links the venv's
-  torch (`just build-selfplay`; tch is pinned to that torch version). Enable
-  with `REVERSI_SELFPLAY=rust` (default `python`; the Mac always uses Python);
+  torch (`just build-selfplay`; tch is pinned to that torch version). Used
+  whenever it is built and CUDA works (`REVERSI_SELFPLAY=auto`, the default;
+  `python` forces the Python processes; the Mac always uses Python);
   the learner runs `reversi-selfplay check` first, restarts the process if it
   dies and falls back to Python self-play. Extra flags:
   `REVERSI_SELFPLAY_RUST_ARGS`. Tests: `cargo test` in `rust/trainer` and
@@ -130,15 +131,24 @@ just train <run> / just logs <run> / just stop <run> / just tournament <run>
   `REVERSI_GPU_CLOCK` MHz (default 1100, `0` removes the cap) when sudo
   needs no password. Under the thermal limits a capped laptop GPU runs
   self-play about twice as fast as an uncapped one that keeps getting paused.
-- **Per-machine settings are environment variables; the code is the same
-  everywhere.** `REVERSI_BATCH_SIZE` / `REVERSI_TRAIN_RATIO` /
-  `REVERSI_LR_SCALE` (default 512 / 100 / 1; 1024 / 200 / 1.41 keeps the
-  sample reuse and halves the learner's cost per position),
-  `REVERSI_SELFPLAY_GPUS` (e.g. `1,2`: one Rust self-play process per GPU,
-  the learner keeps GPU 0), `REVERSI_LEARNER_CPUS` /
-  `REVERSI_SELFPLAY_CPUS` (Linux CPU pinning, e.g. `0,1,24,25` and
-  `2-23,26-47` on a 24-core server where the search threads slowed the
-  learner down).
+- **The run fits itself to the machine; the code is the same everywhere.**
+  At startup `train/hardware.py` probes the backend, accelerators, memory,
+  performance cores and sensors (one `[system] hardware` log line) and plans
+  one self-play process per accelerator, the learner's included, two cores
+  for the learner and the rest split between the processes (pinned on
+  Linux), and the replay size from the memory (at most 8M). While it runs,
+  `train/autotune.py` moves the games in play by ±25 % a minute and keeps a
+  change that raises the KPI (positions written and trained on per second)
+  by more than 3 %, saving the value in `weights/<run>/autotune.json`; it
+  slows the self-play on the learner's accelerator while the learner falls
+  behind; and it logs a `[tune] minute` line with the KPI, utilization and
+  what limits it. Self-play processes follow `selfplay<i>.control` in the
+  run directory. Environment variables only override:
+  `REVERSI_SELFPLAY_GPUS`, `REVERSI_LEARNER_CPUS` / `REVERSI_SELFPLAY_CPUS`,
+  `REVERSI_REPLAY_SIZE`, and the learner's `REVERSI_BATCH_SIZE` /
+  `REVERSI_TRAIN_RATIO` / `REVERSI_LR_SCALE` (default 512 / 100 / 1;
+  1024 / 200 / 1.41 keeps the sample reuse and halves the learner's cost per
+  position).
 
 A run is named by the `just train` argument and writes to `weights/<run>/`; a
 run named after a bot (`zerorev`, `alphazero`) trains the weights that bot
