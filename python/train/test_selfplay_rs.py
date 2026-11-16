@@ -278,8 +278,9 @@ def _python_selfplay(bin_path: Path, games: int, simulations: int) -> dict:
     """The Python self-play loop of train/loop.py, without the shards."""
     import reversi_mcts
 
-    model = create_model()
-    model.load_weights(weights_io.load(bin_path))
+    weights = weights_io.load(bin_path)
+    model = create_model(*weights_io.net_size(weights))
+    model.load_weights(weights)
     pool = reversi_mcts.BatchedSelfPlay(256, simulations, stagger=False)
     parts: list[tuple[np.ndarray, ...]] = []
     done = 0

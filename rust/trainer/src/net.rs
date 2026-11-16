@@ -19,8 +19,6 @@ use tch::Device;
 use tch::Kind;
 use tch::Tensor;
 
-const CHANNELS: usize = 32;
-const BLOCKS: usize = 4;
 const IN_PLANES: usize = 4;
 const POLICY_CHANNELS: usize = 2;
 const SQUARES: usize = 64;
@@ -119,18 +117,24 @@ pub fn hwc_to_chw_columns(weight: &[f32], out_f: usize, channels: usize) -> Vec<
 
 impl FoldedWeights {
     /// Parse a `.bin` export. Tensors the network does not use (the training
-    /// only `margin_fc`) are ignored.
+    /// only `margin_fc`) are ignored. The width comes from the stem, the depth
+    /// from the `blocks.N` present, so any size of the same architecture loads.
     pub fn from_bin(bytes: &[u8]) -> Result<Self, String> {
         let store = WeightStore::load(bytes)?;
-        let mut blocks = Vec::with_capacity(BLOCKS);
-        for i in 0..BLOCKS {
+        let (_, stem_shape) =
+            store.get("stem.layers.0.weight").ok_or("missing weight: 'stem.layers.0.weight'")?;
+        let channels = stem_shape[0];
+        let depth =
+            (0..).take_while(|i| store.get(&format!("blocks.{i}.conv1.weight")).is_some()).count();
+        let mut blocks = Vec::with_capacity(depth);
+        for i in 0..depth {
             let conv = |n: u8| {
                 FoldedConv::load(
                     &store,
                     &format!("blocks.{i}.conv{n}"),
                     &format!("blocks.{i}.bn{n}"),
-                    CHANNELS,
-                    CHANNELS,
+                    channels,
+                    channels,
                     3,
                 )
             };
@@ -144,7 +148,7 @@ impl FoldedWeights {
                 "stem.layers.0",
                 "stem.layers.1",
                 IN_PLANES,
-                CHANNELS,
+                channels,
                 3,
             )?,
             blocks,
@@ -152,12 +156,12 @@ impl FoldedWeights {
                 &store,
                 "policy_conv",
                 "policy_bn",
-                CHANNELS,
+                channels,
                 POLICY_CHANNELS,
                 1,
             )?,
             policy_fc,
-            value_conv: FoldedConv::load(&store, "value_conv", "value_bn", CHANNELS, 1, 1)?,
+            value_conv: FoldedConv::load(&store, "value_conv", "value_bn", channels, 1, 1)?,
             value_fc1: Dense::load(&store, "value_fc1", SQUARES, VALUE_HIDDEN)?,
             value_fc2: Dense::load(&store, "value_fc2", VALUE_HIDDEN, 1)?,
         })
@@ -418,6 +422,11 @@ impl Lcg {
 
 /// A `.bin` export with random weights and non-trivial BatchNorm stats.
 pub fn random_bin(seed: u64) -> Vec<u8> {
+    random_bin_sized(seed, 32, 4)
+}
+
+/// [`random_bin`] for a network `blocks` deep and `channels` wide.
+pub fn random_bin_sized(seed: u64, channels: usize, blocks: usize) -> Vec<u8> {
     let mut rng = Lcg(seed);
     let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
     let mut add = |name: String, shape: Vec<usize>, positive: bool, scale: f32| {
@@ -438,14 +447,20 @@ pub fn random_bin(seed: u64) -> Vec<u8> {
         add(format!("{bn}.running_mean"), vec![o], false, 0.2);
         add(format!("{bn}.running_var"), vec![o], true, 1.0);
     };
-    conv("stem.layers.0", "stem.layers.1", 4, 32, 3);
-    for b in 0..4 {
+    conv("stem.layers.0", "stem.layers.1", 4, channels, 3);
+    for b in 0..blocks {
         for n in 1..=2 {
-            conv(&format!("blocks.{b}.conv{n}"), &format!("blocks.{b}.bn{n}"), 32, 32, 3);
+            conv(
+                &format!("blocks.{b}.conv{n}"),
+                &format!("blocks.{b}.bn{n}"),
+                channels,
+                channels,
+                3,
+            );
         }
     }
-    conv("policy_conv", "policy_bn", 32, 2, 1);
-    conv("value_conv", "value_bn", 32, 1, 1);
+    conv("policy_conv", "policy_bn", channels, 2, 1);
+    conv("value_conv", "value_bn", channels, 1, 1);
     let mut add = |name: &str, shape: Vec<usize>| {
         let n = shape.iter().product();
         tensors.push((name.to_owned(), shape, (0..n).map(|_| rng.next() * 0.2).collect()));
@@ -519,6 +534,34 @@ mod tests {
                 max_diff = max_diff.max((row[64] - value).abs());
             }
             assert!(max_diff < 1e-4, "channels_last={channels_last}: max diff {max_diff}");
+        }
+    }
+
+    /// Other sizes load from the shapes in the file and give the same
+    /// outputs in both memory formats.
+    #[test]
+    fn loads_other_sizes() {
+        let _guard = tch::no_grad_guard();
+        let positions = random_positions(8, 13);
+        let mut planes = vec![0.0f32; positions.len() * PLANES_LEN];
+        for (&(board, is_black, legal), out) in
+            positions.iter().zip(planes.as_chunks_mut::<PLANES_LEN>().0)
+        {
+            write_position_planes(board, is_black, legal, out);
+        }
+        for (channels, blocks) in [(32, 8), (48, 6)] {
+            let weights = FoldedWeights::from_bin(&random_bin_sized(3, channels, blocks)).unwrap();
+            assert_eq!(weights.blocks.len(), blocks);
+            let outs: Vec<Vec<f32>> = [false, true]
+                .map(|last| {
+                    let net = TorchNet::new(&weights, cpu(last));
+                    to_vec(&net.forward(&net.planes(&planes)))
+                })
+                .into();
+            assert_eq!(outs[0].len(), 8 * 65);
+            let max_diff =
+                outs[0].iter().zip(&outs[1]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-4, "{blocks}x{channels}: max diff {max_diff}");
         }
     }
 

@@ -15,8 +15,8 @@ from .common import BASE_LEARNING_RATE, GRAD_CLIP_NORM, LABEL_SMOOTHING, WEIGHT_
 
 
 class MlxModel:
-    def __init__(self) -> None:
-        self.net = AlphaZeroNet()
+    def __init__(self, channels: int = 32, n_blocks: int = 4) -> None:
+        self.net = AlphaZeroNet(channels, n_blocks)
         mx.eval(self.net.parameters())
         self._training = True
         self._optimizer = optim.AdamW(

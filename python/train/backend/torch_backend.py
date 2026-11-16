@@ -79,15 +79,25 @@ def _device() -> torch.device:
     return torch.device("cpu")
 
 
+def _metrics(stacked: torch.Tensor) -> dict[str, float]:
+    """One host sync for all five numbers instead of one each."""
+    names = ("loss", "policy", "policy_kl", "value", "margin")
+    return dict(zip(names, stacked.tolist(), strict=True))
+
+
 class TorchModel:
-    def __init__(self) -> None:
+    def __init__(self, channels: int = 32, n_blocks: int = 4) -> None:
         self.device = _device()
         self._cuda = self.device.type == "cuda"
         # cudnn.benchmark stays off here: the self-play batch size changes
         # from round to round while games start, and every new shape would
         # trigger a fresh (slow) algorithm search. The learner's batch never
         # changes shape: train_step turns it on in that process.
-        self.net = _Net().to(self.device).to(memory_format=torch.channels_last)
+        self.net = (
+            _Net(channels, n_blocks)
+            .to(self.device)
+            .to(memory_format=torch.channels_last)
+        )
         # Fused: one kernel for the whole update instead of one per tensor
         # group. A step of this small network is kernel launches, not
         # arithmetic: with cudnn.benchmark and one host sync per step, 83 →
@@ -157,29 +167,57 @@ class TorchModel:
         policy_weights: np.ndarray,
         value_weights: np.ndarray,
     ) -> dict[str, float]:
+        def tensor(a: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(
+                self.device
+            )
+
+        return self.train_tensors(
+            self._input(planes),
+            *map(tensor, (policies, outcomes, margins, policy_weights, value_weights)),
+        )
+
+    def train_tensors(
+        self, x: torch.Tensor, *targets: torch.Tensor
+    ) -> dict[str, float]:
+        """`train_step` on a batch already on the device: planes `x` in the
+        net's memory format, then the five target arrays as float32."""
         if self._cuda and not torch.backends.cudnn.benchmark:
             # Training batches all have one shape: let cuDNN pick its fastest
             # kernels once. Only in the process that trains; self-play
             # batches change size from round to round.
             torch.backends.cudnn.benchmark = True
         self.net.train()
+        loss, metrics = self._losses(x, *targets)
+        self._optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.net.parameters(), GRAD_CLIP_NORM)
+        self._optimizer.step()
+        return _metrics(metrics)
 
-        def tensor(a: np.ndarray) -> torch.Tensor:
-            return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(
-                self.device
-            )
+    def evaluate_tensors(
+        self, x: torch.Tensor, *targets: torch.Tensor
+    ) -> dict[str, float]:
+        """The losses of `train_tensors` without training (eval mode)."""
+        self.net.eval()
+        with torch.no_grad():
+            return _metrics(self._losses(x, *targets)[1])
 
-        x = self._input(planes)
+    def _losses(
+        self,
+        x: torch.Tensor,
+        policies: torch.Tensor,
+        outcomes: torch.Tensor,
+        margins: torch.Tensor,
+        policy_weights: torch.Tensor,
+        value_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The total loss and the five logged numbers, still on the device."""
         phase = x[:, 3, 0, 0]
-        policy_targets = (1.0 - LABEL_SMOOTHING) * tensor(
-            policies
-        ) + LABEL_SMOOTHING / 64.0
-        value_targets = tensor(outcomes)
-        margin_targets = tensor(margins)
-        known_margin = torch.isfinite(margin_targets)
-        margin_targets = torch.where(known_margin, margin_targets, 0.0)
-        policy_w = tensor(policy_weights)
-        value_w = tensor(value_weights) * (0.5 + 1.5 * phase)
+        policy_targets = (1.0 - LABEL_SMOOTHING) * policies + LABEL_SMOOTHING / 64.0
+        known_margin = torch.isfinite(margins)
+        margin_targets = torch.where(known_margin, margins, 0.0)
+        value_w = value_weights * (0.5 + 1.5 * phase)
         margin_w = value_w * known_margin
 
         def mean(per_sample, weights):
@@ -187,27 +225,20 @@ class TorchModel:
 
         logits, values, margin = self.net(x)
         policy_loss_per = -(policy_targets * F.log_softmax(logits, dim=-1)).sum(dim=-1)
-        policy_loss = mean(policy_loss_per, policy_w)
-        value_loss = mean((values - value_targets) ** 2, value_w)
+        policy_loss = mean(policy_loss_per, policy_weights)
+        value_loss = mean((values - outcomes) ** 2, value_w)
         margin_loss = mean((margin - margin_targets) ** 2, margin_w)
         loss = policy_loss + value_loss + MARGIN_LOSS_WEIGHT * margin_loss
-
-        self._optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.net.parameters(), GRAD_CLIP_NORM)
-        self._optimizer.step()
 
         # The part of the policy loss that can go down: the cross-entropy
         # minus the entropy of the targets themselves (the KL divergence).
         with torch.no_grad():
             target_entropy = -(policy_targets * policy_targets.log()).sum(dim=-1)
-            policy_kl = policy_loss - mean(target_entropy, policy_w)
-            # One host sync for all five numbers instead of one each.
-            values_out = torch.stack(
+            policy_kl = policy_loss - mean(target_entropy, policy_weights)
+            metrics = torch.stack(
                 [loss, policy_loss, policy_kl, value_loss, margin_loss]
-            ).tolist()
-        names = ("loss", "policy", "policy_kl", "value", "margin")
-        return dict(zip(names, values_out, strict=True))
+            )
+        return loss, metrics
 
     def set_learning_rate(self, learning_rate: float) -> None:
         for group in self._optimizer.param_groups:

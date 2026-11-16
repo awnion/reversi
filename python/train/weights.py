@@ -76,6 +76,13 @@ def _read_bin(path: Path) -> Weights:
     return weights
 
 
+def net_size(weights: Weights) -> tuple[int, int]:
+    """``(channels, residual blocks)`` of a network's weights."""
+    channels = int(weights["stem.layers.0.weight"].shape[0])
+    blocks = sum(1 for name in weights if name.endswith(".conv1.weight"))
+    return channels, blocks
+
+
 def load(path: Path) -> Weights:
     """Read weights from a ``.bin`` export or an ``.npz`` checkpoint."""
     path = Path(path)

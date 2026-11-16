@@ -65,12 +65,12 @@ def backend_name() -> str:
     return "mlx" if sys.platform == "darwin" else "torch"
 
 
-def create_model() -> Model:
-    """A freshly initialised network on this machine's backend."""
+def create_model(channels: int = 32, blocks: int = 4) -> Model:
+    """A freshly initialised network of this size on this machine's backend."""
     if backend_name() == "mlx":
         from .mlx_backend import MlxModel
 
-        return MlxModel()
+        return MlxModel(channels, blocks)
     from .torch_backend import TorchModel
 
-    return TorchModel()
+    return TorchModel(channels, blocks)

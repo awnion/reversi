@@ -10,6 +10,8 @@
 //! - folds every BatchNorm into the preceding convolution at load time;
 //! - skips zero inputs, which are common after ReLU and in the input planes;
 //! - works in fixed-size stack buffers, without allocating.
+//!
+//! Width and depth come from the weights (up to [`MAX_CHANNELS`] channels).
 
 use crate::layers::softmax;
 use crate::weights::WeightStore;
@@ -18,8 +20,11 @@ const BOARD: usize = 8;
 const SQUARES: usize = BOARD * BOARD;
 /// Input planes: my discs, opponent discs, legal moves, phase.
 const IN_PLANES: usize = 4;
-/// Width of the residual tower.
+/// Widest residual tower the stack buffers hold.
+pub const MAX_CHANNELS: usize = 64;
+#[cfg(feature = "test-utils")]
 const CHANNELS: usize = 32;
+#[cfg(feature = "test-utils")]
 const BLOCKS: usize = 4;
 const POLICY_CHANNELS: usize = 2;
 const VALUE_HIDDEN: usize = 64;
@@ -191,9 +196,11 @@ fn relu(x: &mut [f32]) {
 
 // ── AlphaZeroNet ─────────────────────────────────────────────────────────────
 
-/// AlphaZero-style network for 8×8 Reversi: a 3×3 stem, four residual blocks
-/// of 32 channels, and policy/value heads.
+/// AlphaZero-style network for 8×8 Reversi: a 3×3 stem, a tower of residual
+/// blocks (4×32 for the trained bots), and policy/value heads.
 pub struct AlphaZeroNet {
+    /// Width of the residual tower.
+    channels: usize,
     stem: Conv,
     /// `(conv1, conv2)` of each residual block.
     blocks: Vec<(Conv, Conv)>,
@@ -213,16 +220,25 @@ impl AlphaZeroNet {
 
     /// Build the network from an already-parsed `WeightStore` holding the MLX
     /// parameter tree (MLX names, channel-last convolution weights).
+    /// The width comes from the stem, the depth from the `blocks.N` present.
     pub fn from_store(store: &WeightStore) -> Result<Self, String> {
-        let mut blocks = Vec::with_capacity(BLOCKS);
-        for i in 0..BLOCKS {
+        let (_, stem_shape) =
+            store.get("stem.layers.0.weight").ok_or("missing weight: 'stem.layers.0.weight'")?;
+        let channels = stem_shape[0];
+        if channels > MAX_CHANNELS {
+            return Err(format!("{channels} channels, at most {MAX_CHANNELS} supported"));
+        }
+        let depth =
+            (0..).take_while(|i| store.get(&format!("blocks.{i}.conv1.weight")).is_some()).count();
+        let mut blocks = Vec::with_capacity(depth);
+        for i in 0..depth {
             let conv = |n: u8| {
                 Conv::load(
                     store,
                     &format!("blocks.{i}.conv{n}"),
                     &format!("blocks.{i}.bn{n}"),
-                    CHANNELS,
-                    CHANNELS,
+                    channels,
+                    channels,
                     3,
                 )
             };
@@ -230,20 +246,21 @@ impl AlphaZeroNet {
         }
 
         Ok(AlphaZeroNet {
-            stem: Conv::load(store, "stem.layers.0", "stem.layers.1", IN_PLANES, CHANNELS, 3)?,
+            channels,
+            stem: Conv::load(store, "stem.layers.0", "stem.layers.1", IN_PLANES, channels, 3)?,
             blocks,
             policy_conv: Conv::load(
                 store,
                 "policy_conv",
                 "policy_bn",
-                CHANNELS,
+                channels,
                 POLICY_CHANNELS,
                 1,
             )?,
             // The training model flattens the policy head as (H, W, C), which
             // is exactly this module's activation layout.
             policy_fc: Dense::load(store, "policy_fc", SQUARES * POLICY_CHANNELS, SQUARES)?,
-            value_conv: Conv::load(store, "value_conv", "value_bn", CHANNELS, 1, 1)?,
+            value_conv: Conv::load(store, "value_conv", "value_bn", channels, 1, 1)?,
             value_fc1: Dense::load(store, "value_fc1", SQUARES, VALUE_HIDDEN)?,
             value_fc2: Dense::load(store, "value_fc2", VALUE_HIDDEN, 1)?,
         })
@@ -268,18 +285,22 @@ impl AlphaZeroNet {
         }
 
         // ── Stem and residual tower ───────────────────────────────────────────
-        let mut x = [0.0f32; SQUARES * CHANNELS];
-        let mut hidden = [0.0f32; SQUARES * CHANNELS];
-        let mut out = [0.0f32; SQUARES * CHANNELS];
+        let width = SQUARES * self.channels;
+        let mut x_buf = [0.0f32; SQUARES * MAX_CHANNELS];
+        let mut hidden_buf = [0.0f32; SQUARES * MAX_CHANNELS];
+        let mut out_buf = [0.0f32; SQUARES * MAX_CHANNELS];
+        let mut x = &mut x_buf[..width];
+        let hidden = &mut hidden_buf[..width];
+        let mut out = &mut out_buf[..width];
 
-        self.stem.forward(&input, &mut x);
-        relu(&mut x);
+        self.stem.forward(&input, x);
+        relu(x);
 
         for (conv1, conv2) in &self.blocks {
-            conv1.forward(&x, &mut hidden);
-            relu(&mut hidden);
-            conv2.forward(&hidden, &mut out);
-            for (o, &residual) in out.iter_mut().zip(&x) {
+            conv1.forward(x, hidden);
+            relu(hidden);
+            conv2.forward(hidden, out);
+            for (o, &residual) in out.iter_mut().zip(x.iter()) {
                 *o = (*o + residual).max(0.0);
             }
             std::mem::swap(&mut x, &mut out);
@@ -287,7 +308,7 @@ impl AlphaZeroNet {
 
         // ── Policy head ───────────────────────────────────────────────────────
         let mut p = [0.0f32; SQUARES * POLICY_CHANNELS];
-        self.policy_conv.forward(&x, &mut p);
+        self.policy_conv.forward(x, &mut p);
         relu(&mut p);
         let mut policy = [0.0f32; SQUARES];
         self.policy_fc.forward(&p, &mut policy);
@@ -295,7 +316,7 @@ impl AlphaZeroNet {
 
         // ── Value head ────────────────────────────────────────────────────────
         let mut v = [0.0f32; SQUARES];
-        self.value_conv.forward(&x, &mut v);
+        self.value_conv.forward(x, &mut v);
         relu(&mut v);
         let mut h = [0.0f32; VALUE_HIDDEN];
         self.value_fc1.forward(&v, &mut h);
@@ -313,6 +334,7 @@ impl AlphaZeroNet {
     #[cfg(feature = "test-utils")]
     pub fn zeros() -> Self {
         AlphaZeroNet {
+            channels: CHANNELS,
             stem: Conv::zeros(IN_PLANES, CHANNELS, 3),
             blocks: (0..BLOCKS)
                 .map(|_| (Conv::zeros(CHANNELS, CHANNELS, 3), Conv::zeros(CHANNELS, CHANNELS, 3)))
