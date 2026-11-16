@@ -16,7 +16,6 @@ threads where the page allows it:
 | Minimax | [alpha-beta search](https://en.wikipedia.org/wiki/Alpha%E2%80%93beta_pruning) over a hand-written score: mobility, corners, discs |
 | ZeroRev | tree search guided by a neural network trained by self-play |
 | Gladiator0 | ZeroRev's engine with frozen weights from step 1 239 000 |
-| AlphaZero | the same engine, weights of an earlier run |
 
 ## How ZeroRev learns
 

@@ -20,9 +20,6 @@
       "path": "../../packages/bot-minimax"
     },
     {
-      "path": "../../packages/bot-alphazero"
-    },
-    {
       "path": "../../packages/bot-zerorev"
     }
   ]

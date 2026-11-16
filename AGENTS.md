@@ -7,7 +7,9 @@ WASM, and a Python self-play training pipeline (MLX or PyTorch).
 
 - `rust/minimax`, `rust/mcts`, `rust/nn` — bitboard engine, MCTS, NN inference
 - `rust/alphazero`, `rust/zerorev` — WASM bot crates; each embeds
-  `weights/<bot>/champion.bin` via `include_bytes!`
+  `weights/<bot>/champion.bin` via `include_bytes!`. `alphazero` is the March
+  2026 prototype, kept for history and not offered in the web app (see
+  `weights/alphazero/README.md`)
 - `packages/core` — game rules; `packages/board-ui` — DOM board;
   `packages/bot` — greedy bot; `packages/bot-{minimax,alphazero,zerorev}` — TS
   wrappers around the WASM crates

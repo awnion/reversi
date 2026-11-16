@@ -29,7 +29,6 @@ const ANALYSIS_THREADS = Math.max(1, Math.floor(BOT_THREADS / 2));
 /** Bots whose search uses every thread it is given. */
 const THREADED_BOTS: ReadonlySet<string> = new Set([
   'minimax',
-  'alphazero',
   'gladiator0',
   'zerorev',
   'ramo0',
@@ -37,13 +36,7 @@ const THREADED_BOTS: ReadonlySet<string> = new Set([
 
 const pool = new BotWorkerPool(BOT_THREADS);
 
-type BotId =
-  | 'greedy'
-  | 'minimax'
-  | 'alphazero'
-  | 'gladiator0'
-  | 'zerorev'
-  | 'ramo0';
+type BotId = 'greedy' | 'minimax' | 'gladiator0' | 'zerorev' | 'ramo0';
 
 /**
  * The bots a side can be handed to. A side without a bot is played by hand.
@@ -72,13 +65,6 @@ const BOTS: {
     detail: 'Searches moves ahead',
     timed: true,
     player: createWorkerBot(pool, 'minimax', 'Minimax'),
-  },
-  {
-    id: 'alphazero',
-    name: 'AlphaZero',
-    detail: '',
-    timed: true,
-    player: createWorkerBot(pool, 'alphazero', 'AlphaZero'),
   },
   {
     id: 'gladiator0',

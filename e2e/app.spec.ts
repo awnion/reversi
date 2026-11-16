@@ -156,15 +156,15 @@ test('network bots say when they were trained and their loss', async ({
   ).toContainText(/\d{4}, loss \d\.\d\d/);
 });
 
-test('Gladiator0 is offered between AlphaZero and ZeroRev', async ({
-  page,
-}) => {
+test('Gladiator0 is offered between Minimax and ZeroRev', async ({ page }) => {
   await page.goto('/');
   const bots = page.locator('#player-black .option[data-bot]');
   const ids = await bots.evaluateAll((options) =>
     options.map((option) => option.getAttribute('data-bot')),
   );
-  expect(ids.indexOf('gladiator0')).toBe(ids.indexOf('alphazero') + 1);
+  // The March 2026 prototype network is kept in the repository only.
+  expect(ids).not.toContain('alphazero');
+  expect(ids.indexOf('gladiator0')).toBe(ids.indexOf('minimax') + 1);
   expect(ids.indexOf('zerorev')).toBe(ids.indexOf('gladiator0') + 1);
   await expect(
     page.locator('#player-black .option[data-bot="gladiator0"]'),

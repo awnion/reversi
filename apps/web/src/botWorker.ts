@@ -1,4 +1,3 @@
-import { createAlphaZeroBot } from '@reversi/bot-alphazero';
 import { createMinimaxBot } from '@reversi/bot-minimax';
 import { createZeroRevBot } from '@reversi/bot-zerorev';
 import type {
@@ -10,7 +9,6 @@ import type {
 import type { WorkerBotId } from './workerBot';
 
 let minimax: BotPlayer;
-let alphazero: BotPlayer & { meta: NetworkBotMeta };
 let gladiator0: BotPlayer & { meta: NetworkBotMeta };
 let zerorev: BotPlayer & { meta: NetworkBotMeta };
 let ramo0: BotPlayer & { meta: NetworkBotMeta };
@@ -20,9 +18,8 @@ const threads = Number(self.name) || 1;
 
 void (async () => {
   try {
-    [minimax, alphazero, gladiator0, zerorev, ramo0] = await Promise.all([
+    [minimax, gladiator0, zerorev, ramo0] = await Promise.all([
       createMinimaxBot('Minimax', { threads }),
-      createAlphaZeroBot(undefined, { threads }),
       // Same engine as ZeroRev, other weights; they share its threads.
       createZeroRevBot(undefined, { threads, network: 'gladiator0' }),
       createZeroRevBot(undefined, { threads }),
@@ -35,7 +32,6 @@ void (async () => {
   }
   self.postMessage({
     type: 'ready',
-    alphazero: alphazero.meta,
     gladiator0: gladiator0.meta,
     zerorev: zerorev.meta,
     ramo0: ramo0.meta,
@@ -52,7 +48,7 @@ export type WorkerRequest = {
 
 self.addEventListener('message', async (e: MessageEvent<WorkerRequest>) => {
   const { id, bot, action, state, thinkMs } = e.data;
-  const player = { minimax, alphazero, gladiator0, zerorev, ramo0 }[bot];
+  const player = { minimax, gladiator0, zerorev, ramo0 }[bot];
   try {
     if (action === 'chooseMove') {
       const position = await player.chooseMove(state, thinkMs);

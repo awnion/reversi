@@ -9,19 +9,13 @@ import botWorkerUrl from './botWorker.ts?worker&url';
 
 /** Sent by the worker once the WASM bots are loaded. */
 export type BotsReady = {
-  alphazero: NetworkBotMeta;
   gladiator0: NetworkBotMeta;
   zerorev: NetworkBotMeta;
   ramo0: NetworkBotMeta;
 };
 
 /** The bots the worker runs. */
-export type WorkerBotId =
-  | 'minimax'
-  | 'alphazero'
-  | 'gladiator0'
-  | 'zerorev'
-  | 'ramo0';
+export type WorkerBotId = 'minimax' | 'gladiator0' | 'zerorev' | 'ramo0';
 
 type PendingEntry = {
   resolve: (value: unknown) => void;
@@ -52,7 +46,6 @@ export class BotWorkerPool {
     this.worker.addEventListener('message', (e: MessageEvent) => {
       if (e.data.type === 'ready') {
         resolveReady({
-          alphazero: e.data.alphazero as NetworkBotMeta,
           gladiator0: e.data.gladiator0 as NetworkBotMeta,
           zerorev: e.data.zerorev as NetworkBotMeta,
           ramo0: e.data.ramo0 as NetworkBotMeta,
