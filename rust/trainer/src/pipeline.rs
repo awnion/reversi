@@ -34,6 +34,7 @@ use reversi_mcts::SelfPlayPool;
 use crate::control::LoadedWeights;
 use crate::control::PanicGuard;
 use crate::control::Stop;
+use crate::control::Tuning;
 use crate::graph::GraphedForward;
 use crate::log_selfplay;
 use crate::net::NetOptions;
@@ -276,6 +277,7 @@ pub struct WorkerLinks {
     pub requests: Sender<Request>,
     pub replies: Receiver<Reply>,
     pub games: Sender<GameRecord>,
+    pub tuning: Arc<Tuning>,
     pub stop: Stop,
 }
 
@@ -289,9 +291,27 @@ struct Worker {
     slots: KeyMap<u32>,
     policies: Vec<f32>,
     values: Vec<f32>,
+    /// Pools of all workers, and the games target last applied.
+    all_pools: usize,
+    applied_games: u64,
 }
 
 impl Worker {
+    /// This worker's share of the games target, spread over its pools.
+    fn apply_games_target(&mut self) {
+        let target = self.links.tuning.games.load(Ordering::Relaxed);
+        if target == self.applied_games {
+            return;
+        }
+        self.applied_games = target;
+        let (target, all) = (target as usize, self.all_pools);
+        let first = self.id * self.pools.len();
+        for (i, pool) in self.pools.iter_mut().enumerate() {
+            let index = first + i;
+            pool.set_games(target / all + usize::from(index < target % all));
+        }
+    }
+
     /// Apply a pool's completed batch (`pending[pool].rows`) and hand its
     /// finished games on.
     fn finish(&mut self, pool: usize) -> bool {
@@ -314,6 +334,7 @@ impl Worker {
             if self.links.stop.is_set() {
                 return false;
             }
+            self.apply_games_target();
             let cache = &self.links.cache;
             let generation = cache.generation();
             let state = &mut self.pending[pool];
@@ -392,6 +413,8 @@ pub fn run_worker(id: usize, config: &PipelineConfig, links: WorkerLinks) {
         slots: KeyMap::default(),
         policies: Vec::new(),
         values: Vec::new(),
+        all_pools: config.workers * config.pools_per_worker,
+        applied_games: (config.workers * config.pools_per_worker * config.games_per_pool) as u64,
     };
     for pool in 0..worker.pools.len() {
         if !worker.submit(pool) {
@@ -430,6 +453,9 @@ pub struct GpuThread {
     pub paused: Arc<AtomicBool>,
     /// Thermal throttle (f64 bits), see `thermal::Governor`.
     pub throttle: Arc<AtomicU64>,
+    /// The learner's share of pauses ([`Tuning::duty`]); the larger of the
+    /// two applies.
+    pub tuning: Arc<Tuning>,
     pub stats: Arc<Stats>,
     pub stop: Stop,
 }
@@ -572,6 +598,7 @@ impl GpuThread {
             // Slow down while the machine is too hot, in proportion to the
             // completed work.
             let throttle = f64::from_bits(self.throttle.load(Ordering::Relaxed));
+            let throttle = throttle.max(self.tuning.duty());
             let pause = pacer.pause_after(work.as_secs_f64(), throttle);
             if pause > 0.0 {
                 self.stop.sleep(Duration::from_secs_f64(pause));

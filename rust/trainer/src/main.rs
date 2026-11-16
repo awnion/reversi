@@ -329,6 +329,9 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
     let paused = Arc::new(AtomicBool::new(false));
     let throttle = Arc::new(AtomicU64::new(0f64.to_bits()));
     let temps = Arc::new(Mutex::new(String::new()));
+    let tuning = Arc::new(control::Tuning::new(
+        (config.workers * config.pools_per_worker * config.games_per_pool) as u64,
+    ));
     let (weights_tx, weights_rx) = crossbeam_channel::unbounded();
     let (request_tx, request_rx) = crossbeam_channel::unbounded();
     let (games_tx, games_rx) = crossbeam_channel::unbounded();
@@ -373,6 +376,9 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         source,
         cooldown_flag: run_dir.as_ref().map(|d| d.join("cooldown")),
         paused: paused.clone(),
+        // Written by the learner: games in play and pauses for this process.
+        control_file: run_dir.as_ref().map(|d| d.join(format!("selfplay{process_index}.control"))),
+        tuning: tuning.clone(),
         weights_tx,
         parent_pid,
         stop: stop.clone(),
@@ -398,6 +404,7 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
             requests: request_tx.clone(),
             replies: reply_rx,
             games: games_tx.clone(),
+            tuning: tuning.clone(),
             stop: stop.clone(),
         };
         let config = config.clone();
@@ -414,6 +421,7 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
         cache,
         paused,
         throttle,
+        tuning: tuning.clone(),
         stats: stats.clone(),
         stop: stop.clone(),
     };
@@ -452,11 +460,13 @@ fn selfplay(args: &mut Args, bench: bool) -> Result<ExitCode, String> {
             crate::log::event(
                 "selfplay",
                 &format!(
-                    "progress process={process_index} games={} positions={} batch={} evals_per_s={rate:.0} cache_hits={:.0}%{temp}",
+                    "progress process={process_index} games={} positions={} batch={} evals_per_s={rate:.0} cache_hits={:.0}% in_play={} duty={:.0}%{temp}",
                     now.games,
                     now.positions,
                     stats.last_batch.load(Ordering::Relaxed),
                     hits * 100.0,
+                    tuning.games.load(Ordering::Relaxed),
+                    tuning.duty() * 100.0,
                 ),
                 &[],
             );

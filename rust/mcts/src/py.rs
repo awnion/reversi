@@ -209,6 +209,17 @@ impl BatchedSelfPlay {
         Ok(())
     }
 
+    /// Play `games` games from now on (see `SelfPlayPool::set_games`).
+    pub fn set_games(&mut self, games: usize) {
+        self.pool.set_games(games);
+    }
+
+    /// Games in play once the last `set_games` has settled.
+    #[getter]
+    pub fn games(&self) -> usize {
+        self.pool.games()
+    }
+
     /// Games finished since the last call, each as a list of position dicts.
     pub fn take_finished<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let games = PyList::empty(py);

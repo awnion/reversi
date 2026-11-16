@@ -1,11 +1,13 @@
 //! Process control: the stop signal every stage waits on, signal handling,
-//! parent supervision, weight reloads and the learner's cooldown flag.
+//! parent supervision, weight reloads, the learner's cooldown flag and its
+//! control file (games in play, share of time paused).
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -160,12 +162,52 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Watches the weights file and the cooldown flag.
+/// What the learner sets for this process through its control file.
+pub struct Tuning {
+    /// Games in play, over all pools.
+    pub games: AtomicU64,
+    /// Share of the time the GPU thread sleeps (f64 bits), so that the
+    /// learner on the same GPU keeps up.
+    pub duty: AtomicU64,
+}
+
+impl Tuning {
+    pub fn new(games: u64) -> Self {
+        Tuning { games: AtomicU64::new(games), duty: AtomicU64::new(0f64.to_bits()) }
+    }
+
+    pub fn duty(&self) -> f64 {
+        f64::from_bits(self.duty.load(Ordering::Relaxed))
+    }
+
+    /// Apply `games=N duty=F` (either may be missing).
+    fn apply(&self, text: &str) {
+        for field in text.split_whitespace() {
+            match field.split_once('=') {
+                Some(("games", v)) => {
+                    if let Ok(games) = v.parse::<u64>() {
+                        self.games.store(games.max(1), Ordering::Relaxed);
+                    }
+                }
+                Some(("duty", v)) => {
+                    if let Ok(duty) = v.parse::<f64>() {
+                        self.duty.store(duty.clamp(0.0, 0.95).to_bits(), Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Watches the weights file, the cooldown flag and the control file.
 pub struct Watcher {
     /// A run directory to poll, or one fixed weights file.
     pub source: WeightsSource,
     pub cooldown_flag: Option<PathBuf>,
     pub paused: Arc<AtomicBool>,
+    pub control_file: Option<PathBuf>,
+    pub tuning: Arc<Tuning>,
     pub weights_tx: Sender<LoadedWeights>,
     pub parent_pid: Option<u32>,
     pub stop: Stop,
@@ -185,7 +227,16 @@ impl Watcher {
         let mut last_check: Option<Instant> = None;
         let mut waiting_logged = false;
         let mut failed_logged: Option<(PathBuf, Option<SystemTime>)> = None;
+        let mut control_seen: Option<SystemTime> = None;
         loop {
+            if let Some(file) = &self.control_file
+                && let Some(modified) = mtime(file)
+                && control_seen != Some(modified)
+                && let Ok(text) = std::fs::read_to_string(file)
+            {
+                control_seen = Some(modified);
+                self.tuning.apply(&text);
+            }
             if let Some(parent) = self.parent_pid
                 && !parent_alive(parent)
             {

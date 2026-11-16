@@ -91,6 +91,28 @@ fn outcomes_are_consistent() {
     }
 }
 
+/// Requests of the next round; the round is then applied with uniform priors.
+fn round_size(pool: &mut SelfPlayPool) -> usize {
+    let n = pool.collect().len();
+    pool.apply(&vec![1.0 / 64.0; n * 64], &vec![0.0; n]);
+    n
+}
+
+#[test]
+fn set_games_shrinks_and_grows_the_pool() {
+    let mut pool = SelfPlayPool::new(8, 4);
+    run_pool(&mut pool, 4);
+    pool.set_games(3);
+    // The games above the limit finish and are not replaced.
+    run_pool(&mut pool, 40);
+    assert_eq!(round_size(&mut pool), 3);
+    pool.set_games(12);
+    assert_eq!(pool.games(), 12);
+    assert_eq!(round_size(&mut pool), 12);
+    assert!(!run_pool(&mut pool, 20).is_empty());
+    assert_eq!(round_size(&mut pool), 12);
+}
+
 #[test]
 fn games_start_randomly_and_record_few_solved_positions() {
     let records = run_pool(&mut SelfPlayPool::new(16, 8), 200);

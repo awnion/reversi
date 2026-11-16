@@ -379,6 +379,10 @@ pub struct SelfPlayPool {
     /// `start_round[i]`: first round in which game `i` takes part.
     start_round: Vec<u64>,
     round: u64,
+    /// Games at or beyond this index are not replaced when they finish.
+    limit: usize,
+    /// `retired[i]`: game `i` finished beyond the limit and is left idle.
+    retired: Vec<bool>,
     /// Requests of the current round; `requests[i]` belongs to `owners[i]`.
     requests: Vec<EvalRequest>,
     owners: Vec<usize>,
@@ -398,6 +402,8 @@ impl SelfPlayPool {
             games: (0..games).map(|_| Game::new()).collect(),
             start_round: vec![0; games],
             round: 0,
+            limit: games,
+            retired: vec![false; games],
             requests: Vec::with_capacity(games),
             owners: Vec::with_capacity(games),
             finished: Vec::new(),
@@ -416,27 +422,59 @@ impl SelfPlayPool {
         pool
     }
 
+    /// Games in play once the change of [`SelfPlayPool::set_games`] has
+    /// settled.
+    pub fn games(&self) -> usize {
+        self.limit
+    }
+
+    /// Play `games` games from now on: new ones start in the next round;
+    /// above the new number, games play to the end and are not replaced.
+    pub fn set_games(&mut self, games: usize) {
+        let games = games.max(1);
+        while self.games.len() < games {
+            self.games.push(Game::new());
+            self.start_round.push(self.round);
+            self.retired.push(false);
+        }
+        for index in 0..games {
+            if self.retired[index] {
+                self.games[index] = Game::new();
+                self.start_round[index] = self.round;
+                self.retired[index] = false;
+            }
+        }
+        self.limit = games;
+    }
+
     /// Advance every game to its next evaluation and return the batch.
     ///
     /// Games that finish on the way are moved to the finished list and
-    /// replaced by fresh ones, so the batch has one request per started game.
+    /// replaced by fresh ones (below the limit of
+    /// [`SelfPlayPool::set_games`]), so the batch has one request per game in
+    /// play.
     pub fn collect(&mut self) -> &[EvalRequest] {
         assert!(self.requests.is_empty(), "collect() called twice without apply()");
         let round = self.round;
         self.round += 1;
         for (index, game) in self.games.iter_mut().enumerate() {
-            if self.start_round[index] > round {
+            if self.retired[index] || self.start_round[index] > round {
                 continue;
             }
             let request = loop {
                 match game.advance(&self.budget) {
-                    Ok(request) => break request,
+                    Ok(request) => break Some(request),
                     Err(record) => {
                         self.finished.push(record);
+                        if index >= self.limit {
+                            self.retired[index] = true;
+                            break None;
+                        }
                         *game = Game::new();
                     }
                 }
             };
+            let Some(request) = request else { continue };
             self.requests.push(request);
             self.owners.push(index);
         }
