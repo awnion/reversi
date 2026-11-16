@@ -533,7 +533,11 @@ mod tests {
                 }
                 max_diff = max_diff.max((row[64] - value).abs());
             }
-            assert!(max_diff < 1e-4, "channels_last={channels_last}: max diff {max_diff}");
+            // Both in fp32, but libtorch sums in another order than the
+            // reference, and the random weights give large logits: up to
+            // 1.2e-4 apart on a CPU with oneDNN. A wrong layout or fold is
+            // off by tenths.
+            assert!(max_diff < 1e-3, "channels_last={channels_last}: max diff {max_diff}");
         }
     }
 
